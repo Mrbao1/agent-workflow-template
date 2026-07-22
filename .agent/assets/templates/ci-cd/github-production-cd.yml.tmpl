@@ -1,0 +1,51 @@
+name: promote-tested-artifact
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_digest:
+        description: Immutable digest produced by CI
+        required: true
+      test_receipt:
+        description: Passed test receipt bound to the same digest
+        required: true
+      provider_preflight_receipt:
+        description: Fresh provider-owned proof of branch protection, required checks and production reviewers
+        required: true
+      production_decision_packet:
+        description: Human-approved packet binding artifact, repository target, provider proof and test summary
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+jobs:
+  production:
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify fresh provider governance preflight
+        run: "{{verify_provider_preflight_receipt_command}} ${{ inputs.provider_preflight_receipt }}"
+      - name: Verify artifact and test receipt
+        run: "{{verify_artifact_and_receipt_command}} ${{ inputs.artifact_digest }} ${{ inputs.test_receipt }}"
+      - name: Verify human-approved production decision packet
+        run: "{{verify_production_decision_packet_command}} ${{ inputs.production_decision_packet }} ${{ inputs.artifact_digest }} ${{ inputs.test_receipt }} ${{ inputs.provider_preflight_receipt }}"
+      - name: Promote exact tested artifact
+        id: deploy_production
+        continue-on-error: true
+        run: "{{deploy_production_command}} ${{ inputs.artifact_digest }}"
+      - name: Verify or rollback
+        id: verify_or_rollback
+        if: always()
+        continue-on-error: true
+        run: "{{verify_or_rollback_command}} ${{ inputs.artifact_digest }} ${{ steps.deploy_production.outcome }}"
+      - name: Publish promotion or rollback receipt
+        id: publish_promotion_receipt
+        if: always()
+        continue-on-error: true
+        run: "{{publish_promotion_receipt_command}} ${{ inputs.artifact_digest }} ${{ steps.deploy_production.outcome }} ${{ steps.verify_or_rollback.outcome }}"
+      - name: Fail closed after rollback and receipt
+        if: always() && (steps.deploy_production.outcome != 'success' || steps.verify_or_rollback.outcome != 'success' || steps.publish_promotion_receipt.outcome != 'success')
+        run: exit 1

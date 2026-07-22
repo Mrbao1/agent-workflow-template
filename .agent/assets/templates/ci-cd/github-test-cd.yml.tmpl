@@ -1,0 +1,42 @@
+name: deploy-test-and-accept
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_digest:
+        description: Immutable digest produced by CI
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: cd-test
+  cancel-in-progress: false
+jobs:
+  test:
+    environment: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch and verify exact CI artifact
+        run: "{{fetch_and_verify_artifact_command}} ${{ inputs.artifact_digest }}"
+      - name: Deploy test artifact
+        id: deploy_test
+        continue-on-error: true
+        run: "{{deploy_test_command}} ${{ inputs.artifact_digest }}"
+      - name: Run independent test acceptance
+        id: accept_test
+        if: always() && steps.deploy_test.outcome == 'success'
+        continue-on-error: true
+        run: "{{test_acceptance_command}} ${{ inputs.artifact_digest }}"
+      - name: Publish digest-bound test receipt
+        id: publish_test_receipt
+        if: always()
+        continue-on-error: true
+        run: "{{publish_test_receipt_command}} ${{ inputs.artifact_digest }}"
+      - name: Clean test runtime
+        id: cleanup_test
+        if: always()
+        continue-on-error: true
+        run: "{{cleanup_test_command}} ${{ inputs.artifact_digest }}"
+      - name: Fail closed after receipt and cleanup
+        if: always() && (steps.deploy_test.outcome != 'success' || steps.accept_test.outcome != 'success' || steps.publish_test_receipt.outcome != 'success' || steps.cleanup_test.outcome != 'success')
+        run: exit 1

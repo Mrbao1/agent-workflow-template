@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Local Runtime"
+  short_description: "Run local validation with guaranteed process cleanup"
+  default_prompt: "Use $manage-local-runtime to run local validation with guaranteed cleanup."

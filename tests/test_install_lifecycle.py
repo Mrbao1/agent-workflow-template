@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Repeatable install isolation and transaction lifecycle regression test."""
+
+from pathlib import Path
+import argparse
+import base64
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+SOURCE_SENTINEL = "SOURCE_PRIVATE_SENTINEL_NEVER_INSTALL"
+TARGET_SENTINEL = "TARGET_PRIVATE_SENTINEL_PRESERVE"
+
+
+def run(*command: str, cwd: Path, env=None, expected=(0,)) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        list(command), cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180,
+    )
+    if result.returncode not in expected:
+        raise SystemExit(f"command failed ({result.returncode}): {' '.join(command)}\n{result.stdout}")
+    return result
+
+
+def tree(root: Path):
+    result = {}
+    if not root.exists() and not root.is_symlink():
+        return result
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            result[relative] = ("link", os.readlink(path))
+        elif path.is_file():
+            result[relative] = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+        elif path.is_dir():
+            result[relative] = ("dir", None)
+    return result
+
+
+def project_init_journal(target: Path, phase: str = "prepared") -> dict:
+    paths = (
+        target / ".agent/config.json",
+        target / ".agent/policies/PROJECT_GUARDRAILS.md",
+        target / ".agent/state/CONTEXT.json",
+    )
+    backups = {}
+    committed = {}
+    for path in paths:
+        data = path.read_bytes()
+        relative = str(path.relative_to(target))
+        backups[relative] = {
+            "data_b64": base64.b64encode(data).decode("ascii"),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+        }
+        committed[relative] = hashlib.sha256(data).hexdigest()
+    return {
+        "schema": "agent-project-init-transaction/v1",
+        "phase": phase,
+        "backups": backups,
+        "committed_sha256": committed if phase == "committed" else None,
+    }
+
+
+def assert_no_sentinel(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink() and SOURCE_SENTINEL.encode() in path.read_bytes():
+            raise SystemExit(f"source-private bytes escaped into installed target: {path}")
+
+
+def pollute_source(template: Path, external: Path) -> None:
+    agent = template / ".agent"
+    (agent / "config.json").write_text(
+        json.dumps({"source_private": SOURCE_SENTINEL}) + "\n", encoding="utf-8",
+    )
+    (agent / "policies/PROJECT_GUARDRAILS.md").write_text(SOURCE_SENTINEL + "\n", encoding="utf-8")
+    state = agent / "state"
+    for name in ("TASK.json", "CONTEXT.json", "agents.json", "EVIDENCE_INDEX.json"):
+        (state / name).write_text(json.dumps({"source_private": SOURCE_SENTINEL}) + "\n", encoding="utf-8")
+    evidence = state / "evidence"; evidence.mkdir(exist_ok=True)
+    (evidence / "source-private.txt").write_text(SOURCE_SENTINEL, encoding="utf-8")
+    external.write_text(SOURCE_SENTINEL, encoding="utf-8")
+    (state / "source-private-link").symlink_to(external)
+
+
+def completed_guardrails(path: Path) -> None:
+    path.write_text(
+        """# Project Guardrails
+
+## Required project facts
+
+- Product and users: Disposable install lifecycle fixture for template maintainers.
+- Technology and architecture: Python installer with local JSON and Markdown state.
+- Writable and read-only areas: The temporary fixture is writable; external paths are read-only.
+- Security, privacy, compliance and performance red lines: No credentials, network, or external effects.
+- Build, test and lint commands: Run tests/test_install_lifecycle.py in a clean temporary directory.
+- Deployment authority and rollback owner: Deployment is forbidden; the fixture owner controls rollback.
+
+## Universal project constraints
+
+- Keep every operation local, bounded, reversible, and transactionally recoverable.
+""",
+        encoding="utf-8",
+    )
+
+
+def crash_and_recover(installer: Path, target: Path, mode_args, recovery_args, cwd: Path) -> None:
+    before = tree(target)
+    env = dict(os.environ); env["AGENT_WORKFLOW_INSTALL_SELF_TEST_CRASH_AFTER_TARGET"] = "1"
+    run(sys.executable, str(installer), str(target), *mode_args, cwd=cwd, env=env, expected=(97,))
+    run(sys.executable, str(installer), str(target), *recovery_args, cwd=cwd, expected=(0, 1))
+    if tree(target) != before:
+        raise SystemExit(f"transaction rollback changed target for {' '.join(mode_args)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--template-root", default=".")
+    args = parser.parse_args()
+    source = Path(args.template_root).resolve()
+    with tempfile.TemporaryDirectory(prefix="install-lifecycle-") as raw:
+        workspace = Path(raw)
+        polluted = workspace / "polluted-template"
+        shutil.copytree(
+            source, polluted, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".idea", "__pycache__", "*.pyc"),
+        )
+        pollute_source(polluted, workspace / "external-private.txt")
+        installer = polluted / "install.py"
+        target = workspace / "installed-project"
+
+        # Polluted source private config/policies/state/evidence/links are ignored.
+        installed = run(
+            sys.executable, str(installer), str(target), "--project-name", "isolation-fixture",
+            cwd=polluted,
+        )
+        if "PROJECT INIT REQUIRED" not in installed.stdout or "BOOTSTRAP NOT READY" not in installed.stdout or "NEXT: local" in installed.stdout:
+            raise SystemExit("fresh install bootstrap output overclaimed readiness")
+        assert_no_sentinel(target)
+        config = json.loads((target / ".agent/config.json").read_text(encoding="utf-8"))
+        task = json.loads((target / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        agents = json.loads((target / ".agent/state/agents.json").read_text(encoding="utf-8"))
+        if (
+            config.get("project") != {"name": "isolation-fixture", "type": "software-project"}
+            or config.get("guardrails_ready") is not False
+            or config.get("project_initialization") is not None
+            or task.get("status") != "idle" or task.get("requirements_clarified") is not False
+            or any(agents.get(name) != [] for name in ("members", "prepared_dispatches", "capacity_failures", "replay_runs"))
+        ):
+            raise SystemExit("fresh install did not use the canonical isolated idle seed")
+
+        # Project-writable verifier scripts cannot impersonate provider-owned
+        # platform, scheduler, or host-compaction trust boundaries.
+        config_path = target / ".agent/config.json"
+        pristine_config = config_path.read_bytes()
+        forged_adapter = target / "forged-provider-adapter.py"
+        forged_adapter.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
+        forged_adapter.chmod(0o755)
+        forged_config = json.loads(pristine_config)
+        forged_config["agent_control"]["platform_observer"]["signed_adapter"] = str(forged_adapter)
+        forged_config["agent_control"]["scheduler"]["signed_adapter"] = str(forged_adapter)
+        forged_config["context"]["host_compaction_observer"]["signed_adapter"] = str(forged_adapter)
+        config_path.write_text(json.dumps(forged_config, indent=2) + "\n", encoding="utf-8")
+        rejected_adapters = run(
+            sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=target, expected=(1,),
+        ).stdout
+        if not all(label in rejected_adapters for label in (
+            "configured platform adapter is invalid",
+            "configured scheduler adapter is invalid",
+            "configured host compaction adapter is invalid",
+        )):
+            raise SystemExit("project-writable protected adapters were not all rejected")
+        config_path.write_bytes(pristine_config)
+        forged_adapter.unlink()
+
+        # A fully prepared but interrupted project-init is rolled back before
+        # any later command observes partial config/policy/context bytes.
+        journal_path = target / ".agent/state/.project-init-transaction.json"
+        recovery_before = {
+            path: path.read_bytes() for path in (
+                target / ".agent/config.json",
+                target / ".agent/policies/PROJECT_GUARDRAILS.md",
+                target / ".agent/state/CONTEXT.json",
+            )
+        }
+        journal_path.write_text(json.dumps(project_init_journal(target), indent=2) + "\n", encoding="utf-8")
+        for path in recovery_before:
+            path.write_text("{}\n", encoding="utf-8")
+        run(sys.executable, ".agent/scripts/agentctl.py", "status", cwd=target)
+        if journal_path.exists() or any(path.read_bytes() != data for path, data in recovery_before.items()):
+            raise SystemExit("prepared project-init recovery did not restore all targets atomically")
+
+        # Recovery validates every backup before writing the first target.
+        malformed = project_init_journal(target)
+        malformed["backups"][".agent/state/CONTEXT.json"]["sha256"] = "0" * 64
+        journal_path.write_text(json.dumps(malformed, indent=2) + "\n", encoding="utf-8")
+        before_malformed = {path: path.read_bytes() for path in recovery_before}
+        run(sys.executable, ".agent/scripts/agentctl.py", "status", cwd=target, expected=(1,))
+        if any(path.read_bytes() != data for path, data in before_malformed.items()):
+            raise SystemExit("malformed project-init journal caused a partial restore")
+        journal_path.unlink()
+
+        incomplete = target / "incomplete-guardrails.md"
+        incomplete.write_text("# Project Guardrails\n\n- Product and users: TODO\n", encoding="utf-8")
+        before_init_failure = tree(target)
+        no_bytecode = dict(os.environ); no_bytecode["PYTHONDONTWRITEBYTECODE"] = "1"
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "project-init", "--guardrails-file", incomplete.name,
+            cwd=target, env=no_bytecode, expected=(1,),
+        )
+        if tree(target) != before_init_failure:
+            raise SystemExit("failed project-init changed installed project bytes")
+        guardrails = target / "project-guardrails.md"; completed_guardrails(guardrails)
+        leaf_link = target / "guardrails-link.md"
+        leaf_link.symlink_to(guardrails.name)
+        before_link = tree(target)
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "project-init", "--guardrails-file", leaf_link.name,
+            cwd=target, env=no_bytecode, expected=(1,),
+        )
+        if tree(target) != before_link:
+            raise SystemExit("symlinked guardrails input changed project state")
+        leaf_link.unlink()
+        real_dir = target / "guardrail-files"; real_dir.mkdir()
+        nested = real_dir / "policy.md"; completed_guardrails(nested)
+        directory_link = target / "guardrail-link-dir"; directory_link.symlink_to(real_dir.name, target_is_directory=True)
+        before_ancestor_link = tree(target)
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "project-init",
+            "--guardrails-file", str(directory_link.name + "/policy.md"),
+            cwd=target, env=no_bytecode, expected=(1,),
+        )
+        if tree(target) != before_ancestor_link:
+            raise SystemExit("symlink-ancestor guardrails input changed project state")
+        directory_link.unlink(); shutil.rmtree(real_dir)
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "project-init", "--guardrails-file", guardrails.name,
+            cwd=target, env=no_bytecode,
+        )
+        config = json.loads((target / ".agent/config.json").read_text(encoding="utf-8"))
+        policy = (target / ".agent/policies/PROJECT_GUARDRAILS.md").read_bytes()
+        binding = config.get("project_initialization", {})
+        if config.get("guardrails_ready") is not True or binding.get("guardrails_sha256") != hashlib.sha256(policy).hexdigest():
+            raise SystemExit("project-init did not atomically bind readiness to guardrails bytes")
+
+        # A durable commit marker is never interpreted as permission to undo
+        # later drift. Recovery fails closed and preserves both bytes and journal.
+        committed_fixture = workspace / "committed-project-init-drift"
+        shutil.copytree(target, committed_fixture, symlinks=True)
+        committed_journal = committed_fixture / ".agent/state/.project-init-transaction.json"
+        committed_journal.write_text(
+            json.dumps(project_init_journal(committed_fixture, "committed"), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        committed_fixture.joinpath(".agent/config.json").write_text("{}\n", encoding="utf-8")
+        drift_before = tree(committed_fixture)
+        run(sys.executable, ".agent/scripts/agentctl.py", "status", cwd=committed_fixture, expected=(1,))
+        if tree(committed_fixture) != drift_before or not committed_journal.exists():
+            raise SystemExit("committed project-init drift was rolled back or journal was discarded")
+
+        # Installed private additions survive update/migration; source sentinels do not.
+        private = target / ".agent/state/evidence/project-private.txt"
+        private.parent.mkdir(parents=True, exist_ok=True); private.write_text(TARGET_SENTINEL, encoding="utf-8")
+        manifest_path = target / ".agent/.workflow-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "3.1.39"; manifest["migration_version"] = 32
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        crash_and_recover(installer, target, ("--update",), ("--check",), polluted)
+        run(sys.executable, str(installer), str(target), "--update", cwd=polluted)
+        if private.read_text(encoding="utf-8") != TARGET_SENTINEL:
+            raise SystemExit("update/migration replaced installed project-private evidence")
+        assert_no_sentinel(target)
+
+        # Adopt has the same isolation and rollback properties.
+        manifest_path.unlink()
+        crash_and_recover(installer, target, ("--adopt",), ("--adopt", "--dry-run"), polluted)
+        run(sys.executable, str(installer), str(target), "--adopt", cwd=polluted)
+        if private.read_text(encoding="utf-8") != TARGET_SENTINEL:
+            raise SystemExit("adopt replaced installed project-private evidence")
+        assert_no_sentinel(target)
+        run(sys.executable, str(installer), str(target), "--check", cwd=polluted)
+
+    print("INSTALL LIFECYCLE PASS: idle/polluted/installed isolation and rollback")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

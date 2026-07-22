@@ -1,0 +1,36 @@
+{
+  "name": "pxpipe-context",
+  "version": "0.1.0+codex.20260721210500",
+  "description": "Make pxpipe the default Responses provider path for all new Codex Local sessions, with an optional MCP for cold file references.",
+  "author": {
+    "name": "Agent Workflow Template maintainers"
+  },
+  "homepage": "https://github.com/teamchong/pxpipe",
+  "repository": "https://github.com/teamchong/pxpipe",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "mcp",
+    "pxpipe",
+    "token-optimization"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "pxpipe for Codex",
+    "shortDescription": "Default new Codex sessions to pxpipe",
+    "longDescription": "Installs the primary whole-session provider proxy as the default path for all new Codex Local sessions and retains an optional, read-only MCP auxiliary for explicitly selected cold file references. It cannot retrofit the transport of a chat that is already running.",
+    "developerName": "Agent Workflow Template maintainers",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Provider Proxy",
+      "Context",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Enable pxpipe by default for every new Codex session",
+      "Verify that a Codex request was compressed",
+      "Optionally render approved cold reference files"
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Agent Team"
+  short_description: "Bounded multi-agent coordination and monitoring"
+  default_prompt: "Use $manage-agent-team to coordinate independent implementation and review agents with bounded monitoring."

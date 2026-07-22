@@ -1,0 +1,26 @@
+name: verify-and-publish
+on:
+  pull_request:
+  push:
+    branches: [develop, main, "test/**", "release/**"]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: "{{install_command}}"
+      - run: "{{static_security_command}}"
+      - run: "{{test_command}}"
+      - run: "{{integration_command}}"
+      - run: "{{migration_dry_run_command}}"
+      - run: "{{build_command}}"
+      - name: Publish immutable artifact
+        run: "{{publish_artifact_and_digest_command}}"
+      - name: Publish artifact receipt
+        run: "{{publish_artifact_receipt_command}}"

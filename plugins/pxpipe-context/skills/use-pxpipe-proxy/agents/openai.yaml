@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use pxpipe Proxy"
+  short_description: "Enable pxpipe by default for every new Codex session"
+  default_prompt: "Use $use-pxpipe-proxy to start a separate Codex CLI session through the local pxpipe provider proxy and verify that eligible context is compressed."

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Use pxpipe Context"
+  short_description: "Load approved cold references as images"
+  default_prompt: "Use $use-pxpipe-context to analyze selected cold reference files, explain the lossy boundary, and render them only after explicit approval."
+policy:
+  allow_implicit_invocation: true

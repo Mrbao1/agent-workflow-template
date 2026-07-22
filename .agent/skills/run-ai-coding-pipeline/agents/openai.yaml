@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adaptive AI Coding Pipeline"
+  short_description: "Route work through fast, standard, or release modes"
+  default_prompt: "Use $run-ai-coding-pipeline to select the smallest safe workflow for this clarified task."

@@ -1,0 +1,18 @@
+# CI/CD Adapter
+
+- Provider: {{provider}}
+- CI triggers: pull request and pushes to test/production branches.
+- CI responsibilities: clean install, static checks, tests, build once, publish immutable artifact.
+- Test CD: deploy the CI artifact first, run independent integration acceptance, then publish a digest-bound test receipt.
+- Production CD: promote the identical approved artifact from protected production branch.
+- Provider files: keep CI verification/publication and CD promotion as separate workflows. CD accepts an immutable artifact digest and never rebuilds source.
+- Provider preflight receipt SHA-256: {{provider_preflight_receipt_sha256}}
+- Provider preflight observed at: {{provider_preflight_observed_at}}
+- Repository identity: {{repository_identity}}
+- Effective branch protection / ruleset: {{effective_branch_protection_or_ruleset}}
+- Required status checks: {{required_status_checks}}
+- Production environment required reviewers: {{production_environment_required_reviewers}}
+- Approved production decision packet SHA-256: {{production_decision_packet_sha256}}
+- Required approvals: {{approvals}}
+- Secrets source: {{secret_provider}}
+- Rollback: {{rollback}}

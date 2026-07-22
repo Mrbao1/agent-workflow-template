@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""Adversarial fixtures for deterministic template routing and rendering."""
+
+from pathlib import Path
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+SOURCE_AGENT = Path(__file__).resolve().parents[1]
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def invoke(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, ".agent/scripts/templatectl.py", *args],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def require_failure(root: Path, label: str, *args: str) -> None:
+    result = invoke(root, *args)
+    if result.returncode == 0:
+        raise AssertionError(f"adversarial template fixture passed: {label}\n{result.stdout}")
+
+
+def fixture(root: Path, clarified: bool) -> None:
+    (root / ".agent/scripts").mkdir(parents=True, exist_ok=True)
+    (root / ".agent/templates").mkdir(parents=True, exist_ok=True)
+    (root / ".agent/state/artifacts").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SOURCE_AGENT / "scripts/templatectl.py", root / ".agent/scripts/templatectl.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/contextctl.py", root / ".agent/scripts/contextctl.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/contexttx.py", root / ".agent/scripts/contexttx.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/agentctl.py", root / ".agent/scripts/agentctl.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/humandecision.py", root / ".agent/scripts/humandecision.py")
+    shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib", dirs_exist_ok=True)
+    shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
+    shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "skills/run-ai-coding-pipeline", root / ".agent/skills/run-ai-coding-pipeline", dirs_exist_ok=True)
+    templates = [
+        {
+            "id": "requirement-contract",
+            "path": "templates/requirement.md.tmpl",
+            "output": ".agent/state/REQUIREMENT_CONTRACT.md",
+            "renderable": False,
+            "depends_on": [],
+            "nodes": [1],
+            "modes": ["release"],
+            "capabilities": ["core"],
+            "required": ["goal"],
+        },
+        {
+            "id": "task-plan",
+            "path": "templates/task.md.tmpl",
+            "output": ".agent/state/artifacts/04-task-plan.md",
+            "renderable": True,
+            "depends_on": ["requirement-contract"],
+            "nodes": [4],
+            "modes": ["release"],
+            "capabilities": ["core"],
+            "required": ["task"],
+        },
+        {
+            "id": "delivery-plan",
+            "path": "templates/delivery.md.tmpl",
+            "output": ".agent/state/artifacts/08-delivery-plan.md",
+            "renderable": True,
+            "depends_on": ["task-plan"],
+            "nodes": [8],
+            "modes": ["release"],
+            "capabilities": ["delivery"],
+            "required": ["delivery"],
+        },
+        {
+            "id": "ci-contract",
+            "path": "templates/ci.md.tmpl",
+            "output": ".agent/state/artifacts/08-ci-contract.md",
+            "renderable": True,
+            "depends_on": ["delivery-plan"],
+            "nodes": [8],
+            "modes": ["release"],
+            "capabilities": ["ci-provider-github"],
+            "required": ["provider"],
+        },
+        {
+            "id": "review-policy",
+            "path": "templates/review.json.tmpl",
+            "output": ".agent/state/artifacts/05-review-policy.json",
+            "renderable": True,
+            "depends_on": ["task-plan"],
+            "nodes": [5, 7],
+            "modes": ["release"],
+            "capabilities": ["multi-agent"],
+            "required": ["policy"],
+        },
+        {
+            "id": "acceptance-workflow",
+            "path": "templates/acceptance.json.tmpl",
+            "output": ".agent/state/artifacts/04-acceptance-runner.json",
+            "renderable": True,
+            "depends_on": ["task-plan", "review-policy"],
+            "nodes": [4, 7],
+            "modes": ["release"],
+            "capabilities": ["acceptance-workflow"],
+            "required": ["runner"],
+        },
+        {
+            "id": "acceptance-api",
+            "path": "templates/acceptance.json.tmpl",
+            "output": ".agent/state/artifacts/04-acceptance-runner.json",
+            "renderable": True,
+            "depends_on": ["task-plan", "review-policy"],
+            "nodes": [4, 7],
+            "modes": ["release"],
+            "capabilities": ["acceptance-api"],
+            "required": ["runner"],
+        },
+        {
+            "id": "context-transport-profile",
+            "path": "templates/context-transport-profile.json.tmpl",
+            "output": ".agent/state/artifacts/04-context-transport-profile.json",
+            "renderable": True,
+            "depends_on": ["task-plan"],
+            "nodes": [4, 6],
+            "modes": ["release"],
+            "capabilities": ["context-transport-pxpipe"],
+            "required": [
+                "model", "plugin_name", "plugin_version", "plugin_manifest_sha256",
+                "plugin_integrity_sha256", "mcp_server_sha256", "mcp_worker_sha256",
+                "runtime_bundle_sha256", "workflow_manifest_sha256",
+                "workflow_source_tree_sha256", "workflow_plugin_files_sha256",
+                "trusted_root_sha256",
+                "source_sha256", "analyze_receipt_path", "analyze_receipt_sha256", "requirement_contract_sha256",
+                "task_invariant_sha256", "approval_source", "approval_receipt_sha256",
+            ],
+        },
+    ]
+    write_json(root / ".agent/templates/manifest.json", {"schema": "agent-template-manifest/v2", "templates": templates})
+    (root / ".agent/templates/requirement.md.tmpl").write_text("# {{goal}}\n", encoding="utf-8")
+    (root / ".agent/templates/task.md.tmpl").write_text("# Task\n\n{{task}}\n", encoding="utf-8")
+    (root / ".agent/templates/delivery.md.tmpl").write_text("# Delivery\n\n{{delivery}}\n", encoding="utf-8")
+    (root / ".agent/templates/ci.md.tmpl").write_text("# CI\n\n{{provider}}\n", encoding="utf-8")
+    (root / ".agent/templates/acceptance.json.tmpl").write_text('{"runner":"{{runner}}"}\n', encoding="utf-8")
+    (root / ".agent/templates/review.json.tmpl").write_text('{"policy":"{{policy}}"}\n', encoding="utf-8")
+    shutil.copy2(
+        SOURCE_AGENT / "templates/context-transport-profile.json.tmpl",
+        root / ".agent/templates/context-transport-profile.json.tmpl",
+    )
+    config = {
+        "context": {
+            "max_bytes": 8192,
+            "max_list_items": 30,
+            "max_capsule_tokens": {"release": 2200},
+            "max_active_checkpoint_age_minutes": 45,
+            "soft_budget_ratio": 0.6,
+            "compact_budget_ratio": 0.75,
+            "hard_budget_ratio": 0.9,
+        },
+        "routing": {"modes": {"release": {"token_budget": 30000}}},
+        "acceptance_adapters": {
+            "acceptance-workflow": {"implemented": True},
+            "acceptance-api": {"implemented": False},
+        },
+        "context_transport": {
+            "default": "native",
+            "pxpipe": {
+                "enabled": False,
+                "activation": "explicit-opt-in",
+                "plugin_name": "pxpipe-context",
+                "plugin_version": "0.1.0+codex.20260721210500",
+                "models": ["gpt-5.6-sol"],
+                "primary_mode": "provider-proxy",
+                "provider_activation": "default-new-local-sessions",
+                "provider_configuration": "user-model-provider-plus-launch-agent",
+                "provider_content_scope": "whole-request-eligible-content",
+                "mcp_role": "optional-cold-reference",
+                "selection": "analyze-then-render",
+                "content_scope": "new-cold-reference-only",
+                "session_boundary": "plugin-load-requires-new-chat",
+                "fallback": "native",
+            },
+        },
+    }
+    write_json(root / ".agent/config.json", config)
+    contract = "# Requirement Contract\n\nClarified by user.\n\n- Context transport: pxpipe-plugin-explicit-opt-in\n"
+    (root / ".agent/state/REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
+    task = {
+        "schema": "agent-task/v2",
+        "title": "template fixture",
+        "task_type": "governance",
+        "complexity": "complex",
+        "mode": "release",
+        "files": 2,
+        "environment": "local",
+        "deployment_requested": False,
+        "branch": "unversioned",
+        "risk_flags": {},
+        "requirements_clarified": clarified,
+        "requirement_source": "user:fixture" if clarified else "pending",
+        "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
+        "requirement_contract_sha256": hashlib.sha256(contract.encode()).hexdigest() if clarified else "pending",
+        "token_budget": 30000,
+        "tokens_used": 100,
+        "token_usage_source": "estimated",
+        "child_agents_used": 0,
+        "peak_child_agents": 0,
+        "loaded_references": [],
+        "primary_skill": "run-ai-coding-pipeline" if clarified else "clarify-task",
+        "phase": "planning" if clarified else "clarification",
+        "status": "in_progress" if clarified else "waiting_human",
+        "decisions": [],
+        "open_questions": [] if clarified else ["requirement contract approval"],
+        "next_action": "route templates" if clarified else "clarify requirements",
+        "current_node": 2 if clarified else 1,
+        "accepted_nodes": [0, 1] if clarified else [0],
+        "node_artifacts": {},
+        "gate_approvals": {"requirement": {
+            "source": "user:fixture",
+            "decision_receipt": {"sha256": "a" * 64},
+        }} if clarified else {},
+        "decision_policy_version": 1,
+        "pending_gate_artifacts": {},
+        "rollback_ledger": [],
+        "rollback_archive": None,
+        "failure_ledger": {},
+        "failure_archive": None,
+        "mode_status": "confirmed" if clarified else "provisional",
+        "selected_templates": ["requirement-contract"],
+        "selected_capabilities": ["core"],
+        "rendered_artifacts": [],
+        "metrics": {
+            "tokens": 100,
+            "token_source": "estimated",
+            "child_agents": 0,
+            "peak_children": 0,
+            "tool_calls": 0,
+            "test_runs": 0,
+            "test_failures": 0,
+            "repair_rounds": 0,
+            "user_corrections": 0,
+            "context_compactions": 0,
+            "references_loaded": 0,
+        },
+    }
+    write_json(root / ".agent/state/TASK.json", task)
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="templatectl-") as raw:
+        root = Path(raw)
+        fixture(root, clarified=False)
+
+        # No template routing or rendering can cross the clarification gate.
+        before = (root / ".agent/state/TASK.json").read_bytes()
+        require_failure(root, "unclarified-route", "route", "--capability", "acceptance-workflow")
+        require_failure(
+            root,
+            "unclarified-render",
+            "render",
+            "--id",
+            "task-plan",
+            "--output",
+            ".agent/state/artifacts/04-task-plan.md",
+            "--var",
+            "task=forged",
+        )
+        if (root / ".agent/state/TASK.json").read_bytes() != before:
+            raise SystemExit("rejected unclarified operation mutated TASK.json")
+
+        # Rebuild as clarified, bootstrap context, then route deterministically.
+        fixture(root, clarified=True)
+        context = subprocess.run(
+            [
+                sys.executable,
+                ".agent/scripts/contextctl.py",
+                "sync",
+                "--reason",
+                "fixture",
+                "--summary",
+                "clarified fixture ready for routing",
+                "--source-tokens",
+                "1800",
+            ],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if context.returncode:
+            raise SystemExit(context.stdout)
+
+        # The manifest's exact variable contract must match the placeholders
+        # in its governed source. Otherwise a selected template can become
+        # impossible to render: manifest variables are rejected by the source,
+        # while source variables are rejected by the manifest.
+        manifest_path = root / ".agent/templates/manifest.json"
+        original_manifest = manifest_path.read_text(encoding="utf-8")
+        mismatched_manifest = json.loads(original_manifest)
+        next(
+            item for item in mismatched_manifest["templates"]
+            if item["id"] == "task-plan"
+        )["required"] = ["wrong_variable"]
+        write_json(manifest_path, mismatched_manifest)
+        require_failure(
+            root,
+            "manifest-placeholder-contract",
+            "route",
+            "--capability",
+            "acceptance-workflow",
+        )
+        manifest_path.write_text(original_manifest, encoding="utf-8")
+
+        require_failure(root, "unimplemented-release-adapter", "route", "--capability", "acceptance-api")
+        routed = invoke(root, "route", "--capability", "ci-provider-github", "--capability", "acceptance-workflow")
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task_path = root / ".agent/state/TASK.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        if "delivery" not in task["selected_capabilities"]:
+            raise SystemExit("CI provider did not automatically select its delivery dependency")
+        if "multi-agent" not in task["selected_capabilities"]:
+            raise SystemExit("release acceptance did not automatically select independent review")
+        if task["selected_templates"] != [
+            "requirement-contract",
+            "task-plan",
+            "delivery-plan",
+            "ci-contract",
+            "review-policy",
+            "acceptance-workflow",
+        ]:
+            raise SystemExit(f"unexpected deterministic route: {task['selected_templates']}")
+        route_receipt = task.get("template_route", {})
+        if (
+            route_receipt.get("schema") != "agent-template-route/v2"
+            or route_receipt.get("task_type") != task.get("task_type")
+            or route_receipt.get("projection") != "lightweight-release"
+            or not route_receipt.get("sha256")
+        ):
+            raise SystemExit("route did not persist a digest-bound receipt")
+
+        # Provider text cannot disagree with the provider capability bound into the route.
+        require_failure(
+            root, "ci-provider-mismatch", "render", "--id", "ci-contract",
+            "--output", ".agent/state/artifacts/08-ci-contract.md", "--var", "provider=gitlab",
+        )
+
+        # At must_compact, a new capability is an executable budget violation, not a warning.
+        compact_task = json.loads(task_path.read_text(encoding="utf-8"))
+        compact_task["tokens_used"] = 24000
+        compact_task["budget_state"] = "must_compact"
+        write_json(task_path, compact_task)
+        before_expansion = task_path.read_bytes()
+        require_failure(root, "must-compact-capability-expansion", "route", "--capability", "multi-agent", "--capability", "acceptance-workflow")
+        if task_path.read_bytes() != before_expansion:
+            raise SystemExit("blocked budget expansion mutated TASK")
+        write_json(task_path, task)
+
+        # Output is manifest-driven; arbitrary project and protected state paths are rejected.
+        for label, output in (
+            ("source-overwrite", "src/owned.md"),
+            ("task-overwrite", ".agent/state/TASK.json"),
+            ("different-artifact", ".agent/state/artifacts/not-canonical.md"),
+            ("path-escape", "../escape.md"),
+        ):
+            require_failure(
+                root,
+                label,
+                "render",
+                "--id",
+                "task-plan",
+                "--output",
+                output,
+                "--var",
+                "task=fixture task",
+            )
+
+        rendered = invoke(
+            root,
+            "render",
+            "--id",
+            "task-plan",
+            "--output",
+            ".agent/state/artifacts/04-task-plan.md",
+            "--var",
+            "task=fixture task",
+        )
+        if rendered.returncode:
+            raise SystemExit(rendered.stdout)
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        record = next(item for item in task["rendered_artifacts"] if item["template_id"] == "task-plan")
+        required_binding = {
+            "schema",
+            "template_id",
+            "path",
+            "sha256",
+            "bytes",
+            "requirement_contract_sha256",
+            "manifest_sha256",
+            "route_sha256",
+            "source_path",
+            "source_sha256",
+            "source_bytes",
+        }
+        if set(record) != required_binding:
+            raise SystemExit(f"render record lacks full provenance binding: {sorted(set(record) ^ required_binding)}")
+
+        # Expected route/dependencies are recomputed, not trusted from selected_templates.
+        valid_task = json.loads(task_path.read_text(encoding="utf-8"))
+        tampered = {**valid_task, "selected_templates": [item for item in valid_task["selected_templates"] if item != "delivery-plan"]}
+        write_json(task_path, tampered)
+        require_failure(root, "missing-route-dependency", "validate")
+        write_json(task_path, valid_task)
+
+        # Terminal workflow replay is read-only and must remain valid after
+        # complete-task changes the task to accepted/idle. Mutating operations
+        # stay blocked at the same terminal state.
+        terminal = {
+            **valid_task,
+            "status": "accepted",
+            "phase": "idle",
+            "current_node": "idle",
+            "next_action": "start the next requirement in clarification",
+        }
+        write_json(task_path, terminal)
+        terminal_validation = invoke(root, "validate")
+        if terminal_validation.returncode:
+            raise SystemExit(f"terminal template validation was incorrectly blocked:\n{terminal_validation.stdout}")
+        require_failure(root, "terminal-route-remains-blocked", "route", "--capability", "acceptance-workflow")
+        require_failure(
+            root, "terminal-render-remains-blocked", "render", "--id", "task-plan",
+            "--output", ".agent/state/artifacts/04-task-plan.md", "--var", "task=terminal mutation",
+        )
+        write_json(task_path, valid_task)
+
+        # A rendered artifact becomes stale when its source, contract, manifest or output changes.
+        source = root / ".agent/templates/task.md.tmpl"
+        original_source = source.read_text(encoding="utf-8")
+        source.write_text(original_source + "changed\n", encoding="utf-8")
+        require_failure(root, "stale-template-source", "validate")
+        source.write_text(original_source, encoding="utf-8")
+
+        # The original manifest path identity itself must be a regular file, not
+        # an in-boundary symlink whose resolved target merely looks safe.
+        link = root / ".agent/templates/task-link.md.tmpl"
+        link.symlink_to(source.name)
+        manifest_path = root / ".agent/templates/manifest.json"
+        original_manifest = manifest_path.read_text(encoding="utf-8")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        next(item for item in manifest["templates"] if item["id"] == "task-plan")["path"] = "templates/task-link.md.tmpl"
+        write_json(manifest_path, manifest)
+        require_failure(root, "template-source-symlink", "validate")
+        manifest_path.write_text(original_manifest, encoding="utf-8")
+
+        output = root / ".agent/state/artifacts/04-task-plan.md"
+        output.write_text("tampered output\n", encoding="utf-8")
+        require_failure(root, "stale-render-output", "validate")
+
+    with tempfile.TemporaryDirectory(prefix="templatectl-pxpipe-") as raw:
+        root = Path(raw)
+        fixture(root, clarified=True)
+        agents_path = root / "AGENTS.md"
+        agents_path.write_text("# Fixture bootstrap\n", encoding="utf-8")
+        plugin_root = root / "plugins/pxpipe-context"
+        plugin_manifest_path = plugin_root / ".codex-plugin/plugin.json"
+        integrity_path = plugin_root / "integrity.json"
+        server_path = plugin_root / "mcp/server.mjs"
+        worker_path = plugin_root / "mcp/worker.mjs"
+        runtime_path = plugin_root / "mcp/vendor/pxpipe-runtime.mjs"
+        write_json(plugin_manifest_path, {"name": "pxpipe-context", "version": "0.1.0+codex.20260721210500"})
+        server_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        server_path.write_text("// fixture server\n", encoding="utf-8")
+        worker_path.write_text("// fixture worker\n", encoding="utf-8")
+        runtime_path.write_text("export {};\n", encoding="utf-8")
+        runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+        write_json(integrity_path, {
+            "plugin_version": "0.1.0+codex.20260721210500",
+            "runtime_bundle": "mcp/vendor/pxpipe-runtime.mjs",
+            "runtime_bundle_sha256": runtime_sha256,
+        })
+        plugin_files = {
+            ".codex-plugin/plugin.json": hashlib.sha256(plugin_manifest_path.read_bytes()).hexdigest(),
+            "integrity.json": hashlib.sha256(integrity_path.read_bytes()).hexdigest(),
+            "mcp/server.mjs": hashlib.sha256(server_path.read_bytes()).hexdigest(),
+            "mcp/worker.mjs": hashlib.sha256(worker_path.read_bytes()).hexdigest(),
+            "mcp/vendor/pxpipe-runtime.mjs": runtime_sha256,
+        }
+        # Project installations retain only content attestations. The actual
+        # Skill + MCP bundle is installed globally and must not be copied here.
+        shutil.rmtree(plugin_root)
+        workflow_manifest_path = root / ".agent/.workflow-manifest.json"
+        write_json(workflow_manifest_path, {
+            "schema": "agent-workflow-install/v3",
+            "version": "fixture",
+            "migration_version": 1,
+            "source_tree_sha256": "f" * 64,
+            "agent_files": {},
+            "repo_plugin_files": plugin_files,
+            "marketplace_entry": {"name": "pxpipe-context", "sha256": "9" * 64},
+            "agents_bootstrap": {
+                "path": "AGENTS.md",
+                "sha256": hashlib.sha256(agents_path.read_bytes()).hexdigest(),
+            },
+        })
+        workflow_manifest_sha256 = hashlib.sha256(workflow_manifest_path.read_bytes()).hexdigest()
+        workflow_plugin_files_sha256 = hashlib.sha256(json.dumps(
+            plugin_files, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        trusted_root_sha256 = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+        context = subprocess.run(
+            [
+                sys.executable, ".agent/scripts/contextctl.py", "sync",
+                "--reason", "fixture", "--summary", "pxpipe plugin route fixture",
+                "--source-tokens", "1800",
+            ],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if context.returncode:
+            raise SystemExit(context.stdout)
+        require_failure(
+            root, "available-plugin-is-not-enabled", "route",
+            "--capability", "context-transport-pxpipe",
+            "--capability", "acceptance-workflow",
+        )
+        config_path = root / ".agent/config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["context_transport"]["pxpipe"]["enabled"] = True
+        write_json(config_path, config)
+        routed = invoke(
+            root, "route", "--capability", "context-transport-pxpipe",
+            "--capability", "acceptance-workflow",
+        )
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        invariant = hashlib.sha256(json.dumps({
+            key: task.get(key)
+            for key in (
+                "title", "mode", "task_type", "complexity", "environment",
+                "branch", "requirement_contract_sha256", "selected_capabilities",
+            )
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        analyze_receipt = {
+            "schema": "pxpipe-context-analyze/v1",
+            "model": "gpt-5.6-sol",
+            "purpose": "cold-semantic-reference",
+            "status": "eligible",
+            "source_sha256": "c" * 64,
+            "file_count": 1,
+            "source_bytes": 4096,
+            "page_count": 1,
+            "total_image_bytes": 2048,
+            "token_report": {
+                "text_tokens": 1200,
+                "image_tokens": 500,
+                "percent_saved": 58.3,
+            },
+            "rejection_reasons": [],
+            "provenance": {
+                "plugin_name": "pxpipe-context",
+                "plugin_version": "0.1.0+codex.20260721210500",
+                "plugin_manifest_sha256": plugin_files[".codex-plugin/plugin.json"],
+                "plugin_integrity_sha256": plugin_files["integrity.json"],
+                "mcp_server_sha256": plugin_files["mcp/server.mjs"],
+                "mcp_worker_sha256": plugin_files["mcp/worker.mjs"],
+                "pxpipe_package": "pxpipe-proxy",
+                "pxpipe_version": "0.9.0",
+                "runtime_bundle_sha256": runtime_sha256,
+                "source_package_sha256": "e" * 64,
+                "provenance_assurance": "content-and-install-anchored;no-host-signature",
+                "trusted_root_sha256": trusted_root_sha256,
+                "trusted_root_source": "mcp-roots/list",
+                "workflow_manifest_sha256": workflow_manifest_sha256,
+                "workflow_source_tree_sha256": "f" * 64,
+                "workflow_plugin_files_sha256": workflow_plugin_files_sha256,
+                "attestation_mode": "agent-workflow-v3",
+            },
+        }
+        analyze_receipt_sha256 = hashlib.sha256(json.dumps(
+            analyze_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        analyze_receipt["analyze_receipt_sha256"] = analyze_receipt_sha256
+        analyze_receipt_relative = Path(
+            ".agent/state/evidence/context-transport"
+        ) / f"{analyze_receipt_sha256}.json"
+        write_json(root / analyze_receipt_relative, analyze_receipt)
+        variables = [
+            "model=gpt-5.6-sol",
+            "plugin_name=pxpipe-context",
+            "plugin_version=0.1.0+codex.20260721210500",
+            f"plugin_manifest_sha256={plugin_files['.codex-plugin/plugin.json']}",
+            f"plugin_integrity_sha256={plugin_files['integrity.json']}",
+            f"mcp_server_sha256={plugin_files['mcp/server.mjs']}",
+            f"mcp_worker_sha256={plugin_files['mcp/worker.mjs']}",
+            f"runtime_bundle_sha256={runtime_sha256}",
+            f"workflow_manifest_sha256={workflow_manifest_sha256}",
+            "workflow_source_tree_sha256=" + "f" * 64,
+            f"workflow_plugin_files_sha256={workflow_plugin_files_sha256}",
+            f"trusted_root_sha256={trusted_root_sha256}",
+            f"source_sha256={'c' * 64}",
+            f"analyze_receipt_path={analyze_receipt_relative}",
+            f"analyze_receipt_sha256={analyze_receipt_sha256}",
+            f"requirement_contract_sha256={task['requirement_contract_sha256']}",
+            f"task_invariant_sha256={invariant}",
+            "approval_source=user:fixture",
+            f"approval_receipt_sha256={'a' * 64}",
+        ]
+        invalid = [
+            "source_sha256=not-a-digest" if item.startswith("source_sha256=") else item
+            for item in variables
+        ]
+        invalid_args = [value for variable in invalid for value in ("--var", variable)]
+        require_failure(
+            root, "unbound-plugin-source", "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *invalid_args,
+        )
+        render_args = [value for variable in variables for value in ("--var", variable)]
+        original_agents = agents_path.read_text(encoding="utf-8")
+        agents_path.write_text(original_agents + "drift\n", encoding="utf-8")
+        require_failure(
+            root, "workflow-bootstrap-drift", "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *render_args,
+        )
+        agents_path.write_text(original_agents, encoding="utf-8")
+        rendered = invoke(
+            root, "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *render_args,
+        )
+        if rendered.returncode:
+            raise SystemExit(rendered.stdout)
+        profile = json.loads((root / ".agent/state/artifacts/04-context-transport-profile.json").read_text(encoding="utf-8"))
+        forbidden = {
+            "pxpipe_repository", "pxpipe_commit", "openai_upstream", "loopback_port", "runner",
+        }
+        if (
+            profile.get("schema") != "agent-context-transport-profile/v2"
+            or profile.get("selection") != "analyze-then-render"
+            or profile.get("content_scope") != "new-cold-reference-only"
+            or forbidden.intersection(profile)
+        ):
+            raise AssertionError(f"pxpipe plugin profile retained the old proxy contract: {profile}")
+
+        forged = [
+            f"analyze_receipt_sha256={'d' * 64}"
+            if item.startswith("analyze_receipt_sha256=") else item
+            for item in variables
+        ]
+        forged_args = [value for variable in forged for value in ("--var", variable)]
+        require_failure(
+            root, "forged-analyze-receipt", "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *forged_args,
+        )
+
+    print("TEMPLATECTL SELF-TEST PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

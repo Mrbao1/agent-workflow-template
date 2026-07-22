@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.agent/state/.runtime.lock
+.agent/state/.agents.lock
+.agent/state/.context.lock
+.agent/state/.project-init.lock

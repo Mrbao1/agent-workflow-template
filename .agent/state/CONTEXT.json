@@ -1,0 +1,84 @@
+{
+  "schema": "agent-context/v2",
+  "policy_bundle_sha256": "3b2ecfbcb75b937e31a80f5db5be35bf476d45a33cfa100bab790fce2522370f",
+  "task_title": "No active task",
+  "phase": "idle",
+  "mode": "standard",
+  "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
+  "requirement_contract_sha256": "unapproved-draft",
+  "phase_summary": "atomically initialized project guardrails",
+  "confirmed_facts": [
+    "requirement_source=pending",
+    "requirements_clarified=false",
+    "environment=local"
+  ],
+  "decisions": [],
+  "open_questions": [],
+  "changed_files": [],
+  "evidence": [],
+  "open_risks": [],
+  "next_action": "start clarification",
+  "resume": {
+    "schema": "agent-context-resume/v1",
+    "task_status": "idle",
+    "current_node": "idle",
+    "next_action": "start clarification",
+    "budget_state": "ok",
+    "terminal": false,
+    "resume_action": "waiting_human",
+    "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5"
+  },
+  "checkpoint": {
+    "sequence": 1,
+    "reason": "project-init",
+    "updated_at": "2026-07-22T10:22:04+00:00",
+    "previous_sha256": "none",
+    "previous_task_invariant_sha256": "none",
+    "task_delta": [
+      "initial_canonical_task_state"
+    ],
+    "transition_authorization": null
+  },
+  "usage_freshness": {
+    "schema": "agent-context-usage/v1",
+    "checkpoint_sequence": 1,
+    "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
+    "coverage": "through-current-checkpoint",
+    "source": "explicit-estimate",
+    "estimated_tokens": 800,
+    "observed_at": "2026-07-22T10:22:04+00:00"
+  },
+  "compaction": {
+    "source_estimated_tokens": 800,
+    "capsule_estimated_tokens": 562,
+    "tokens_removed": 238,
+    "compression_ratio": 1.42,
+    "method": "explicit-estimate/v1",
+    "reason": "project-init",
+    "source": "agentctl:project-init",
+    "budget_snapshot": {
+      "task_tokens_used": 0,
+      "current_checkpoint_estimated_tokens": 800,
+      "task_token_budget": 20000,
+      "usage_source": "estimated",
+      "reserved_reference_tokens": 0,
+      "child_reserved_tokens": 0,
+      "child_settled_tokens": 0,
+      "consumed_tokens": 800,
+      "budget_ratio": 0.04,
+      "watermark": "normal",
+      "assurance": {
+        "level": "best-effort-estimate",
+        "hard_billing_limit": false,
+        "unmetered_direct_reads_possible": true,
+        "estimated_max_error_ratio": 0.35
+      }
+    }
+  },
+  "integrity": {
+    "status": "verified",
+    "verified_at": "2026-07-22T10:22:04+00:00",
+    "source": "agentctl:project-init",
+    "content_sha256": "db8e8f816767254f34b4d164f96fc93e0b9391f5aedf332f1d2dd9b8210edebd"
+  }
+}

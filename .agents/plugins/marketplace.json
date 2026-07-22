@@ -1,0 +1,20 @@
+{
+  "name": "agent-workflow-template",
+  "interface": {
+    "displayName": "Agent Workflow Template"
+  },
+  "plugins": [
+    {
+      "name": "pxpipe-context",
+      "source": {
+        "source": "local",
+        "path": "./plugins/pxpipe-context"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

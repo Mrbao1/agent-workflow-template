@@ -1,0 +1,20 @@
+services:
+  app:
+    restart: "no"
+    image: ${AGENT_IMAGE:-{{project}}:local}
+    build:
+      context: .
+    ports:
+      - "127.0.0.1:${AGENT_ACCEPTANCE_PORT:-{{port}}}:{{container_port}}"
+    healthcheck:
+      test: ["CMD", "{{health_command}}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

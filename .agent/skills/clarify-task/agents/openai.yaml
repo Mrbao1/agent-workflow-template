@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clarify Task"
+  short_description: "Clarify requirements before implementation begins"
+  default_prompt: "Use $clarify-task to clarify the request and produce an approved requirement contract before implementation."

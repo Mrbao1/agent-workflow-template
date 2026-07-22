@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Task Context"
+  short_description: "Control context loading, compaction, and token budgets"
+  default_prompt: "Use $manage-task-context to maintain a compact task capsule and context budget."

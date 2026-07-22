@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Full-Chain Acceptance"
+  short_description: "Run independent live evidence gates for release mode"
+  default_prompt: "Use $run-full-chain-acceptance to validate this release candidate with independent live evidence."

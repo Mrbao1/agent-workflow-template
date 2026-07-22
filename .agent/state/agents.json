@@ -1,0 +1,58 @@
+{
+  "schema": "agent-team/v9",
+  "platform_limit": 4,
+  "default_model": "gpt-5.6-sol",
+  "allow_model_fallback": false,
+  "context_strategy": "long-window-capsule",
+  "max_fork_turns": 10,
+  "capacity_retry_limit": 1,
+  "task_payload_limits": {
+    "max_input_count": 24,
+    "max_single_bytes": 131072,
+    "max_total_bytes": 262144,
+    "max_estimated_tokens": 65536
+  },
+  "reserved_root_slots": 1,
+  "status_interval_seconds": 30,
+  "monitor_grace_seconds": 30,
+  "stall_timeout_seconds": 300,
+  "allowed_role_types": [
+    "worker",
+    "researcher",
+    "documentation-worker",
+    "implementer",
+    "reviewer",
+    "adversarial",
+    "cross",
+    "integrator"
+  ],
+  "review_role_types": [
+    "reviewer",
+    "adversarial",
+    "cross",
+    "integrator"
+  ],
+  "status_request_after_unchanged_checks": 1,
+  "max_redispatch": 1,
+  "platform_observer": {
+    "source": "orchestrator-tool-transcript",
+    "automatic_release_trust": false,
+    "human_verification_required": true,
+    "signed_adapter": null
+  },
+  "epoch": "1cb7067a5c59c3feece0ddad1d340ec2d9343ed5e7820816a1b97dcb7b9175c4",
+  "members": [],
+  "prepared_dispatches": [],
+  "capacity_failures": [],
+  "replay_runs": [],
+  "token_accounting": {
+    "schema": "agent-child-token-accounting/v1",
+    "token_budget": 20000,
+    "settled_tokens": 0
+  },
+  "task_payload_schema": "agent-task-payload/v2",
+  "last_platform_snapshot": null,
+  "platform_empty_verified": false,
+  "migration_source": null,
+  "updated_at": "2026-07-22T02:17:20+00:00"
+}

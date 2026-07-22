@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deliver Environments"
+  short_description: "Separate local, test, and production delivery flows"
+  default_prompt: "Use $deliver-environments to plan and validate local, test, and production delivery."

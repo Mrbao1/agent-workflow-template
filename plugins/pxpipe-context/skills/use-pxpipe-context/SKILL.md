@@ -1,0 +1,18 @@
+---
+name: use-pxpipe-context
+description: Optionally analyze and render explicitly selected cold, non-authoritative reference files through local pxpipe MCP tools so a Codex chat can consume bounded PNG context instead of loading the original bulk text. This auxiliary is not the whole-session provider proxy. Use only when large reference files have not entered the chat and the user accepts lossy semantic transport; do not use for instructions, requirements, state, diffs, tests, security, deployment, audit evidence, secrets, or exact identifiers.
+---
+
+# Use pxpipe File Context (Optional Auxiliary)
+
+This optional MCP auxiliary handles cold files only. The primary whole-session integration is `use-pxpipe-proxy`. This MCP cannot remove history already present in the current chat, replace its provider, or prove that a Codex request passed through pxpipe.
+
+1. Clarify what material is cold reference context and what remains authoritative. Do not proceed while that boundary is ambiguous.
+2. Read [selection-policy.md](references/selection-policy.md). Keep system/developer/user instructions, requirements, decisions, tests, patches, errors, active protocol state, `.agent/state`, paths, IDs, hashes, versions, amounts and deployment or security evidence as native text.
+3. Confirm the new chat exposes the project as a standard MCP Root. If the host has no MCP Roots support, require an explicit project root/allowlist in the MCP process environment at chat startup; never treat the tool-call `workspace_root` as authority. A generic project needs no Git state, workflow manifest or local plugin copy. An Agent Workflow project with a declared installation anchor receives additional fail-closed workflow/plugin attestation. Call `pxpipe_analyze_files` first with that exact root, explicit relative paths, exact model `gpt-5.6-sol` and purpose `cold-semantic-reference`. The tool must not return the source text.
+4. Show the estimated token result and lossy-quality warning. Call `pxpipe_render_files` only after the user has explicitly approved this material for lossy semantic transport. Pass the exact `source_sha256` returned by analyze and `acknowledge_lossy: true`. When an Agent Workflow Template project routes `context-transport-pxpipe`, persist the exact analyze `structuredContent` at `.agent/state/evidence/context-transport/<analyze_receipt_sha256>.json`; the project gate must validate it before rendering the transport profile.
+5. Treat returned images as a convenience view. Use the supplemental factsheet only as a hint; re-read the original file as native text before relying on an exact value or making a state-changing decision. Treat receipt provenance as content/install anchoring, not proof of MCP origin, unless the host adds an independently verifiable signature.
+6. If the source changed, factsheet extraction dropped values, estimated savings are below the gate, or the page/size cap is exceeded, keep native transport or split the reference once. Do not enter an automatic split/retry loop.
+7. This plugin can keep new bulk references out of the text context of a newly loaded chat. It cannot remove history already present in the current chat and cannot hot-swap that chat's model transport. Transparent whole-session proxying is a separate, explicit next-session configuration using a user-level Codex provider profile.
+
+The MCP server is one STDIO process owned by Codex. It binds no port, starts no proxy, performs no network request, writes no persistent output and exits when the host closes stdin. Tool execution is single-flight; rendering runs in a bounded worker that is terminated on timeout.

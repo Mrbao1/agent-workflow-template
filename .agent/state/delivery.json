@@ -1,0 +1,15 @@
+{
+  "schema": "agent-delivery/v3",
+  "environment": "local",
+  "deployment_requested": false,
+  "status": "not_requested",
+  "artifact": null,
+  "test_receipt": null,
+  "provider_preflight": null,
+  "production_approval": null,
+  "deployment_attempt": null,
+  "promotion_receipt": null,
+  "rollback_receipt": null,
+  "legacy_production_chain": null,
+  "updated_at": null
+}

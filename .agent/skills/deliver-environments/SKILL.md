@@ -1,0 +1,22 @@
+---
+name: deliver-environments
+description: Select and validate local development, shared test, and production delivery paths with explicit branch rules, separate CI and CD, immutable artifacts, environment variables, migrations, approvals, verification, cleanup, and rollback. Use for branching, CI/CD, deployment, release preparation, environment promotion, or production changes.
+---
+
+# Deliver Environments
+
+1. Read `.agent/workflows/ENVIRONMENTS.md` and the active requirement contract.
+2. Select exactly one target: local, test or production. Do not reuse production credentials or data locally.
+3. Fill `templates/delivery-plan.md.tmpl` and load only the selected stack/provider asset.
+4. Local: run targeted checks, register every runtime, never deploy, always cleanup and assert clean.
+5. Test validation without deployment stays `standard`; test deployment is `release`. CI performs clean install, security/static checks, tests, build, migrations dry-run and integration checks; CD deploys an ephemeral/shared-test artifact.
+6. During a waiting production clarification, write the proposed `agent-production-provider-target/v1` JSON to a project file and run `agentctl.py configure-production-provider --target <file> --source user:<decision>`. The command validates provider, `owner/repo`, protected default branch, test/production environments, required checks and minimum reviewers; writes canonical JSON into the requirement contract; and prints the exact requirement-approval digest. `approve-requirements` then puts that same object in TASK and the provider-owned human decision signs the full contract. Never hand-edit TASK; a TASK-only target is not approved authority.
+7. After test acceptance, production enters `awaiting_provider_preflight`. Collect a fresh `provider-production-preflight/v1` under `.agent/state/evidence/provider-preflight/` from the configured read-only provider observer. It must prove the candidate revision is the protected default-branch head or merge commit; every required check run is `completed/success` for that exact SHA with provider IDs, URLs and evidence digests; and effective protection/reviews/environment reviewers meet the approved target. Run `deliveryctl.py record-provider-preflight --receipt <path>`. Local branch patterns, generated YAML and caller-authored JSON/verifiers are declarations, not provider proof. Missing access/adapter pauses at `waiting_human`; missing controls require provider remediation and a new receipt.
+8. `agent_control.provider_preflight_observer` is separate from the platform observer. Its `signed_adapter` must be a dedicated OS-owned, non-writable, non-temporary host executable. The adapter command `verify-provider-preflight --receipt <absolute-path>` must return only `VERIFIED PROVIDER PREFLIGHT sha256=<file-sha256>`. Never point it at a project script or generic interpreter.
+9. Use `deliveryctl.py` to bind source revision/build run, immutable artifact bytes, configured test branch, independent runner/evidence, provider receipt, production approval, deployment attempt, promotion and rollback. `approve-production` signs a content-addressed decision packet containing artifact/revision, repository/default branch/environment, provider receipt SHA and test summary SHA; `promote` freshly re-verifies all bytes and bindings. Production accepts only the exact candidate verified in test and observed by the provider.
+10. CI validates and produces immutable artifacts. CD promotes those artifacts. Never rebuild between test and production.
+11. Every CI/CD job has a timeout. Test and production cleanup/receipt steps use failure-safe execution; a failed deployment still runs rollback and receipt publication, then the job fails closed.
+12. Record environment, branch, provider-preflight receipt/digest and observation time, exact revision/check-run IDs and URLs, runner hash, artifact digest, decision-packet digest, variables, migration, approval, verification and nested rollback health evidence—not provider chatter.
+13. Local/test paths never load or require the production provider adapter. After delivery reaches `not_requested`, `promoted` or `rolled_back`, run `deliveryctl.py snapshot-node8`. Migration-only `legacy_*` statuses are read-only historical attestations and may never be promoted or projected as a new release receipt.
+
+Read [environment-gates.md](references/environment-gates.md) for failure and rollback routing.
