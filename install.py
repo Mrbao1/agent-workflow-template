@@ -4,8 +4,8 @@
 from pathlib import Path
 import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 
-VERSION="3.1.41"
-MIGRATION_VERSION=34
+VERSION="3.1.42"
+MIGRATION_VERSION=35
 MANAGED=("INDEX.md","scripts","skills","templates","workflows","assets","capabilities")
 MANAGED_FILES=("knowledge/INDEX.md",)
 FRESH_STATE_RELATIVE=Path("assets")/"fresh-state"/"v1"
@@ -198,7 +198,8 @@ def named_marketplace_entry(value,name=PLUGIN_NAME,required=True):
 
 
 def source_contract(source_root):
-    validate_agents_bootstrap(source_root/"AGENTS.md")
+    validate_bootstrap(source_root/"AGENTS.md","AGENTS.md")
+    validate_bootstrap(source_root/"CLAUDE.md","CLAUDE.md")
     validate_managed_source(source_root/".agent")
     fresh_state_seed(source_root/".agent")
     agent_files=files(source_root/".agent")
@@ -239,7 +240,7 @@ def manifest(path,required=False):
     if schema=="agent-workflow-install/v1":
         if not isinstance(value.get("files"),dict): raise SystemExit("invalid workflow install manifest")
         if value.get("source_tree_sha256")!=tree_sha256(value["files"]): raise SystemExit("workflow install manifest source tree hash is invalid")
-    elif schema in {"agent-workflow-install/v2","agent-workflow-install/v3"}:
+    elif schema in {"agent-workflow-install/v2","agent-workflow-install/v3","agent-workflow-install/v4"}:
         if not isinstance(value.get("agent_files"),dict) or not isinstance(value.get("repo_plugin_files"),dict):
             raise SystemExit("invalid workflow install manifest")
         entry=value.get("marketplace_entry")
@@ -250,7 +251,7 @@ def manifest(path,required=False):
             "repo_plugin_files":value["repo_plugin_files"],
             "marketplace_entry_sha256":entry["sha256"],
         }
-        if schema=="agent-workflow-install/v3":
+        if schema in {"agent-workflow-install/v3","agent-workflow-install/v4"}:
             bootstrap=value.get("agents_bootstrap")
             if (
                 not isinstance(bootstrap,dict) or set(bootstrap)!={"path","sha256"}
@@ -259,6 +260,15 @@ def manifest(path,required=False):
             ):
                 raise SystemExit("invalid workflow install bootstrap binding")
             payload["agents_bootstrap_sha256"]=bootstrap["sha256"]
+        if schema=="agent-workflow-install/v4":
+            claude=value.get("claude_bootstrap")
+            if (
+                not isinstance(claude,dict) or set(claude)!={"path","sha256"}
+                or claude.get("path")!="CLAUDE.md"
+                or not isinstance(claude.get("sha256"),str) or len(claude["sha256"])!=64
+            ):
+                raise SystemExit("invalid workflow install bootstrap binding")
+            payload["claude_bootstrap_sha256"]=claude["sha256"]
         expected=canonical_sha256(payload)
         if value.get("source_tree_sha256")!=expected: raise SystemExit("workflow install manifest source tree hash is invalid")
     else: raise SystemExit("invalid workflow install manifest")
@@ -285,7 +295,7 @@ def plan_agent_update(wanted,previous,destination):
     return sorted(set(writes)),sorted(set(removes)),sorted(set(conflicts))
 
 
-def agents_bootstrap_state(path):
+def bootstrap_state(path):
     if not path.exists() and not path.is_symlink(): return "missing",None
     if path.is_symlink() or not path.is_file(): return "conflict",None
     try: text=path.read_text(encoding="utf-8")
@@ -298,44 +308,46 @@ def agents_bootstrap_state(path):
     return ("current" if observed==BOOTSTRAP else "conflict"),text
 
 
-def plan_agents_bootstrap(path):
-    state,_=agents_bootstrap_state(path)
+def plan_bootstrap(path,filename):
+    state,_=bootstrap_state(path)
     if state=="current": return False,[]
     if state in {"missing","absent"}: return True,[]
-    return False,["AGENTS.md#agent-workflow-bootstrap"]
+    return False,[f"{filename}#agent-workflow-bootstrap"]
 
 
-def render_agents_bootstrap(path):
-    state,text=agents_bootstrap_state(path)
-    if state=="conflict": raise RuntimeError("AGENTS.md managed bootstrap is malformed or locally modified")
+def render_bootstrap(path):
+    state,text=bootstrap_state(path)
+    if state=="conflict": raise RuntimeError("managed bootstrap anchor is malformed or locally modified")
     if state=="current": return text
     if state=="missing": return BOOTSTRAP
     return text.rstrip()+"\n\n"+BOOTSTRAP
 
 
-def stage_agents_bootstrap(target,candidate_parent):
-    rendered=render_agents_bootstrap(target/"AGENTS.md")
-    candidate=candidate_parent/"AGENTS.md"
+def stage_bootstrap(target,candidate_parent,filename):
+    rendered=render_bootstrap(target/filename)
+    candidate=candidate_parent/filename
     candidate.write_text(rendered,encoding="utf-8")
     return candidate
 
 
-def validate_agents_bootstrap(path):
-    state,_=agents_bootstrap_state(path)
-    if state!="current": raise RuntimeError("candidate AGENTS.md lacks the canonical managed bootstrap")
+def validate_bootstrap(path,filename):
+    state,_=bootstrap_state(path)
+    if state!="current": raise RuntimeError(f"candidate {filename} lacks the canonical managed bootstrap")
 
 
-def install_manifest(agent_files,plugin_files,entry_digest,agents_sha256):
-    if not isinstance(agents_sha256,str) or re.fullmatch(r"[0-9a-f]{64}",agents_sha256) is None:
-        raise RuntimeError("installed AGENTS.md SHA-256 is invalid")
+def install_manifest(agent_files,plugin_files,entry_digest,agents_sha256,claude_sha256):
+    for label,value in (("AGENTS.md",agents_sha256),("CLAUDE.md",claude_sha256)):
+        if not isinstance(value,str) or re.fullmatch(r"[0-9a-f]{64}",value) is None:
+            raise RuntimeError(f"installed {label} SHA-256 is invalid")
     source_digest=canonical_sha256({
         "agent_files":agent_files,
         "repo_plugin_files":plugin_files,
         "marketplace_entry_sha256":entry_digest,
         "agents_bootstrap_sha256":agents_sha256,
+        "claude_bootstrap_sha256":claude_sha256,
     })
     return {
-        "schema":"agent-workflow-install/v3",
+        "schema":"agent-workflow-install/v4",
         "version":VERSION,
         "migration_version":MIGRATION_VERSION,
         "source_tree_sha256":source_digest,
@@ -343,6 +355,7 @@ def install_manifest(agent_files,plugin_files,entry_digest,agents_sha256):
         "repo_plugin_files":plugin_files,
         "marketplace_entry":{"name":PLUGIN_NAME,"sha256":entry_digest},
         "agents_bootstrap":{"path":"AGENTS.md","sha256":agents_sha256},
+        "claude_bootstrap":{"path":"CLAUDE.md","sha256":claude_sha256},
     }
 
 
@@ -423,15 +436,16 @@ def validate_repo_plugin(plugin,wanted):
     if not server_script.is_file() or server_script.is_symlink(): raise RuntimeError("candidate plugin MCP server is missing")
 
 
-def validate_candidate(candidate,wanted,plugin_wanted,entry_digest,agents):
+def validate_candidate(candidate,wanted,plugin_wanted,entry_digest,agents,claude):
     validate_private_tree(candidate)
     validate_project_guardrails(candidate)
     observed=files(candidate)
     if observed!=wanted: raise RuntimeError("candidate managed tree differs from source")
     installed=manifest(candidate/".workflow-manifest.json",required=True)
-    if installed!=install_manifest(wanted,plugin_wanted,entry_digest,sha(agents)):
+    if installed!=install_manifest(wanted,plugin_wanted,entry_digest,sha(agents),sha(claude)):
         raise RuntimeError("candidate install manifest is stale")
-    validate_agents_bootstrap(agents)
+    validate_bootstrap(agents,"AGENTS.md")
+    validate_bootstrap(claude,"CLAUDE.md")
     for base in (candidate/"scripts",candidate/"skills"):
         for python_file in base.rglob("*.py"):
             try: ast.parse(python_file.read_text(encoding="utf-8"),filename=str(python_file))
@@ -515,6 +529,7 @@ def transaction_targets(target):
         str(PLUGIN_RELATIVE):target/PLUGIN_RELATIVE,
         str(MARKETPLACE_RELATIVE):target/MARKETPLACE_RELATIVE,
         "AGENTS.md":target/"AGENTS.md",
+        "CLAUDE.md":target/"CLAUDE.md",
     }
 
 
@@ -1467,6 +1482,14 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
             entry=modes.setdefault(mode,{})
             if entry.get("token_budget")==previous_budgets[mode]:
                 entry["token_budget"]=new_budget
+    if prior_migration<35:
+        previous_budgets={"fast":6000,"standard":20000,"release":40000}
+        current_budgets={"fast":12000,"standard":24000,"release":48000}
+        modes=config.setdefault("routing",{}).setdefault("modes",{})
+        for mode,new_budget in current_budgets.items():
+            entry=modes.setdefault(mode,{})
+            if entry.get("token_budget")==previous_budgets[mode]:
+                entry["token_budget"]=new_budget
     if prior_migration<21:
         for mode in ("fast", "standard", "release"):
             config.setdefault("routing",{}).setdefault("modes",{}).setdefault(mode,{}).update({
@@ -1544,6 +1567,12 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
     if prior_migration<30:
         previous_budgets={"fast":4000,"standard":12000,"release":30000}
         current_budgets={"fast":6000,"standard":20000,"release":40000}
+        mode=str(task.get("mode","standard"))
+        if mode in previous_budgets and task.get("token_budget")==previous_budgets[mode]:
+            task["token_budget"]=current_budgets[mode]
+    if prior_migration<35:
+        previous_budgets={"fast":6000,"standard":20000,"release":40000}
+        current_budgets={"fast":12000,"standard":24000,"release":48000}
         mode=str(task.get("mode","standard"))
         if mode in previous_budgets and task.get("token_budget")==previous_budgets[mode]:
             task["token_budget"]=current_budgets[mode]
@@ -1688,10 +1717,11 @@ def install(source_root,target,args):
     provider_adapter_path=bootstrap_provider_preflight_adapter(target,args.provider_preflight_adapter)
     guardrails_data=project_guardrails_bytes(args.guardrails_file) if args.guardrails_file else None
     wanted,plugin_wanted,wanted_entry,entry_digest=source_contract(source_root)
-    agents_write,agents_conflicts=plan_agents_bootstrap(target/"AGENTS.md")
-    conflicts=agents_conflicts
+    agents_write,agents_conflicts=plan_bootstrap(target/"AGENTS.md","AGENTS.md")
+    claude_write,claude_conflicts=plan_bootstrap(target/"CLAUDE.md","CLAUDE.md")
+    conflicts=agents_conflicts+claude_conflicts
     if conflicts:
-        print("INSTALL BLOCKED: AGENTS.md contains a conflicting managed bootstrap")
+        print("INSTALL BLOCKED: a managed bootstrap anchor is locally modified")
         for item in conflicts: print(f"- {item}")
         return 2
     if args.dry_run: print(f"DRY RUN install {destination}"); return 0
@@ -1708,11 +1738,13 @@ def install(source_root,target,args):
         agents_state["migration_source"]=None; agents_state["updated_at"]=time.strftime("%Y-%m-%dT%H:%M:%S+00:00",time.gmtime())
         atomic_json(agents_path,agents_state)
         initialize_fresh_context(candidate)
-        candidate_agents=stage_agents_bootstrap(target,candidate_parent)
-        atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents)))
-        validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents)
+        candidate_agents=stage_bootstrap(target,candidate_parent,"AGENTS.md")
+        candidate_claude=stage_bootstrap(target,candidate_parent,"CLAUDE.md")
+        atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents),sha(candidate_claude)))
+        validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents,candidate_claude)
         replacements=[(candidate,destination)]
         if agents_write: replacements.append((candidate_agents,target/"AGENTS.md"))
+        if claude_write: replacements.append((candidate_claude,target/"CLAUDE.md"))
         commit_transaction(target,candidate_parent,replacements)
     except Exception:
         abort_transaction(target)
@@ -1756,21 +1788,25 @@ def execute(args,source_root,target):
             for label,items in (("missing",missing),("extra",extra),("changed",changed)):
                 for item in items: print(f"- {label}: {item}")
             return 2
-        agents_write,agents_conflicts=plan_agents_bootstrap(target/"AGENTS.md")
-        if agents_conflicts:
-            print("ADOPT BLOCKED: AGENTS.md contains a conflicting managed bootstrap")
-            for item in agents_conflicts: print(f"- {item}")
+        agents_write,agents_conflicts=plan_bootstrap(target/"AGENTS.md","AGENTS.md")
+        claude_write,claude_conflicts=plan_bootstrap(target/"CLAUDE.md","CLAUDE.md")
+        adopt_conflicts=agents_conflicts+claude_conflicts
+        if adopt_conflicts:
+            print("ADOPT BLOCKED: a managed bootstrap anchor is locally modified")
+            for item in adopt_conflicts: print(f"- {item}")
             return 2
         if args.dry_run: print(f"DRY RUN adopt workflow {VERSION}"); return 0
         candidate_parent=begin_transaction(target)
         try:
             candidate=candidate_parent/".agent"; copy_private_tree(destination,candidate)
-            candidate_agents=stage_agents_bootstrap(target,candidate_parent)
-            atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents)))
+            candidate_agents=stage_bootstrap(target,candidate_parent,"AGENTS.md")
+            candidate_claude=stage_bootstrap(target,candidate_parent,"CLAUDE.md")
+            atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents),sha(candidate_claude)))
             migrate_private(source,candidate,args.agent_platform_snapshot,project_root=target,allow_current_chat_local_release=args.allow_current_chat_local_release)
-            validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents)
+            validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents,candidate_claude)
             replacements=[(candidate,destination)]
             if agents_write: replacements.append((candidate_agents,target/"AGENTS.md"))
+            if claude_write: replacements.append((candidate_claude,target/"CLAUDE.md"))
             commit_transaction(target,candidate_parent,replacements)
         except Exception:
             abort_transaction(target)
@@ -1782,16 +1818,18 @@ def execute(args,source_root,target):
     wanted,plugin_wanted,wanted_entry,entry_digest=source_contract(source_root)
     installed=manifest(manifest_path,required=True)
     writes,removes,conflicts=plan_agent_update(wanted,installed,destination)
-    agents_write,agents_conflicts=plan_agents_bootstrap(target/"AGENTS.md")
-    conflicts=conflicts+agents_conflicts
+    agents_write,agents_conflicts=plan_bootstrap(target/"AGENTS.md","AGENTS.md")
+    claude_write,claude_conflicts=plan_bootstrap(target/"CLAUDE.md","CLAUDE.md")
+    conflicts=conflicts+agents_conflicts+claude_conflicts
     if conflicts:
         print("UPDATE BLOCKED: locally modified managed files"); [print(f"- {item}") for item in conflicts]; return 2
     if args.check:
         validate_project_guardrails(destination,allow_legacy=int(installed.get("migration_version",0))<33)
-        planned_agents_sha256=hashlib.sha256(render_agents_bootstrap(target/"AGENTS.md").encode()).hexdigest()
-        manifest_matches_source=installed==install_manifest(wanted,plugin_wanted,entry_digest,planned_agents_sha256)
-        if writes or removes or agents_write or installed.get("version")!=VERSION or installed.get("migration_version")!=MIGRATION_VERSION or not manifest_matches_source:
-            print(f"UPDATE AVAILABLE: writes={len(writes)} removes={len(removes)} bootstrap={int(agents_write)} version={installed.get('version')}->{VERSION}"); return 1
+        planned_agents_sha256=hashlib.sha256(render_bootstrap(target/"AGENTS.md").encode()).hexdigest()
+        planned_claude_sha256=hashlib.sha256(render_bootstrap(target/"CLAUDE.md").encode()).hexdigest()
+        manifest_matches_source=installed==install_manifest(wanted,plugin_wanted,entry_digest,planned_agents_sha256,planned_claude_sha256)
+        if writes or removes or agents_write or claude_write or installed.get("version")!=VERSION or installed.get("migration_version")!=MIGRATION_VERSION or not manifest_matches_source:
+            print(f"UPDATE AVAILABLE: writes={len(writes)} removes={len(removes)} bootstrap={int(agents_write or claude_write)} version={installed.get('version')}->{VERSION}"); return 1
         print(f"WORKFLOW CURRENT: {VERSION}"); return 0
     if int(installed.get("migration_version",0))<34:
         validate_legacy_active_context(destination)
@@ -1800,12 +1838,14 @@ def execute(args,source_root,target):
     try:
         candidate=candidate_parent/".agent"
         copy_private_tree(destination,candidate)
-        candidate_agents=stage_agents_bootstrap(target,candidate_parent)
+        candidate_agents=stage_bootstrap(target,candidate_parent,"AGENTS.md")
+        candidate_claude=stage_bootstrap(target,candidate_parent,"CLAUDE.md")
         write_managed(source,candidate,writes,removes); migrate_private(source,candidate,args.agent_platform_snapshot,project_root=target,allow_current_chat_local_release=args.allow_current_chat_local_release)
-        atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents)))
-        validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents)
+        atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents),sha(candidate_claude)))
+        validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents,candidate_claude)
         replacements=[(candidate,destination)]
         if agents_write: replacements.append((candidate_agents,target/"AGENTS.md"))
+        if claude_write: replacements.append((candidate_claude,target/"CLAUDE.md"))
         commit_transaction(target,candidate_parent,replacements)
     except Exception:
         abort_transaction(target)

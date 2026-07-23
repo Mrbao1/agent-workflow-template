@@ -6,7 +6,7 @@
 
 Token budgets are routing thresholds, not a reason to skip correctness gates or end the task. When exceeded, compact or split at a stable artifact boundary, publish the exact resume contract and continue from the canonical node. After compaction and before any final reply, `workflowctl route-resume` decides whether the root task is terminal; `terminal=false` forbids a completion claim.
 
-Default routing ceilings are `fast=6000`, `standard=20000`, and `release=40000` tokens. They are capacity limits, not spending targets: work still stops loading optional references at 60%, compacts at 75%, hard-blocks at 90%, uses one automatic test attempt in fast/standard, and keeps mode-specific wall-time limits. Raising a ceiling must never increase test repetition or Agent fan-out.
+Default routing ceilings are `fast=12000`, `standard=24000`, and `release=48000` tokens. They are capacity limits, not spending targets: work still stops loading optional references at 60%, compacts at 75%, hard-blocks at 90%, uses one automatic test attempt in fast/standard, and keeps mode-specific wall-time limits. Raising a ceiling must never increase test repetition or Agent fan-out.
 
 Capsule thresholds are separate from total task usage: soft 60%, compact 75%, hard 90%. Every checkpoint carries an explicit estimate bound to that checkpoint sequence and TASK invariant. Expansion uses the stricter of this fresh estimate and canonical TASK usage, so a stale low TASK counter cannot bypass compact or hard routing. Total usage must state whether it is measured by the host/platform or estimated; never record an unknown value as measured zero.
 

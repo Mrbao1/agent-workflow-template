@@ -8,7 +8,7 @@
     "default_mode": "standard",
     "modes": {
       "fast": {
-        "token_budget": 6000,
+        "token_budget": 12000,
         "max_loaded_references": 1,
         "max_child_agents": 0,
         "clean_reruns": 0,
@@ -17,7 +17,7 @@
         "max_automatic_test_attempts": 1
       },
       "standard": {
-        "token_budget": 20000,
+        "token_budget": 24000,
         "max_loaded_references": 3,
         "max_child_agents": 1,
         "clean_reruns": 0,
@@ -26,7 +26,7 @@
         "max_automatic_test_attempts": 1
       },
       "release": {
-        "token_budget": 40000,
+        "token_budget": 48000,
         "max_loaded_references": 6,
         "max_child_agents": 2,
         "clean_reruns": 1,
@@ -93,7 +93,6 @@
   },
   "guardrails_ready": true,
   "context": {
-    "capsule_path": ".agent/state/CONTEXT.json",
     "max_bytes": 8192,
     "max_list_items": 30,
     "max_capsule_tokens": {
@@ -113,8 +112,6 @@
     "max_rollback_entries": 4,
     "max_failure_entries": 8,
     "max_failure_archive_depth": 32,
-    "compact_after_phase": true,
-    "keep_chat_transcripts": false,
     "host_compaction_observer": {
       "source": "host-runtime-receipt",
       "signed_adapter": null,
@@ -153,7 +150,6 @@
   "runtime": {
     "registry": ".agent/state/runtime.json",
     "tool_leases_registry": ".agent/state/tool-leases.json",
-    "require_zero_residual": true,
     "term_timeout_seconds": 8
   },
   "agent_control": {
@@ -166,6 +162,12 @@
     "max_task_payload_single_bytes": 131072,
     "max_task_payload_total_bytes": 262144,
     "max_task_payload_estimated_tokens": 65536,
+    "inherit_parent_history": false,
+    "dispatch_payload_token_limits": {
+      "fast": 0,
+      "standard": 16000,
+      "release": 32000
+    },
     "platform_limit": 4,
     "reserve_root_slots": 1,
     "status_interval_seconds": 30,
@@ -196,22 +198,6 @@
       "signed_adapter": null,
       "max_receipt_age_seconds": 300
     },
-    "default_fork_turns": 0,
-    "inherited_turn_estimated_tokens": 800,
-    "child_system_tool_margin_tokens": 1000,
-    "child_output_margin_tokens": 2000,
-    "scheduler": {
-      "source": "host-scheduler",
-      "signed_adapter": null,
-      "automatic_resume": false,
-      "max_receipt_age_seconds": 300
-    },
-    "inherit_parent_history": false,
-    "dispatch_payload_token_limits": {
-      "fast": 0,
-      "standard": 16000,
-      "release": 32000
-    },
     "platform_observer": {
       "source": "orchestrator-tool-transcript",
       "automatic_release_trust": false,
@@ -222,7 +208,7 @@
       "source": "orchestrator-user-message",
       "automatic_gate_trust": false,
       "human_verification_required": true,
-      "allow_current_chat_local_release": true,
+      "allow_current_chat_local_release": false,
       "signed_adapter": null,
       "max_receipt_age_seconds": 900
     },
@@ -231,6 +217,16 @@
       "automatic_release_trust": false,
       "provider_verification_required": true,
       "signed_adapter": null,
+      "max_receipt_age_seconds": 300
+    },
+    "default_fork_turns": 0,
+    "inherited_turn_estimated_tokens": 800,
+    "child_system_tool_margin_tokens": 1000,
+    "child_output_margin_tokens": 2000,
+    "scheduler": {
+      "source": "host-scheduler",
+      "signed_adapter": null,
+      "automatic_resume": false,
       "max_receipt_age_seconds": 300
     }
   },
@@ -250,19 +246,19 @@
       "receipt_schema": "acceptance-live-gate/v2"
     },
     "acceptance-api": {
-      "implemented": false,
-      "runner": null,
-      "receipt_schema": null
+      "implemented": true,
+      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+      "receipt_schema": "local-command-release-gate/v1"
     },
     "acceptance-cli": {
-      "implemented": false,
-      "runner": null,
-      "receipt_schema": null
+      "implemented": true,
+      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+      "receipt_schema": "local-command-release-gate/v1"
     },
     "acceptance-ios": {
-      "implemented": false,
-      "runner": null,
-      "receipt_schema": null
+      "implemented": true,
+      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+      "receipt_schema": "local-command-release-gate/v1"
     }
   },
   "scope": {

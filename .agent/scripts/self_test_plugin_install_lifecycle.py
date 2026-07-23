@@ -33,6 +33,7 @@ def copy_source(source,destination):
     destination.mkdir(parents=True)
     shutil.copy2(source/"install.py",destination/"install.py")
     shutil.copy2(source/"AGENTS.md",destination/"AGENTS.md")
+    shutil.copy2(source/"CLAUDE.md",destination/"CLAUDE.md")
     shutil.copytree(source/".agent",destination/".agent")
     shutil.copytree(source/"plugins",destination/"plugins")
     shutil.copytree(source/".agents",destination/".agents")
@@ -149,17 +150,19 @@ def main():
         run(installer,target,"--project-name","fixture",env=env)
         manifest=json.loads((target/".agent/.workflow-manifest.json").read_text(encoding="utf-8"))
         if (
-            manifest.get("schema")!="agent-workflow-install/v3"
-            or manifest.get("version")!="3.1.41"
-            or manifest.get("migration_version")!=34
+            manifest.get("schema")!="agent-workflow-install/v4"
+            or manifest.get("version")!="3.1.42"
+            or manifest.get("migration_version")!=35
             or not isinstance(manifest.get("agent_files"),dict)
             or not isinstance(manifest.get("repo_plugin_files"),dict)
             or manifest.get("marketplace_entry",{}).get("name")!="pxpipe-context"
             or manifest.get("agents_bootstrap",{}).get("path")!="AGENTS.md"
+            or manifest.get("claude_bootstrap",{}).get("path")!="CLAUDE.md"
             or (target/PLUGIN).exists()
             or (target/MARKET).exists()
             or "Keep this block." not in (target/"AGENTS.md").read_text(encoding="utf-8")
             or (target/"AGENTS.md").read_text(encoding="utf-8").count("<!-- agent-workflow-bootstrap:start -->")!=1
+            or (target/"CLAUDE.md").read_text(encoding="utf-8").count("<!-- agent-workflow-bootstrap:start -->")!=1
         ): raise SystemExit("fresh install did not bind Agent state and canonical plugin expectations")
         run(installer,target,"--check",env=env)
 
@@ -226,8 +229,8 @@ def main():
         }
         (legacy/".agent/.workflow-manifest.json").write_text(json.dumps(legacy_manifest,indent=2)+"\n",encoding="utf-8")
         run(installer,legacy,"--update",env=env)
-        if json.loads((legacy/".agent/.workflow-manifest.json").read_text())["schema"]!="agent-workflow-install/v3":
-            raise SystemExit("v1 manifest was not migrated to v3")
+        if json.loads((legacy/".agent/.workflow-manifest.json").read_text())["schema"]!="agent-workflow-install/v4":
+            raise SystemExit("v1 manifest was not migrated to v4")
 
         # Adopt records canonical plugin expectations but leaves a project
         # marketplace byte-for-byte untouched.
@@ -249,7 +252,7 @@ def main():
         template_market=json.loads((template/MARKET).read_text(encoding="utf-8"))
         next(item for item in template_market["plugins"] if item["name"]=="pxpipe-context")["category"]="Context"
         (template/MARKET).write_text(json.dumps(template_market,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
-        before=(tree(rollback/".agent"),tree(rollback/PLUGIN),tree(rollback/MARKET),tree(rollback/"AGENTS.md"))
+        before=(tree(rollback/".agent"),tree(rollback/PLUGIN),tree(rollback/MARKET),tree(rollback/"AGENTS.md"),tree(rollback/"CLAUDE.md"))
         spec=importlib.util.spec_from_file_location("transactional_installer",installer)
         module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         real_replace=module.os.replace; fail_target=(rollback/"AGENTS.md").resolve()
@@ -266,7 +269,7 @@ def main():
             else: raise SystemExit("transaction fault injection did not fail")
         finally:
             module.os.replace=real_replace; sys.argv=saved_argv
-        after=(tree(rollback/".agent"),tree(rollback/PLUGIN),tree(rollback/MARKET),tree(rollback/"AGENTS.md"))
+        after=(tree(rollback/".agent"),tree(rollback/PLUGIN),tree(rollback/MARKET),tree(rollback/"AGENTS.md"),tree(rollback/"CLAUDE.md"))
         if after!=before: raise SystemExit("failed update did not roll back Agent and AGENTS bootstrap")
 
         # A hard process death between target swaps leaves a durable journal.
@@ -276,7 +279,7 @@ def main():
         run(installer,crash,"--project-name","fixture",env=env)
         project_note=crash/"project-owned.txt"; project_note.write_text("preserve me\n",encoding="utf-8")
         (crash/"AGENTS.md").unlink()
-        predecessor=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"))
+        predecessor=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"),tree(crash/"CLAUDE.md"))
         mutate_source(template,"hard-crash")
         crash_env=dict(env); crash_env["AGENT_WORKFLOW_INSTALL_SELF_TEST_CRASH_AFTER_TARGET"]="2"
         killed=subprocess.run(
@@ -287,7 +290,7 @@ def main():
         if killed.returncode!=97 or not journal.is_file():
             raise SystemExit(f"hard-crash fixture did not leave a recoverable journal: {killed.returncode}\n{killed.stdout}")
         run(installer,crash,"--check",expected=1,env=env)
-        recovered=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"))
+        recovered=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"),tree(crash/"CLAUDE.md"))
         if recovered!=predecessor:
             raise SystemExit("hard-crash recovery did not restore the exact predecessor before planning")
         run(installer,crash,"--update",env=env)
@@ -309,10 +312,10 @@ def main():
         )
         if committed.returncode!=98 or not journal.is_file():
             raise SystemExit("committed-crash fixture did not preserve its cleanup journal")
-        committed_tree=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"))
+        committed_tree=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"),tree(crash/"CLAUDE.md"))
         run(installer,crash,"--check",env=env)
         if (
-            committed_tree!=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"))
+            committed_tree!=(tree(crash/".agent"),tree(crash/PLUGIN),tree(crash/MARKET),tree(crash/"AGENTS.md"),tree(crash/"CLAUDE.md"))
             or journal.exists()
             or any(item.name.startswith(f".{crash.name}.agent-workflow-txn-") for item in crash.parent.iterdir())
         ):

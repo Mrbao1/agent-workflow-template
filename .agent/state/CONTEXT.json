@@ -1,12 +1,12 @@
 {
   "schema": "agent-context/v2",
-  "policy_bundle_sha256": "3b2ecfbcb75b937e31a80f5db5be35bf476d45a33cfa100bab790fce2522370f",
+  "policy_bundle_sha256": "6656f1d72a6ff86928818a95243d531a043e6a38177c0fc67b8a826f2c04b17a",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
+  "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00",
   "requirement_contract_sha256": "unapproved-draft",
-  "phase_summary": "atomically initialized project guardrails",
+  "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
     "requirement_source=pending",
     "requirements_clarified=false",
@@ -26,46 +26,46 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5"
+    "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00"
   },
   "checkpoint": {
-    "sequence": 1,
-    "reason": "project-init",
-    "updated_at": "2026-07-22T10:22:04+00:00",
-    "previous_sha256": "none",
-    "previous_task_invariant_sha256": "none",
+    "sequence": 3,
+    "reason": "fresh-project-seed",
+    "updated_at": "2026-07-23T11:54:22+00:00",
+    "previous_sha256": "ad55895db9e879b4c9a0658d07f47be3819a03b49a29c7fe8e99c3f7e5639e45",
+    "previous_task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
     "task_delta": [
-      "initial_canonical_task_state"
+      "canonical_task_state"
     ],
     "transition_authorization": null
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 1,
-    "task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
+    "checkpoint_sequence": 3,
+    "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
-    "observed_at": "2026-07-22T10:22:04+00:00"
+    "observed_at": "2026-07-23T11:54:22+00:00"
   },
   "compaction": {
     "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 562,
-    "tokens_removed": 238,
-    "compression_ratio": 1.42,
+    "capsule_estimated_tokens": 590,
+    "tokens_removed": 210,
+    "compression_ratio": 1.36,
     "method": "explicit-estimate/v1",
-    "reason": "project-init",
-    "source": "agentctl:project-init",
+    "reason": "fresh-project-seed",
+    "source": "project-init:bootstrap",
     "budget_snapshot": {
       "task_tokens_used": 0,
       "current_checkpoint_estimated_tokens": 800,
-      "task_token_budget": 20000,
+      "task_token_budget": 24000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
       "child_reserved_tokens": 0,
       "child_settled_tokens": 0,
       "consumed_tokens": 800,
-      "budget_ratio": 0.04,
+      "budget_ratio": 0.0333,
       "watermark": "normal",
       "assurance": {
         "level": "best-effort-estimate",
@@ -77,8 +77,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-22T10:22:04+00:00",
-    "source": "agentctl:project-init",
-    "content_sha256": "db8e8f816767254f34b4d164f96fc93e0b9391f5aedf332f1d2dd9b8210edebd"
+    "verified_at": "2026-07-23T11:54:22+00:00",
+    "source": "project-init:bootstrap",
+    "content_sha256": "b5be3ba3e7f72a34b5e947c4753dbf984a10efcd993facb9b3ef198b56df0f0d"
   }
 }

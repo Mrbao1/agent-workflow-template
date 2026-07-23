@@ -53,7 +53,7 @@ control_contract = "# Requirement Contract\n\n- Human decisions: user:runtime-se
 control_task.update({
     "title": "managed-runtime-self-test",
     "mode": "standard",
-    "token_budget": 20000,
+    "token_budget": 24000,
     "tokens_used": 0,
     "budget_state": "ok",
     "status": "in_progress",

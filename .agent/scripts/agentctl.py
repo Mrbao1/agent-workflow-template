@@ -488,9 +488,18 @@ def process_snapshot(pid: int) -> Optional[Dict[str, object]]:
     return {**after, "cwd": str(cwd_record["cwd"])}
 
 
-def live_ancestor_identities() -> Optional[Dict[int, Dict[str, object]]]:
-    """Derive the caller chain and its process groups from stable identities."""
+def _walk_ancestors() -> Tuple[Dict[int, Dict[str, object]], bool]:
+    """Collect the caller chain, reporting whether every ancestor was inspectable.
+
+    A ``gone`` ancestor is a normal boundary (the branch simply ends).  An
+    ``unavailable`` ancestor (e.g. a macOS cross-uid parent that denies
+    ``proc_pidinfo`` with EPERM, common inside nested sandboxes) stops that
+    branch but is recorded as an incomplete walk.  Callers that only need to
+    exclude the visible caller chain can use the partial result safely; callers
+    that must fail closed on any unknown ancestor consume ``complete``.
+    """
     result: Dict[int, Dict[str, object]] = {}
+    complete = True
     pending = [os.getpid(), os.getppid()]
     while pending:
         current = pending.pop()
@@ -501,10 +510,23 @@ def live_ancestor_identities() -> Optional[Dict[int, Dict[str, object]]]:
             if status == "gone":
                 break
             if status != "ok" or record is None:
-                return None
+                # An uninspectable ancestor is outside what we can attribute;
+                # stop ascending this branch but mark the chain incomplete.
+                complete = False
+                break
             result[current] = record
             current = int(record["ppid"])
-    return result
+    return result, complete
+
+
+def live_ancestor_identities() -> Optional[Dict[int, Dict[str, object]]]:
+    """Derive the caller chain, fail-closed when any ancestor is uninspectable.
+
+    Kill/registration guards depend on a ``None`` here to refuse action when the
+    chain cannot be fully proven, so this strict view is preserved unchanged.
+    """
+    result, complete = _walk_ancestors()
+    return result if complete else None
 
 
 def live_ancestor_pids() -> Optional[set[int]]:
@@ -513,9 +535,17 @@ def live_ancestor_pids() -> Optional[set[int]]:
 
 
 def process_group_intersects_live_ancestors(pgid: int) -> Optional[bool]:
-    identities = live_ancestor_identities()
-    if identities is None:
-        return None
+    """Report whether ``pgid`` is one of the caller chain's own process groups.
+
+    Both callers (isolated-group termination and manual registration) only need
+    to avoid acting on the controller's own session.  A process group is
+    session- and uid-scoped, so an uninspectable cross-uid ancestor cannot share
+    a PGID with the same-uid, freshly-sessioned managed or registrable group
+    under consideration.  The visible chain is therefore authoritative for this
+    disjointness decision, and an incomplete walk (e.g. a macOS cross-uid parent
+    that denies inspection) must not permanently refuse every cleanup.
+    """
+    identities, _complete = _walk_ancestors()
     return any(int(item.get("pgid", 0)) == pgid for item in identities.values())
 
 
@@ -581,9 +611,11 @@ def project_processes() -> Optional[List[Dict[str, object]]]:
             records[observed_pid]["command"] = line[1:]
         elif observed_pid is not None and line.startswith("n"):
             records[observed_pid]["cwd"] = line[1:]
-    ancestor_identities = live_ancestor_identities()
-    if ancestor_identities is None:
-        return None
+    # Exclusion only removes the visible caller chain, so a partial walk is
+    # safe: an uninspectable cross-uid ancestor lives outside the project root
+    # and never appears in this cwd-scoped scan.  Missing an exclusion can only
+    # over-report a suspicious residual, never hide one.
+    ancestor_identities, _ = _walk_ancestors()
     excluded = set(ancestor_identities) | {probe.pid}
     snapshots: List[Dict[str, object]] = []
     for pid, raw in sorted(records.items()):
@@ -655,7 +687,10 @@ def project_ancestor_chain(pid: int) -> List[Dict[str, object]]:
         if status == "gone":
             break
         if status != "ok" or identity is None:
-            return []
+            # An uninspectable cross-uid ancestor sits above the project-cwd
+            # supervisor chain; stop ascending but keep the visible chain rather
+            # than discarding the audited lease entirely.
+            break
         current = int(identity["ppid"])
     return chain
 

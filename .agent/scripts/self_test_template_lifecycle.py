@@ -187,8 +187,12 @@ def main() -> int:
             or installed_manifest.get("agents_bootstrap") != {
                 "path": "AGENTS.md", "sha256": digest(target / "AGENTS.md"),
             }
+            or installed_manifest.get("claude_bootstrap") != {
+                "path": "CLAUDE.md", "sha256": digest(target / "CLAUDE.md"),
+            }
+            or (target / "CLAUDE.md").read_text(encoding="utf-8").count("<!-- agent-workflow-bootstrap:start -->") != 1
         ):
-            raise SystemExit("install manifest does not bind the complete preserved AGENTS.md")
+            raise SystemExit("install manifest does not bind the complete preserved AGENTS.md and managed CLAUDE.md")
         fresh_full_config = json.loads((target / ".agent/config.json").read_text(encoding="utf-8"))
         fresh_config = fresh_full_config["agent_control"]
         fresh_task = json.loads((target / ".agent/state/TASK.json").read_text(encoding="utf-8"))
@@ -199,7 +203,7 @@ def main() -> int:
             or fresh_agents.get("replay_runs") != []
             or fresh_agents.get("task_payload_schema") != "agent-task-payload/v2"
             or fresh_agents.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 20000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
                 "settled_tokens": 0,
             }
             or fresh_agents.get("task_payload_limits") != {
@@ -207,7 +211,7 @@ def main() -> int:
                 "max_total_bytes": 262144, "max_estimated_tokens": 65536,
             }
             or {name: entry.get("token_budget") for name, entry in fresh_full_config.get("routing", {}).get("modes", {}).items()} != {
-                "fast": 6000, "standard": 20000, "release": 40000,
+                "fast": 12000, "standard": 24000, "release": 48000,
             }
             or fresh_config.get("status_interval_seconds") != 30
             or fresh_config.get("monitor_grace_seconds") != 30
@@ -409,7 +413,7 @@ def main() -> int:
         if (
             migrated_v8.get("schema") != "agent-team/v9"
             or migrated_v8.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 20000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
                 "settled_tokens": 0,
             }
         ):
@@ -470,6 +474,56 @@ def main() -> int:
         run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=migration28)
         run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=migration28)
 
+        # Migration 35 raises the exact old routing/token defaults
+        # (6000/20000/40000) to 12000/24000/48000 without disturbing a
+        # project-owned custom budget.
+        migration35 = workspace / "migration35-token-budgets"
+        run(sys.executable, str(installer), str(migration35), "--project-name", "fixture-migration35")
+        m35_config_path = migration35 / ".agent/config.json"
+        m35_config = json.loads(m35_config_path.read_text(encoding="utf-8"))
+        for mode, budget in (("fast", 6000), ("standard", 20000), ("release", 40000)):
+            m35_config["routing"]["modes"][mode]["token_budget"] = budget
+        m35_config_path.write_text(json.dumps(m35_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        m35_task_path = migration35 / ".agent/state/TASK.json"
+        m35_task = json.loads(m35_task_path.read_text(encoding="utf-8"))
+        m35_task["token_budget"] = 20000
+        m35_task_path.write_text(json.dumps(m35_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        m35_agents_path = migration35 / ".agent/state/agents.json"
+        m35_agents = json.loads(m35_agents_path.read_text(encoding="utf-8"))
+        m35_agents["token_accounting"]["token_budget"] = 20000
+        m35_agents_path.write_text(json.dumps(m35_agents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        m35_manifest_path = migration35 / ".agent/.workflow-manifest.json"
+        m35_manifest = json.loads(m35_manifest_path.read_text(encoding="utf-8"))
+        m35_manifest["version"] = "3.1.41"
+        m35_manifest["migration_version"] = 34
+        m35_manifest_path.write_text(json.dumps(m35_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(migration35), "--update")
+        m35_migrated = json.loads(m35_config_path.read_text(encoding="utf-8"))
+        if {mode: m35_migrated["routing"]["modes"][mode]["token_budget"] for mode in ("fast", "standard", "release")} != {
+            "fast": 12000, "standard": 24000, "release": 48000,
+        }:
+            raise SystemExit("migration 35 did not raise the exact old routing token budgets")
+        m35_task_after = json.loads(m35_task_path.read_text(encoding="utf-8"))
+        if m35_task_after["token_budget"] != 24000:
+            raise SystemExit("migration 35 did not rebind the active standard task budget")
+        run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=migration35)
+
+        custom35 = workspace / "migration35-custom-budgets"
+        run(sys.executable, str(installer), str(custom35), "--project-name", "fixture-migration35-custom")
+        custom35_config_path = custom35 / ".agent/config.json"
+        custom35_config = json.loads(custom35_config_path.read_text(encoding="utf-8"))
+        custom35_config["routing"]["modes"]["fast"]["token_budget"] = 9000
+        custom35_config_path.write_text(json.dumps(custom35_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        custom35_manifest_path = custom35 / ".agent/.workflow-manifest.json"
+        custom35_manifest = json.loads(custom35_manifest_path.read_text(encoding="utf-8"))
+        custom35_manifest["version"] = "3.1.41"
+        custom35_manifest["migration_version"] = 34
+        custom35_manifest_path.write_text(json.dumps(custom35_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(custom35), "--update")
+        custom35_migrated = json.loads(custom35_config_path.read_text(encoding="utf-8"))
+        if custom35_migrated["routing"]["modes"]["fast"]["token_budget"] != 9000:
+            raise SystemExit("migration 35 overwrote a project-owned custom fast token budget")
+
         # If a template-managed reference was actively loaded under v33, its
         # purpose/phase stay live while migration 34 rebinds the changed bytes.
         loaded33 = workspace / "migration33-loaded-managed-reference"
@@ -517,6 +571,7 @@ def main() -> int:
             "repo_plugin_files": loaded_manifest["repo_plugin_files"],
             "marketplace_entry_sha256": loaded_manifest["marketplace_entry"]["sha256"],
             "agents_bootstrap_sha256": loaded_manifest["agents_bootstrap"]["sha256"],
+            "claude_bootstrap_sha256": loaded_manifest["claude_bootstrap"]["sha256"],
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         loaded_manifest_path.write_text(
             json.dumps(loaded_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -792,7 +847,7 @@ def main() -> int:
         if (
             adopted_v8_agents.get("schema") != "agent-team/v9"
             or adopted_v8_agents.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 20000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
                 "settled_tokens": 0,
             }
         ):

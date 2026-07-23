@@ -2,7 +2,7 @@
 
 Requires Python 3.9 or newer.
 
-This repository is the canonical mother template used to start or upgrade projects. Version 3.1.41 implements a clarification-first, template-driven AI Coding pipeline with adaptive `fast`, `standard`, and `release` modes. Project-private config, policies, task state, runtime state and evidence are never copied between the template and an installed project.
+This repository is the canonical mother template used to start or upgrade projects. Version 3.1.42 implements a clarification-first, template-driven AI Coding pipeline with adaptive `fast`, `standard`, and `release` modes. Project-private config, policies, task state, runtime state and evidence are never copied between the template and an installed project.
 
 ## Install
 
@@ -32,7 +32,7 @@ Node 6 and Node 7 cannot advance on schema validity alone. Their mode-selected d
 
 ## Context, Tokens and resume
 
-The workflow keeps one bounded `agent-context/v2` capsule, but capsule size is not the total task budget. The unified `agent-total-token-budget/v1` account combines root usage, loaded-reference reservations, child reservations and settled child charges. Each child charge includes sealed input, inherited fork-window cost, system/tool margin and output margin. Fast, standard and release ceilings are 6k, 20k and 40k Tokens; they are routing ceilings, not spending targets or provider billing limits. Without a configured usage observer, the account is explicitly `best-effort-estimate`, allows for unmetered direct reads and reports the configured estimation-error ratio.
+The workflow keeps one bounded `agent-context/v2` capsule, but capsule size is not the total task budget. The unified `agent-total-token-budget/v1` account combines root usage, loaded-reference reservations, child reservations and settled child charges. Each child charge includes sealed input, inherited fork-window cost, system/tool margin and output margin. Fast, standard and release ceilings are 12k, 24k and 48k Tokens; they are routing ceilings, not spending targets or provider billing limits. Without a configured usage observer, the account is explicitly `best-effort-estimate`, allows for unmetered direct reads and reports the configured estimation-error ratio.
 
 Every context checkpoint binds a `policy_bundle_sha256` over `.agent/config.json`, `.agent/INDEX.md`, all workflow rules, `templates/manifest.json` and the active Skill. Policy drift therefore invalidates the capsule instead of silently resuming under different rules. At the compact watermark, the capsule publishes an exact `agent-context-resume/v1` contract binding task status, current node, next action, budget state and TASK digest. Expansion is blocked until that compact handoff validates.
 
@@ -160,6 +160,8 @@ Migration 31 adds an explicit Codex current-chat trust option for local release-
 Version 3.1.34 makes node-7 acceptance rendering mode-aware. Standard tasks provide only common acceptance variables and the renderer omits every release-only authority field; release tasks still require the complete reviewer, scenario, platform and live-gate chain. This removes an impossible template/validator contradiction without weakening release gates.
 
 Version 3.1.39 raises only the fast context capsule ceiling from 600 to 1000 tokens. A valid fresh-install fast task already needs more than 600 tokens for its integrity, checkpoint and resume envelope; the new ceiling retains a stricter bound than standard mode while adding measured headroom. Migration 32 upgrades only the exact old default and preserves project-owned custom limits. Template lifecycle coverage now proves explicit fast, qualifying auto-fast and approved Node 2 startup on a fresh install.
+
+Version 3.1.42 / Migration 35 raises routing token budgets from 6k/20k/40k to 12k/24k/48k so that mandatory framework context fits within fast mode with room for actual work, while preserving project-owned custom budgets. The macOS runtime baseline now tolerates cross-uid ancestor processes (common in nested sandboxes) via a partial-chain inspection fallback. Every installed or updated project also receives a managed CLAUDE.md bootstrap anchor alongside the existing AGENTS.md anchor. CI now runs the full test suite on both macOS and Ubuntu.
 
 Version 3.1.41 / Migration 34 validates an active predecessor capsule before update, rebinds unchanged loaded managed references to their new bytes, and then creates one final policy-bound context checkpoint without mutating canonical task intent. Version 3.1.40 / Migration 33 separates the release-managed workflow from all live template-private state. New projects are created from the immutable fresh-state seed; migration defaults use the same seed; project guardrails become ready only through the atomic content-addressed project-init operation. Install output stays fail-closed until that operation succeeds, and lifecycle CI covers polluted-source isolation and transaction rollback.
 

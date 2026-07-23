@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix="control-gates-") as raw:
         "requirement_source": "user:fixture", "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
         "requirement_contract_sha256": digest, "primary_skill": "run-ai-coding-pipeline",
         "risk_flags": {key: False for key in ("deploy", "data_risk", "cross_system", "uncertain", "security", "compliance", "migration", "irreversible", "external_impact")},
-        "token_budget": 40000, "tokens_used": 30000, "token_usage_source": "estimated",
+        "token_budget": 48000, "tokens_used": 36000, "token_usage_source": "estimated",
         "usage_receipts": [], "budget_state": "must_compact", "child_agents_used": 0,
         "peak_child_agents": 0, "loaded_references": [], "selected_templates": ["requirement-contract"],
         "selected_capabilities": ["core"], "template_route": None, "rendered_artifacts": [],
@@ -95,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix="control-gates-") as raw:
         "gate_approvals": {"requirement": "user:fixture"}, "pending_gate_artifacts": {},
         "rollback_ledger": [], "rollback_archive": None,
         "failure_ledger": {}, "failure_archive": None, "mode_status": "confirmed",
-        "metrics": {"tokens": 30000, "token_source": "estimated", "child_agents": 0, "peak_children": 0,
+        "metrics": {"tokens": 36000, "token_source": "estimated", "child_agents": 0, "peak_children": 0,
                     "tool_calls": 0, "test_runs": 0, "test_failures": 0, "repair_rounds": 0,
                     "user_corrections": 0, "context_compactions": 0, "references_loaded": 0},
         "updated": "2026-07-17",
@@ -115,9 +115,9 @@ with tempfile.TemporaryDirectory(prefix="control-gates-") as raw:
 
     # Observed/estimated usage is never discarded merely because it crossed the
     # hard watermark; it is recorded and all expansion is then blocked.
-    run(root, "agentctl", "record-usage", "--tokens", "6000", "--source", "estimated")
+    run(root, "agentctl", "record-usage", "--tokens", "7200", "--source", "estimated")
     hard = json.loads((state / "TASK.json").read_text(encoding="utf-8"))
-    if hard["tokens_used"] != 36000 or hard["budget_state"] != "hard_blocked":
+    if hard["tokens_used"] != 43200 or hard["budget_state"] != "hard_blocked":
         raise AssertionError("hard-watermark usage was not recorded truthfully")
     run(root, "agentctl", "budget-gate", "--action", "finish-node", expected=2)
     run(root, "agentctl", "budget-gate", "--action", "rollback")
@@ -173,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix="human-decision-v1-") as raw:
             "deploy", "data_risk", "cross_system", "uncertain", "security",
             "compliance", "migration", "irreversible", "external_impact",
         )},
-        "token_budget": 40000, "tokens_used": 0, "token_usage_source": "estimated",
+        "token_budget": 48000, "tokens_used": 0, "token_usage_source": "estimated",
         "usage_receipts": [], "budget_state": "ok", "child_agents_used": 0,
         "peak_child_agents": 0, "loaded_references": [],
         "selected_templates": ["requirement-contract"], "selected_capabilities": ["core"],
@@ -284,7 +284,7 @@ with tempfile.TemporaryDirectory(prefix="workflow-hot-state-") as raw:
             "deploy", "data_risk", "cross_system", "uncertain", "security",
             "compliance", "migration", "irreversible", "external_impact",
         )},
-        "token_budget": 20000, "tokens_used": 0, "token_usage_source": "estimated",
+        "token_budget": 24000, "tokens_used": 0, "token_usage_source": "estimated",
         "usage_receipts": [], "budget_state": "ok", "child_agents_used": 0,
         "peak_child_agents": 0, "loaded_references": [], "selected_templates": ["solution"],
         "selected_capabilities": ["core"], "template_route": None,
@@ -395,7 +395,7 @@ with tempfile.TemporaryDirectory(prefix="fast-route-") as raw:
         "branch": "unversioned", "status": "in_progress", "phase": "planning",
         "requirements_clarified": True, "requirement_source": "user:fixture",
         "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md", "requirement_contract_sha256": digest,
-        "token_budget": 6000, "tokens_used": 0, "token_usage_source": "estimated", "usage_receipts": [],
+        "token_budget": 12000, "tokens_used": 0, "token_usage_source": "estimated", "usage_receipts": [],
         "budget_state": "ok", "child_agents_used": 0, "peak_child_agents": 0,
         "loaded_references": [], "selected_templates": ["requirement-contract"], "selected_capabilities": ["core"],
         "template_route": None, "rendered_artifacts": [], "decisions": [], "open_questions": [],

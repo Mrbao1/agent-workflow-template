@@ -117,7 +117,7 @@ def run(root: Path, *args: str, expected: int = 0) -> str:
 
 
 def task(mode: str, node: int, accepted: list[int]) -> dict[str, object]:
-    token_budget = {"fast": 6000, "standard": 20000, "release": 40000}[mode]
+    token_budget = {"fast": 12000, "standard": 24000, "release": 48000}[mode]
     value = json.loads((SOURCE / "state/TASK.json").read_text(encoding="utf-8"))
     value.update({
         "schema": "agent-task/v2", "title": f"{mode} fixture", "mode": mode,
@@ -1528,7 +1528,7 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     context_path = root / ".agent/state/CONTEXT.json"
     context_before = context_path.read_bytes()
     combined_context = json.loads(context_before)
-    combined_context["usage_freshness"] = {"estimated_tokens": 10000}
+    combined_context["usage_freshness"] = {"estimated_tokens": 13000}
     write_json(context_path, combined_context)
     write_json(agents_path, {"prepared_dispatches": [{
         "fork_turns": 0,
