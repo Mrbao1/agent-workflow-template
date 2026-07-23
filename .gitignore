@@ -6,3 +6,4 @@ __pycache__/
 .agent/state/.context.lock
 .agent/state/.project-init.lock
 outputs/
+.idea/
