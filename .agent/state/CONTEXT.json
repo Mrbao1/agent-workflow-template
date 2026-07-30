@@ -1,7 +1,7 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "36493b2c40b27e5d9c44579f0da6b1f63fe474a4d66b503d6e00305d0b046d6c",
+  "policy_bundle_sha256": "6996de270a89c1df2fbe4f520d29193670e8125a7158bd6e9e8cf54661d6eb90",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
@@ -30,10 +30,10 @@
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
   },
   "checkpoint": {
-    "sequence": 8,
-    "reason": "fresh-project-seed",
-    "updated_at": "2026-07-30T10:14:04+00:00",
-    "previous_sha256": "bc9137cf5137bd77fe90a95a688af6068f88184a43abfc2bf9d126197bcefb67",
+    "sequence": 10,
+    "reason": "rebind live capsule after rollback-compat patch",
+    "updated_at": "2026-07-30T13:21:46+00:00",
+    "previous_sha256": "6ebc990f99fd18611c85cf471d95e10e977b3185d3c94bc3a5244a82cbf71b08",
     "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "task_delta": [
       "canonical_task_state"
@@ -42,24 +42,24 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 8,
+    "checkpoint_sequence": 10,
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
-    "estimated_tokens": 800,
-    "observed_at": "2026-07-30T10:14:04+00:00"
+    "estimated_tokens": 1000,
+    "observed_at": "2026-07-30T13:21:46+00:00"
   },
   "compaction": {
-    "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 601,
-    "tokens_removed": 199,
-    "compression_ratio": 1.33,
+    "source_estimated_tokens": 1000,
+    "capsule_estimated_tokens": 714,
+    "tokens_removed": 286,
+    "compression_ratio": 1.4,
     "method": "explicit-estimate/v1",
-    "reason": "fresh-project-seed",
-    "source": "project-init:bootstrap",
+    "reason": "rebind live capsule after rollback-compat patch",
+    "source": "agent:contextctl",
     "budget_snapshot": {
       "task_tokens_used": 0,
-      "current_checkpoint_estimated_tokens": 800,
+      "current_checkpoint_estimated_tokens": 1000,
       "task_token_budget": 48000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
@@ -78,8 +78,15 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-30T10:14:04+00:00",
-    "source": "project-init:bootstrap",
-    "content_sha256": "d3c85be5f991c59ecc6602c0eeb3e2e8cfc0d6c92d69258ad685db85d02fa0f9"
+    "verified_at": "2026-07-30T13:21:46+00:00",
+    "source": "user:rollback compat patch",
+    "repair_capsule_sha256": "d02695bc9fa2322eb4519af0e365642547622936ab571c3ba30378ccad92b4e2",
+    "repair_approval": {
+      "source": "user:rollback compat patch",
+      "artifact_sha256": "d02695bc9fa2322eb4519af0e365642547622936ab571c3ba30378ccad92b4e2",
+      "assurance": "explicit-user-message;local-only;not-provider-verified",
+      "routing_profile_sha256": "4eb1c0e34b0540966fd3469921adc5f4db1f579eb5c2d78a0ccfdc636cc81f72"
+    },
+    "content_sha256": "bbdcaab4af67f699268b6f40e2c8850601889488bebfc3388aaff12fa78210bc"
   }
 }

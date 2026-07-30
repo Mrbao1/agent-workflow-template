@@ -1,7 +1,7 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "98b0c8d35d7349d95c12c81b1033bef806aa690bce6a8e99cd6b049353f5d7c9",
+  "policy_bundle_sha256": "59a28f48a5ca504c3083de4af3554449039bca648255e2604e758973bb9777f3",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
@@ -30,10 +30,10 @@
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
   },
   "checkpoint": {
-    "sequence": 7,
+    "sequence": 8,
     "reason": "fresh-project-seed",
-    "updated_at": "2026-07-30T10:13:41+00:00",
-    "previous_sha256": "f41aa732b7a4c61ac8151a0aa94ca76d305a10e0704592c79bd3c9ee6b56800a",
+    "updated_at": "2026-07-30T13:20:51+00:00",
+    "previous_sha256": "bc9137cf5137bd77fe90a95a688af6068f88184a43abfc2bf9d126197bcefb67",
     "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "task_delta": [
       "canonical_task_state"
@@ -42,12 +42,12 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 7,
+    "checkpoint_sequence": 8,
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
-    "observed_at": "2026-07-30T10:13:41+00:00"
+    "observed_at": "2026-07-30T13:20:51+00:00"
   },
   "compaction": {
     "source_estimated_tokens": 800,
@@ -78,8 +78,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-30T10:13:41+00:00",
+    "verified_at": "2026-07-30T13:20:51+00:00",
     "source": "project-init:bootstrap",
-    "content_sha256": "aa1e9ee7e1d28418a2ccc5423eee5011ed0808cac343d77d0d9a465ca752ae78"
+    "content_sha256": "82ee551682cb502a4707be210c9ddb8faf25494c7250d9c0b22b7093f7216135"
   }
 }
