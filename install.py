@@ -1229,27 +1229,36 @@ def inside(path, boundary):
     except ValueError: return False
 
 
-def protected_external_adapter(adapter_owner, raw):
+def protected_external_adapter_reject_reason(adapter_owner, raw):
     requested=Path(raw).expanduser()
-    if not requested.is_absolute(): return False
+    if not requested.is_absolute(): return f"not absolute: {raw!r}"
     try: path=requested.resolve(strict=True)
-    except OSError: return False
-    if requested!=path or inside(path,adapter_owner.resolve()): return False
+    except OSError: return f"cannot resolve: {raw!r}"
+    if requested!=path: return f"resolves to a different path: {path}"
+    if inside(path,adapter_owner.resolve()): return "inside the project tree"
     temporary_roots={Path(tempfile.gettempdir()).resolve(),Path("/tmp").resolve(),Path("/private/tmp").resolve(),Path("/var/tmp").resolve()}
-    if any(inside(path,candidate) for candidate in temporary_roots): return False
-    if not path.is_file() or not stat.S_ISREG(path.stat().st_mode) or not os.access(path,os.X_OK) or not hasattr(os,"geteuid"): return False
+    if any(inside(path,candidate) for candidate in temporary_roots): return "inside a temporary root"
+    if not hasattr(os,"geteuid"): return "platform has no euid concept"
+    if not path.is_file() or not stat.S_ISREG(path.stat().st_mode): return "not a regular file"
+    if not os.access(path,os.X_OK): return "not executable"
     current_uid=os.geteuid(); current=Path(path.anchor); chain=[current]
     for part in path.parts[1:]:
         current=current/part
         try: metadata=current.lstat()
-        except OSError: return False
-        if stat.S_ISLNK(metadata.st_mode): return False
+        except OSError: return f"cannot stat chain element: {current}"
+        if stat.S_ISLNK(metadata.st_mode): return f"symlink in path chain: {current}"
         chain.append(current)
     for item in chain:
         try: metadata=item.stat()
-        except OSError: return False
-        if metadata.st_uid==current_uid or stat.S_IMODE(metadata.st_mode)&0o022 or os.access(item,os.W_OK): return False
-    return True
+        except OSError: return f"cannot stat chain element: {item}"
+        if metadata.st_uid==current_uid: return f"chain element owned by current uid {current_uid}: {item}"
+        if stat.S_IMODE(metadata.st_mode)&0o022: return f"chain element group/world-writable: {item}"
+        if os.access(item,os.W_OK): return f"chain element writable by current user: {item}"
+    return None
+
+
+def protected_external_adapter(adapter_owner, raw):
+    return protected_external_adapter_reject_reason(adapter_owner, raw) is None
 
 
 def bootstrap_human_decision_adapter(target,raw):
@@ -1262,8 +1271,11 @@ def bootstrap_human_decision_adapter(target,raw):
     )
     if raw is None:
         return None
-    if not isinstance(raw,str) or not raw.strip() or not protected_external_adapter(target.resolve(),raw):
+    if not isinstance(raw,str) or not raw.strip():
         raise RuntimeError(guidance)
+    reject_reason=protected_external_adapter_reject_reason(target.resolve(),raw)
+    if reject_reason is not None:
+        raise RuntimeError(guidance+f"; rejected: {reject_reason}")
     adapter=Path(raw).expanduser().resolve(strict=True)
     try:
         result=subprocess.run(
