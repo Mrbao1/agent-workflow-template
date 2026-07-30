@@ -181,6 +181,23 @@ def rollback_archive_entries(task: Dict[str, object]) -> List[object]:
     return [entry for entries in reversed(chain) for entry in entries]
 
 
+def _rollback_chain_depth(head: Dict[str, object]) -> int:
+    # Node count of the archive chain; legacy heads carry no depth field, so
+    # count by walking the content-addressed payloads (chain already validated).
+    depth = 0; current: Optional[Dict[str, object]] = head
+    while isinstance(current, dict):
+        depth += 1
+        digest = str(current.get("sha256", ""))
+        path = ROOT / ".agent/state/evidence/rollback-archives" / f"{digest}.json"
+        try:
+            value = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError):
+            break
+        previous = value.get("previous") if isinstance(value, dict) else None
+        current = previous if isinstance(previous, dict) else None
+    return depth
+
+
 def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
     ledger = task.get("rollback_ledger")
     if not isinstance(ledger, list):
@@ -199,7 +216,7 @@ def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
     ):
         raise SystemExit("rollback_archive head is invalid")
     evicted = ledger[:-limit]
-    prior_depth = int(previous.get("depth", 0)) if isinstance(previous, dict) else 0
+    prior_depth = _rollback_chain_depth(previous) if isinstance(previous, dict) else 0
     snapshot = prior_depth >= rollback_archive_depth_limit() - 1
     entries = [*rollback_archive_entries(task), *evicted] if snapshot else evicted
     value = {
@@ -1223,11 +1240,13 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
     if head is None:
         return []
     required = {"schema", "path", "sha256", "bytes", "depth", "total_entries"}
+    legacy = required - {"depth"}  # pre-depth heads written before depth consolidation
     current = head; visited: set[str] = set()
-    chain: List[Tuple[Dict[str, object], List[object]]] = []
+    chain: List[Tuple[Dict[str, object], List[object], bool]] = []
     while current is not None:
-        if not isinstance(current, dict) or set(current) != required:
+        if not isinstance(current, dict) or (set(current) != required and set(current) != legacy):
             return ["rollback_archive head has invalid fields"]
+        is_legacy = "depth" not in current
         digest = str(current.get("sha256", ""))
         relative = f".agent/state/evidence/rollback-archives/{digest}.json"
         if (
@@ -1235,8 +1254,10 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None or digest in visited
             or current.get("path") != relative
             or not isinstance(current.get("bytes"), int) or current["bytes"] < 1
-            or not isinstance(current.get("depth"), int) or current["depth"] < 1
-            or current["depth"] > rollback_archive_depth_limit()
+            or (not is_legacy and (
+                not isinstance(current.get("depth"), int) or current["depth"] < 1
+                or current["depth"] > rollback_archive_depth_limit()
+            ))
             or not isinstance(current.get("total_entries"), int) or current["total_entries"] < 1
         ):
             return ["rollback_archive head is not content-addressed"]
@@ -1258,12 +1279,14 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
             or not isinstance(entries, list) or not entries
         ):
             return ["rollback_archive entries or chain head is invalid"]
-        chain.append((current, entries))
+        chain.append((current, entries, is_legacy))
         current = previous
     cumulative = 0
-    for position, (archive_head, entries) in enumerate(reversed(chain), start=1):
+    for position, (archive_head, entries, is_legacy) in enumerate(reversed(chain), start=1):
         cumulative += len(entries)
-        if archive_head["depth"] != position or archive_head["total_entries"] != cumulative:
+        if archive_head["total_entries"] != cumulative or (
+            not is_legacy and archive_head["depth"] != position
+        ):
             return ["rollback_archive cumulative totals or depth are invalid"]
     return []
 

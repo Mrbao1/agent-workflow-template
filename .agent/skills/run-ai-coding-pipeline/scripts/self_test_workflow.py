@@ -948,6 +948,34 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
     ):
         raise AssertionError("rollback archive did not consolidate into a bounded snapshot")
     run(root, "validate")
+
+    # Legacy (pre-depth) rollback heads stay valid, and compacting past them
+    # derives depth by counting the chain instead of resetting it.
+    legacy_task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    legacy_head = dict(legacy_task["rollback_archive"])
+    del legacy_head["depth"]
+    legacy_task["rollback_archive"] = legacy_head
+    write_json(root / ".agent/state/TASK.json", legacy_task)
+    run(root, "validate")
+    legacy_task["rollback_ledger"] = legacy_task["rollback_ledger"] + [
+        {
+            "from": 3, "to": 2, "issue_id": "ISSUE-DEPTH-legacy", "cause_category": "solution",
+            "subtask": "x", "root_cause": "legacy depth fixture", "change": "retry",
+            "signature": hashlib.sha256(b"ISSUE-DEPTH-legacy|solution").hexdigest(), "count": 1,
+        }
+    ]
+    write_json(root / ".agent/state/TASK.json", legacy_task)
+    run(root, "compact-state")
+    mixed = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    mixed_head = mixed.get("rollback_archive", {})
+    mixed_value = json.loads((root / mixed_head["path"]).read_text(encoding="utf-8"))
+    if (
+        mixed_head.get("depth") != 2
+        or mixed_head.get("total_entries") != 5
+        or mixed_value.get("previous") != legacy_head
+    ):
+        raise AssertionError("compaction past a legacy rollback head derived the wrong depth")
+    run(root, "validate")
     (root / ".agent/config.json").write_bytes(depth_config_bytes)
 
     # Release node 4 fails closed when the selected adapter registry entry is unavailable.
