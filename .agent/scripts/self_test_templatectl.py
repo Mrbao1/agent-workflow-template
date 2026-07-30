@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import hashlib
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -46,6 +47,7 @@ def fixture(root: Path, clarified: bool) -> None:
     shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib", dirs_exist_ok=True)
     shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
     shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "policies", root / ".agent/policies", dirs_exist_ok=True)
     shutil.copytree(SOURCE_AGENT / "skills/run-ai-coding-pipeline", root / ".agent/skills/run-ai-coding-pipeline", dirs_exist_ok=True)
     templates = [
         {
@@ -166,7 +168,7 @@ def fixture(root: Path, clarified: bool) -> None:
             "compact_budget_ratio": 0.75,
             "hard_budget_ratio": 0.9,
         },
-        "routing": {"modes": {"release": {"token_budget": 30000}}},
+        "routing": {"modes": {"release": {"token_budget": 48000}}},
         "acceptance_adapters": {
             "acceptance-workflow": {"implemented": True},
             "acceptance-api": {"implemented": False},
@@ -209,7 +211,7 @@ def fixture(root: Path, clarified: bool) -> None:
         "requirement_source": "user:fixture" if clarified else "pending",
         "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
         "requirement_contract_sha256": hashlib.sha256(contract.encode()).hexdigest() if clarified else "pending",
-        "token_budget": 30000,
+        "token_budget": 48000,
         "tokens_used": 100,
         "token_usage_source": "estimated",
         "child_agents_used": 0,
@@ -356,7 +358,7 @@ def main() -> int:
 
         # At must_compact, a new capability is an executable budget violation, not a warning.
         compact_task = json.loads(task_path.read_text(encoding="utf-8"))
-        compact_task["tokens_used"] = 24000
+        compact_task["tokens_used"] = 36000
         compact_task["budget_state"] = "must_compact"
         write_json(task_path, compact_task)
         before_expansion = task_path.read_bytes()
@@ -663,6 +665,179 @@ def main() -> int:
             root, "forged-analyze-receipt", "render", "--id", "context-transport-profile",
             "--output", ".agent/state/artifacts/04-context-transport-profile.json", *forged_args,
         )
+
+    # Fresh installs write agent-workflow-install/v4 manifests. Render the same
+    # pxpipe profile against a manifest produced by the real installer writer so
+    # the v4 installation anchor can never drift out of the accepted render path.
+    with tempfile.TemporaryDirectory(prefix="templatectl-pxpipe-v4-") as raw:
+        root = Path(raw)
+        fixture(root, clarified=True)
+        agents_path = root / "AGENTS.md"
+        agents_path.write_text("# Fixture bootstrap\n", encoding="utf-8")
+        claude_path = root / "CLAUDE.md"
+        claude_path.write_text("# Fixture Claude bootstrap\n", encoding="utf-8")
+        plugin_root = root / "plugins/pxpipe-context"
+        plugin_manifest_path = plugin_root / ".codex-plugin/plugin.json"
+        integrity_path = plugin_root / "integrity.json"
+        server_path = plugin_root / "mcp/server.mjs"
+        worker_path = plugin_root / "mcp/worker.mjs"
+        runtime_path = plugin_root / "mcp/vendor/pxpipe-runtime.mjs"
+        write_json(plugin_manifest_path, {"name": "pxpipe-context", "version": "0.1.0+codex.20260721210500"})
+        server_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        server_path.write_text("// fixture server\n", encoding="utf-8")
+        worker_path.write_text("// fixture worker\n", encoding="utf-8")
+        runtime_path.write_text("export {};\n", encoding="utf-8")
+        runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+        write_json(integrity_path, {
+            "plugin_version": "0.1.0+codex.20260721210500",
+            "runtime_bundle": "mcp/vendor/pxpipe-runtime.mjs",
+            "runtime_bundle_sha256": runtime_sha256,
+        })
+        plugin_files = {
+            ".codex-plugin/plugin.json": hashlib.sha256(plugin_manifest_path.read_bytes()).hexdigest(),
+            "integrity.json": hashlib.sha256(integrity_path.read_bytes()).hexdigest(),
+            "mcp/server.mjs": hashlib.sha256(server_path.read_bytes()).hexdigest(),
+            "mcp/worker.mjs": hashlib.sha256(worker_path.read_bytes()).hexdigest(),
+            "mcp/vendor/pxpipe-runtime.mjs": runtime_sha256,
+        }
+        shutil.rmtree(plugin_root)
+        installer_spec = importlib.util.spec_from_file_location(
+            "workflow_installer", SOURCE_AGENT.parent / "install.py",
+        )
+        installer = importlib.util.module_from_spec(installer_spec)
+        installer_spec.loader.exec_module(installer)
+        workflow_manifest_path = root / ".agent/.workflow-manifest.json"
+        write_json(workflow_manifest_path, installer.install_manifest(
+            installer.files(root / ".agent"),
+            plugin_files,
+            installer.canonical_sha256({"name": "pxpipe-context", "source": "fixture"}),
+            hashlib.sha256(agents_path.read_bytes()).hexdigest(),
+            hashlib.sha256(claude_path.read_bytes()).hexdigest(),
+        ))
+        workflow_manifest = json.loads(workflow_manifest_path.read_text(encoding="utf-8"))
+        if workflow_manifest.get("schema") != "agent-workflow-install/v4":
+            raise SystemExit("installer no longer writes v4 manifests; extend the pxpipe render fixtures")
+        workflow_source_tree_sha256 = workflow_manifest["source_tree_sha256"]
+        workflow_manifest_sha256 = hashlib.sha256(workflow_manifest_path.read_bytes()).hexdigest()
+        workflow_plugin_files_sha256 = hashlib.sha256(json.dumps(
+            plugin_files, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        trusted_root_sha256 = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+        context = subprocess.run(
+            [
+                sys.executable, ".agent/scripts/contextctl.py", "sync",
+                "--reason", "fixture", "--summary", "pxpipe v4 install route fixture",
+                "--source-tokens", "1800",
+            ],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if context.returncode:
+            raise SystemExit(context.stdout)
+        config_path = root / ".agent/config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["context_transport"]["pxpipe"]["enabled"] = True
+        write_json(config_path, config)
+        routed = invoke(
+            root, "route", "--capability", "context-transport-pxpipe",
+            "--capability", "acceptance-workflow",
+        )
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        invariant = hashlib.sha256(json.dumps({
+            key: task.get(key)
+            for key in (
+                "title", "mode", "task_type", "complexity", "environment",
+                "branch", "requirement_contract_sha256", "selected_capabilities",
+            )
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        analyze_receipt = {
+            "schema": "pxpipe-context-analyze/v1",
+            "model": "gpt-5.6-sol",
+            "purpose": "cold-semantic-reference",
+            "status": "eligible",
+            "source_sha256": "c" * 64,
+            "file_count": 1,
+            "source_bytes": 4096,
+            "page_count": 1,
+            "total_image_bytes": 2048,
+            "token_report": {
+                "text_tokens": 1200,
+                "image_tokens": 500,
+                "percent_saved": 58.3,
+            },
+            "rejection_reasons": [],
+            "provenance": {
+                "plugin_name": "pxpipe-context",
+                "plugin_version": "0.1.0+codex.20260721210500",
+                "plugin_manifest_sha256": plugin_files[".codex-plugin/plugin.json"],
+                "plugin_integrity_sha256": plugin_files["integrity.json"],
+                "mcp_server_sha256": plugin_files["mcp/server.mjs"],
+                "mcp_worker_sha256": plugin_files["mcp/worker.mjs"],
+                "pxpipe_package": "pxpipe-proxy",
+                "pxpipe_version": "0.9.0",
+                "runtime_bundle_sha256": runtime_sha256,
+                "source_package_sha256": "e" * 64,
+                "provenance_assurance": "content-and-install-anchored;no-host-signature",
+                "trusted_root_sha256": trusted_root_sha256,
+                "trusted_root_source": "mcp-roots/list",
+                "workflow_manifest_sha256": workflow_manifest_sha256,
+                "workflow_source_tree_sha256": workflow_source_tree_sha256,
+                "workflow_plugin_files_sha256": workflow_plugin_files_sha256,
+                "attestation_mode": "agent-workflow-v4",
+            },
+        }
+        analyze_receipt_sha256 = hashlib.sha256(json.dumps(
+            analyze_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        analyze_receipt["analyze_receipt_sha256"] = analyze_receipt_sha256
+        analyze_receipt_relative = Path(
+            ".agent/state/evidence/context-transport"
+        ) / f"{analyze_receipt_sha256}.json"
+        write_json(root / analyze_receipt_relative, analyze_receipt)
+        variables = [
+            "model=gpt-5.6-sol",
+            "plugin_name=pxpipe-context",
+            "plugin_version=0.1.0+codex.20260721210500",
+            f"plugin_manifest_sha256={plugin_files['.codex-plugin/plugin.json']}",
+            f"plugin_integrity_sha256={plugin_files['integrity.json']}",
+            f"mcp_server_sha256={plugin_files['mcp/server.mjs']}",
+            f"mcp_worker_sha256={plugin_files['mcp/worker.mjs']}",
+            f"runtime_bundle_sha256={runtime_sha256}",
+            f"workflow_manifest_sha256={workflow_manifest_sha256}",
+            f"workflow_source_tree_sha256={workflow_source_tree_sha256}",
+            f"workflow_plugin_files_sha256={workflow_plugin_files_sha256}",
+            f"trusted_root_sha256={trusted_root_sha256}",
+            f"source_sha256={'c' * 64}",
+            f"analyze_receipt_path={analyze_receipt_relative}",
+            f"analyze_receipt_sha256={analyze_receipt_sha256}",
+            f"requirement_contract_sha256={task['requirement_contract_sha256']}",
+            f"task_invariant_sha256={invariant}",
+            "approval_source=user:fixture",
+            f"approval_receipt_sha256={'a' * 64}",
+        ]
+        render_args = [value for variable in variables for value in ("--var", variable)]
+        # v4 additionally anchors the CLAUDE.md bootstrap; drift must fail closed.
+        original_claude = claude_path.read_text(encoding="utf-8")
+        claude_path.write_text(original_claude + "drift\n", encoding="utf-8")
+        require_failure(
+            root, "workflow-claude-bootstrap-drift", "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *render_args,
+        )
+        claude_path.write_text(original_claude, encoding="utf-8")
+        rendered = invoke(
+            root, "render", "--id", "context-transport-profile",
+            "--output", ".agent/state/artifacts/04-context-transport-profile.json", *render_args,
+        )
+        if rendered.returncode:
+            raise SystemExit(rendered.stdout)
+        profile = json.loads((root / ".agent/state/artifacts/04-context-transport-profile.json").read_text(encoding="utf-8"))
+        if profile.get("schema") != "agent-context-transport-profile/v2":
+            raise AssertionError(f"v4 install render produced an unexpected profile: {profile}")
 
     print("TEMPLATECTL SELF-TEST PASSED")
     return 0

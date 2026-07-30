@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 import copy
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -150,6 +151,36 @@ def failure_archive_depth_limit() -> int:
     return raw
 
 
+def rollback_archive_depth_limit() -> int:
+    config = load(AGENT_DIR / "config.json")
+    workflow = config.get("workflow", {})
+    raw = workflow.get("rollback_archive_depth_limit", 4) if isinstance(workflow, dict) else 4
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1:
+        raise SystemExit("workflow.rollback_archive_depth_limit must be a positive cold-chain limit")
+    return raw
+
+
+def rollback_archive_entries(task: Dict[str, object]) -> List[object]:
+    """Return every archived rollback entry, oldest first, after chain validation."""
+    head = task.get("rollback_archive")
+    if head is None:
+        return []
+    errors = rollback_archive_errors(task)
+    if errors:
+        raise SystemExit("invalid rollback archive chain: " + "; ".join(errors))
+    chain: List[List[object]] = []
+    current: Optional[Dict[str, object]] = head if isinstance(head, dict) else None
+    while current is not None:
+        value = load(ROOT / str(current["path"]))
+        entries = value.get("entries")
+        if not isinstance(entries, list):
+            raise SystemExit("rollback archive entries are invalid")
+        chain.append(entries)
+        previous = value.get("previous")
+        current = previous if isinstance(previous, dict) else None
+    return [entry for entries in reversed(chain) for entry in entries]
+
+
 def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
     ledger = task.get("rollback_ledger")
     if not isinstance(ledger, list):
@@ -168,10 +199,13 @@ def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
     ):
         raise SystemExit("rollback_archive head is invalid")
     evicted = ledger[:-limit]
+    prior_depth = int(previous.get("depth", 0)) if isinstance(previous, dict) else 0
+    snapshot = prior_depth >= rollback_archive_depth_limit() - 1
+    entries = [*rollback_archive_entries(task), *evicted] if snapshot else evicted
     value = {
         "schema": "agent-rollback-archive/v1",
-        "previous": previous,
-        "entries": evicted,
+        "previous": None if snapshot else previous,
+        "entries": entries,
     }
     data = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -183,6 +217,7 @@ def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
         "path": relative,
         "sha256": digest,
         "bytes": len(data),
+        "depth": 1 if snapshot else prior_depth + 1,
         "total_entries": len(evicted) + (int(previous["total_entries"]) if isinstance(previous, dict) else 0),
     }
     task["rollback_ledger"] = ledger[-limit:]
@@ -367,8 +402,12 @@ def human_gate_approval_valid(task: Dict[str, object], gate: str, approval: obje
     if not source.startswith("user:") or approval.get("artifact_sha256")!=digest:
         return False
     if task.get("decision_policy_version") == humandecision.LOCAL_POLICY_VERSION:
+        try:
+            config = load(AGENT_DIR / "config.json")
+        except SystemExit:
+            config = None
         return humandecision.local_approval_valid(
-            task, approval, source=source, artifact_sha256=digest,
+            task, approval, source=source, artifact_sha256=digest, config=config,
         )
     if task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION:
         return True
@@ -515,6 +554,14 @@ def actual_scope_gate(task: Dict[str, object], record: Dict[str, object]) -> Non
         raise SystemExit("node 6 requires at least one actual product/control-plane owned change")
     observed_risks=[]
     lower=[path.lower() for path in governed]
+    sensitive=[path for path in governed if path.lower().startswith(("auth/","crypto/","security/","secrets/")) or path.lower().endswith((".pem",".key"))]
+    if sensitive:
+        print(
+            "WARNING: governed changes touch security-sensitive paths: "
+            + ", ".join(sensitive)
+            + "; confirm the declared mode or escalate with "
+            "`python3 .agent/scripts/agentctl.py escalate-mode --reapprove --source user:<decision>`"
+        )
     if any("migration" in path for path in lower): observed_risks.append("migration")
     if any(path.startswith((".github/workflows/", "deploy/", "production/", "infra/")) for path in lower): observed_risks.append("external_impact")
     missing=[name for name in observed_risks if task.get("risk_flags",{}).get(name) is not True]
@@ -525,15 +572,16 @@ def actual_scope_gate(task: Dict[str, object], record: Dict[str, object]) -> Non
         flags=" ".join(f"--new-risk {name}" for name in missing)
         raise SystemExit(
             f"actual governed scope exceeds the declaration: files={len(governed)} minimum_mode={minimum}; "
-            f"run `agentctl.py escalate-mode --new-mode {minimum} --files {len(governed)} {flags}` and reroute"
+            f"run `python3 .agent/scripts/agentctl.py escalate-mode --new-mode {minimum} --files {len(governed)} {flags} --reapprove --source user:<decision>` and reroute"
         )
 
 
-def update_stage(task: Dict[str, object]) -> None:
+def stage_side_effect(task: Dict[str, object]) -> Tuple[Path, bytes]:
+    """Stage index bytes committed inside the TASK transition, never after it."""
     mode=str(task["mode"]); accepted=task.get("accepted_nodes",[]); last=max(accepted) if accepted else "none"
     gate="required" if mode=="release" else "not_applicable"
     reason="strict release gate is required for release mode" if mode=="release" else f"{mode} mode uses targeted acceptance and has no release live gate"
-    STAGE_PATH.write_text(f"""# AI Coding Stage Index
+    return STAGE_PATH, f"""# AI Coding Stage Index
 
 - Pipeline version: 2.0
 - Task: {task['title']}
@@ -558,7 +606,18 @@ def update_stage(task: Dict[str, object]) -> None:
 - Entries: {len(task.get('rollback_ledger',[]))}
 ## Canonical outputs
 - `.agent/state/TASK.json`
-""",encoding="utf-8")
+""".encode("utf-8")
+
+
+def update_stage(task: Dict[str, object]) -> None:
+    """Compatibility shim for callers predating transactional stage commits.
+
+    Workflow transitions commit the stage index through stage_side_effect; this
+    direct write remains only for standalone tooling that renders the index
+    outside a transition.
+    """
+    path, data = stage_side_effect(task)
+    path.write_bytes(data)
 
 
 def adapter(task: Dict[str, object]):
@@ -602,9 +661,22 @@ def required_gate(task: Dict[str, object], node: int) -> str:
     return ""
 
 
-def execution_gate(task: Dict[str, object], action: str) -> None:
+def effective_projection(task: Dict[str, object]) -> str:
+    """Projection bound at task creation, falling back to the routed family."""
+    raw = task.get("projection")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return task_projection(str(task.get("task_type")), str(task.get("mode")))
+
+
+def lightweight_standard(task: Dict[str, object]) -> bool:
+    return task.get("mode") == "standard" and effective_projection(task) == "lightweight"
+
+
+def requirement_gate_error(task: Dict[str, object]) -> Optional[str]:
+    """Single requirement-gate revalidation shared by mutations and route-resume."""
     if task.get("requirements_clarified") is not True:
-        raise SystemExit("workflow progression is blocked until requirements are clarified and human-approved")
+        return "workflow progression is blocked until requirements are clarified and human-approved"
     source = task.get("requirement_source")
     approval = task.get("gate_approvals", {}).get("requirement") if isinstance(task.get("gate_approvals"), dict) else None
     contract_hash = str(task.get("requirement_contract_sha256", ""))
@@ -633,16 +705,74 @@ def execution_gate(task: Dict[str, object], action: str) -> None:
         or hashlib.sha256(contract.read_bytes()).hexdigest() != contract_hash
         or task.get("mode_status") != "confirmed"
     ):
-        raise SystemExit("workflow progression lacks a valid user-bound requirement contract")
+        return "workflow progression lacks a valid user-bound requirement contract"
+    return None
+
+
+THREE_STRIKE_NEXT_ACTION = "same root cause failed three times; human decision required"
+
+
+def three_strike_marker(task: Dict[str, object]) -> bool:
+    """The three-strike marker is derived from invariant state, never a writable hint field."""
+    return (
+        task.get("status") == "waiting_human"
+        and task.get("next_action") == THREE_STRIKE_NEXT_ACTION
+    )
+
+
+def failure_escalation_digest(task: Dict[str, object]) -> str:
+    """Digest binding the escalation decision to the root-cause rollback entry."""
+    ledger = task.get("rollback_ledger")
+    if not isinstance(ledger, list) or not ledger or not isinstance(ledger[-1], dict):
+        raise SystemExit("three-strike escalation lacks its root-cause rollback entry")
+    return canonical_sha256(ledger[-1])
+
+
+def failure_escalation_gate(task: Dict[str, object]) -> None:
+    """A three-strike marker blocks progression until a bound human decision exists."""
+    if not three_strike_marker(task):
+        return
+    digest = failure_escalation_digest(task)
+    approvals = task.get("gate_approvals", {})
+    approval = approvals.get("failure-escalation") if isinstance(approvals, dict) else None
+    source = str(approval.get("source", "")) if isinstance(approval, dict) else ""
+    if not isinstance(approval, dict) or not humandecision.decision_approval_valid(
+        ROOT, load(AGENT_DIR / "config.json"), task, gate="failure-escalation",
+        artifact_sha256=digest, source=source, record=approval,
+    ):
+        raise SystemExit(
+            "three-strike failure escalation requires a recorded human decision: "
+            "run `python3 .agent/scripts/workflowctl.py resolve-failure --source user:<decision>`"
+        )
+
+
+def run_checked(command: List[str], label: str, timeout: int = 120) -> None:
+    """Run a bounded mutator subprocess; failures and hangs become structured errors."""
+    try:
+        result=subprocess.run(command,cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"{label}: timed out after {timeout}s")
+    if result.returncode:
+        detail=result.stdout.decode("utf-8",errors="replace").strip().replace("\n"," | ")[:2000]
+        raise SystemExit(label + (f": {detail}" if detail else ""))
+
+
+def execution_gate(task: Dict[str, object], action: str) -> None:
+    requirement_error = requirement_gate_error(task)
+    if requirement_error is not None:
+        raise SystemExit(requirement_error)
     current = task.get("current_node")
     accepted = task.get("accepted_nodes")
     expected = list(range(current + 1)) if isinstance(current, int) and task.get("status") == "ready_to_complete" else (list(range(current)) if isinstance(current, int) else None)
     if isinstance(current, int) and current >= 2 and accepted != expected:
         raise SystemExit("workflow sequence is discontinuous; accepted nodes must exactly precede current_node")
-    result = subprocess.run(
-        [sys.executable, str(AGENT_DIR / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
-        cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(AGENT_DIR / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
+            cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"budget gate timed out before deciding {action}")
     if result.returncode:
         raise SystemExit(result.stdout.strip() or f"budget gate blocked {action}")
 
@@ -652,6 +782,7 @@ def command_submit(args: argparse.Namespace) -> int:
     if args.gate == "requirement":
         raise SystemExit("requirement approval is owned exclusively by agentctl approve-requirements")
     execution_gate(task, "request-decision")
+    failure_escalation_gate(task)
     before=copy.deepcopy(task)
     if task.get("current_node")!=expected: raise SystemExit("gate is not active at the current node")
     record=artifact(args.artifact); validate_node_artifact(task,expected,record)
@@ -661,8 +792,7 @@ def command_submit(args: argparse.Namespace) -> int:
     task.setdefault("pending_gate_artifacts",{})[args.gate]=record
     packet=decision_packet(task,args.gate,record)
     task.update({"status":"waiting_human","decision_packet":packet,"next_action":decision_next_action(packet)})
-    contexttx.transition_task(before,task,mutator="workflowctl",operation="submit-gate",reason=f"gate-submitted-{args.gate}",summary=f"submitted exact {args.gate} artifact for human decision")
-    update_stage(task)
+    contexttx.transition_task(before,task,mutator="workflowctl",operation="submit-gate",reason=f"gate-submitted-{args.gate}",summary=f"submitted exact {args.gate} artifact for human decision",side_effects=[stage_side_effect(task)])
     print_decision_packet(packet); return 0
 
 
@@ -672,6 +802,7 @@ def command_approve(args: argparse.Namespace) -> int:
     if args.gate == "requirement":
         raise SystemExit("requirement approval is owned exclusively by agentctl approve-requirements")
     execution_gate(task, "request-decision")
+    failure_escalation_gate(task)
     before=copy.deepcopy(task)
     if task.get("current_node") != expected and args.gate not in {"knowledge","production"}:
         raise SystemExit("gate is not active at the current node")
@@ -711,8 +842,7 @@ def command_approve(args: argparse.Namespace) -> int:
     approvals=task.setdefault("gate_approvals",{}); approvals[args.gate]=approval
     task.pop("decision_packet",None)
     task["status"]="in_progress"; task["next_action"]=f"advance approved node {expected}"
-    contexttx.transition_task(before,task,mutator="workflowctl",operation="approve-gate",reason=f"gate-approved-{args.gate}",summary=f"recorded exact human {args.gate} decision")
-    update_stage(task)
+    contexttx.transition_task(before,task,mutator="workflowctl",operation="approve-gate",reason=f"gate-approved-{args.gate}",summary=f"recorded exact human {args.gate} decision",side_effects=[stage_side_effect(task)])
     print(f"GATE APPROVED: {args.gate}")
     return 0
 
@@ -720,10 +850,11 @@ def command_approve(args: argparse.Namespace) -> int:
 def command_advance(args: argparse.Namespace) -> int:
     task=load(TASK_PATH); node=args.node
     execution_gate(task, "acceptance" if node==7 else ("delivery" if node==8 else "finish-node"))
+    failure_escalation_gate(task)
     before=copy.deepcopy(task)
     projected=(
         task.get("current_node")==2 and node==6
-        and (task.get("mode")=="fast" or task_projection(str(task.get("task_type")), str(task.get("mode")))=="lightweight")
+        and (task.get("mode")=="fast" or effective_projection(task)=="lightweight")
     )
     if task.get("status") not in {"in_progress","waiting_human"} or (task.get("current_node")!=node and not projected):
         raise SystemExit("advance must match the active node")
@@ -742,6 +873,10 @@ def command_advance(args: argparse.Namespace) -> int:
     if node==7 and task.get("mode")=="release" and not release_acceptance_approval_valid(task,approval,record):
         raise SystemExit("release node 7 requires artifact-bound human transcript verification and supervision-debt waiver")
     if node==7 and task.get("mode")=="release": replay_release_gate(task,record)
+    # Consume the three-strike decision on the first successful advance; the
+    # marker itself clears because the transition rewrites next_action.
+    task.pop("failure_escalation",None)
+    if isinstance(task.get("gate_approvals"),dict): task["gate_approvals"].pop("failure-escalation",None)
     artifacts=task.setdefault("node_artifacts",{}); artifacts[str(node)]=record
     additions=[2,3,4,5,6] if projected else [node]
     accepted=sorted(set([*task.setdefault("accepted_nodes",[]),*additions])); task["accepted_nodes"]=accepted
@@ -752,8 +887,7 @@ def command_advance(args: argparse.Namespace) -> int:
         task.update({"current_node":8,"status":"ready_to_complete","phase":"retrospective","next_action":"render retrospective and complete task"})
     else:
         task.update({"current_node":next_node,"status":"in_progress","phase":PHASES[next_node],"next_action":f"complete node {next_node}: {PHASES[next_node]}"})
-    contexttx.transition_task(before,task,mutator="workflowctl",operation="advance",reason=f"node-{node}-accepted",summary=f"accepted node {node} with bound evidence")
-    update_stage(task)
+    contexttx.transition_task(before,task,mutator="workflowctl",operation="advance",reason=f"node-{node}-accepted",summary=f"accepted node {node} with bound evidence",side_effects=[stage_side_effect(task)])
     print(f"NODE ACCEPTED: {node} artifact={record['path']}")
     return 0
 
@@ -781,7 +915,7 @@ def command_return(args: argparse.Namespace) -> int:
     if count>=3:
         task.update({
             "current_node":target,"status":"waiting_human","phase":PHASES[target],
-            "next_action":"same root cause failed three times; human decision required",
+            "next_action":THREE_STRIKE_NEXT_ACTION,
         })
     else:
         if count==2 and int(task["current_node"])>4: target=4
@@ -789,7 +923,7 @@ def command_return(args: argparse.Namespace) -> int:
     task.setdefault("rollback_ledger",[]).append({"from":args.from_node,"to":target,"issue_id":args.issue_id,"cause_category":args.cause_category,"subtask":args.subtask,"root_cause":args.root_cause,"change":args.change,"signature":signature,"count":count})
     task["accepted_nodes"]=[node for node in task.get("accepted_nodes",[]) if node<target]
     task["node_artifacts"]={key:value for key,value in task.get("node_artifacts",{}).items() if int(key)<target}
-    side_effects=[*compact_rollback_state(task),*compact_failure_state(task)]
+    side_effects=[*compact_rollback_state(task),*compact_failure_state(task),stage_side_effect(task)]
     contexttx.transition_task(
         before,task,mutator="workflowctl",operation="return-node",
         reason="root-cause-return",summary=f"returned to root-cause node {target}",
@@ -799,8 +933,27 @@ def command_return(args: argparse.Namespace) -> int:
         # exceed the very budget it is meant to recover.
         evidence=[],
     )
-    update_stage(task)
     print(f"RETURNED TO NODE {target}: failure_count={count}")
+    return 0
+
+
+def command_resolve_failure(args: argparse.Namespace) -> int:
+    if not args.source.startswith("user:"): raise SystemExit("failure decision source must start with user:")
+    task=load(TASK_PATH)
+    execution_gate(task, "request-decision")
+    if not three_strike_marker(task):
+        raise SystemExit("no three-strike failure escalation is pending")
+    digest=failure_escalation_digest(task)
+    approval=humandecision.record_decision_approval(
+        ROOT,load(AGENT_DIR/"config.json"),task,gate="failure-escalation",
+        artifact_sha256=digest,source=args.source,receipt=args.human_decision_receipt,
+    )
+    before=copy.deepcopy(task)
+    approvals=task.setdefault("gate_approvals",{})
+    if not isinstance(approvals,dict): raise SystemExit("gate_approvals must be an object")
+    approvals["failure-escalation"]=approval
+    contexttx.transition_task(before,task,mutator="workflowctl",operation="resolve-failure",reason="failure-escalation-decision",summary="recorded human three-strike failure decision",side_effects=[stage_side_effect(task)])
+    print("FAILURE ESCALATION RESOLVED: advance the repaired node")
     return 0
 
 
@@ -864,17 +1017,22 @@ def command_complete(args: argparse.Namespace) -> int:
     if any(len(re.findall(rf"^- {re.escape(field)}:\s*(.+?)\s*$",retro_text,re.MULTILINE))!=1 for field in retro_fields) or "{{" in retro_text:
         raise SystemExit("retrospective is incomplete or contains unresolved placeholders")
     ledger_command=[sys.executable,str(AGENT_DIR/"skills/manage-agent-team/scripts/agentledger.py"),"validate","--require-empty","--platform-snapshot",args.platform_snapshot]
-    structure=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-    if structure.returncode:
-        detail=structure.stdout.decode("utf-8",errors="replace").strip().replace("\n"," | ")[:2000]
-        raise SystemExit(
-            "task completion requires a fully valid workflow before consuming the final platform snapshot"
-            + (f": {detail}" if detail else "")
-        )
-    ledger=subprocess.run(ledger_command,cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-    cleanup=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"cleanup"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-    clean=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-    if ledger.returncode or cleanup.returncode or clean.returncode: raise SystemExit("task completion requires a fully valid workflow, an orchestrator-observed empty Agent ledger and zero runtime residuals")
+    # Validate the ledger and runtime before any destructive cleanup so a
+    # failing check never has its evidence removed first; every call is bounded.
+    run_checked(
+        [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"validate"],
+        "task completion requires a fully valid workflow before consuming the final platform snapshot",
+    )
+    run_checked(ledger_command,"task completion requires an orchestrator-observed empty Agent ledger")
+    run_checked(
+        [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],
+        "task completion requires zero runtime residuals",
+    )
+    run_checked([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"cleanup"],"runtime cleanup failed")
+    run_checked(
+        [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],
+        "task completion leaves runtime residuals after cleanup",
+    )
     task["retrospective"]=retro; task["knowledge_candidates"]=args.knowledge_candidates or []
     artifact_set=[
         {"node":int(node),**record}
@@ -891,8 +1049,7 @@ def command_complete(args: argparse.Namespace) -> int:
         "completion_decision_receipt":completion_decision_receipt,
     }
     task.update({"current_node":"idle","status":"accepted","phase":"idle","next_action":"start the next requirement in clarification"})
-    contexttx.transition_task(before,task,mutator="workflowctl",operation="complete-task",reason="task-completed",summary="completed accepted task and bounded retrospective")
-    update_stage(task)
+    contexttx.transition_task(before,task,mutator="workflowctl",operation="complete-task",reason="task-completed",summary="completed accepted task and bounded retrospective",side_effects=[stage_side_effect(task)])
     print("TASK COMPLETED")
     return 0
 
@@ -942,6 +1099,10 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
         "schema", "archived_at", "source", "reason", "assurance",
         "decision_receipt", "task", "requirement_contract", "previous",
     }
+    # agentctl build_task_archive writes v2 payloads: the v1 identity fields
+    # plus the embedded delivery record and the structured referenced-evidence
+    # digest list (see the reader contract in evidencectl.py).
+    payload_v2_fields = payload_fields | {"delivery", "referenced_evidence"}
     visited: set[str] = set()
     expected_total = current.get("total_archives") if isinstance(current, dict) else None
     while current is not None:
@@ -971,7 +1132,11 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
             value = json.loads(data)
         except json.JSONDecodeError:
             return ["task_archive content is not valid JSON"]
-        if not isinstance(value, dict) or set(value) != payload_fields or value.get("schema") != "agent-task-archive/v1":
+        if (
+            not isinstance(value, dict)
+            or value.get("schema") not in {"agent-task-archive/v1", "agent-task-archive/v2"}
+            or set(value) != (payload_v2_fields if value.get("schema") == "agent-task-archive/v2" else payload_fields)
+        ):
             return ["task_archive payload schema is invalid"]
         archived_task = value.get("task")
         contract = value.get("requirement_contract")
@@ -1003,6 +1168,22 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
             or hashlib.sha256(contract["utf8"].encode()).hexdigest() != contract.get("sha256")
         ):
             return ["task_archive requirement contract is invalid"]
+        if value.get("schema") == "agent-task-archive/v2":
+            delivery = value.get("delivery")
+            if delivery is not None and (
+                not isinstance(delivery, dict)
+                or set(delivery) != {"sha256", "bytes", "utf8"}
+                or not isinstance(delivery.get("utf8"), str)
+                or len(delivery["utf8"].encode()) != delivery.get("bytes")
+                or hashlib.sha256(delivery["utf8"].encode()).hexdigest() != delivery.get("sha256")
+            ):
+                return ["task_archive delivery record is invalid"]
+            referenced = value.get("referenced_evidence")
+            if (
+                not isinstance(referenced, list)
+                or any(not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None for item in referenced)
+            ):
+                return ["task_archive referenced evidence digests are invalid"]
         assurance = value.get("assurance")
         source = str(value.get("source", ""))
         if assurance == "explicit-user-message;local-cancellation;not-provider-verified":
@@ -1041,8 +1222,9 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
     head = task.get("rollback_archive")
     if head is None:
         return []
-    required = {"schema", "path", "sha256", "bytes", "total_entries"}
+    required = {"schema", "path", "sha256", "bytes", "depth", "total_entries"}
     current = head; visited: set[str] = set()
+    chain: List[Tuple[Dict[str, object], List[object]]] = []
     while current is not None:
         if not isinstance(current, dict) or set(current) != required:
             return ["rollback_archive head has invalid fields"]
@@ -1053,6 +1235,8 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None or digest in visited
             or current.get("path") != relative
             or not isinstance(current.get("bytes"), int) or current["bytes"] < 1
+            or not isinstance(current.get("depth"), int) or current["depth"] < 1
+            or current["depth"] > rollback_archive_depth_limit()
             or not isinstance(current.get("total_entries"), int) or current["total_entries"] < 1
         ):
             return ["rollback_archive head is not content-addressed"]
@@ -1068,16 +1252,19 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
             return ["rollback_archive content is not valid JSON"]
         previous = value.get("previous") if isinstance(value, dict) else None
         entries = value.get("entries") if isinstance(value, dict) else None
-        prior_count = previous.get("total_entries", 0) if isinstance(previous, dict) else 0
         if (
             not isinstance(value, dict) or set(value) != {"schema", "previous", "entries"}
             or value.get("schema") != "agent-rollback-archive/v1"
             or not isinstance(entries, list) or not entries
-            or not isinstance(prior_count, int)
-            or current["total_entries"] != prior_count + len(entries)
         ):
-            return ["rollback_archive entry count or chain head is invalid"]
+            return ["rollback_archive entries or chain head is invalid"]
+        chain.append((current, entries))
         current = previous
+    cumulative = 0
+    for position, (archive_head, entries) in enumerate(reversed(chain), start=1):
+        cumulative += len(entries)
+        if archive_head["depth"] != position or archive_head["total_entries"] != cumulative:
+            return ["rollback_archive cumulative totals or depth are invalid"]
     return []
 
 
@@ -1164,12 +1351,26 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
     errors.extend(failure_archive_errors(task))
     errors.extend(task_archive_errors(task))
     errors.extend(state_machine_errors(task))
+    if task.get("status") in {"in_progress","ready_to_complete"}:
+        # Revalidate the requirement gate with the same function the mutators
+        # use, so a `continue` route never contradicts the next transition.
+        requirement_error=requirement_gate_error(task)
+        if requirement_error is not None:
+            errors.append(requirement_error)
     artifacts=task.get("node_artifacts",{})
     if not isinstance(artifacts,dict):
         artifacts={}; errors.append("node_artifacts must be an object")
     if require_full:
         terminal=8 if task.get("mode")=="release" else 7
-        required_records={1,6,7} if task.get("mode")=="fast" else set(range(1,terminal+1))
+        if task.get("mode")=="fast":
+            required_records={1,6,7}
+        elif lightweight_standard(task):
+            # The standard lightweight projection accepts nodes 2-6 through the
+            # node 6 receipt alone; node 2 keeps its own record only when it was
+            # advanced before the projection jump.
+            required_records={1,6,7}|({2} if "2" in artifacts else set())
+        else:
+            required_records=set(range(1,terminal+1))
         observed={int(node) for node in artifacts if str(node).isdigit()}
         if observed!=required_records:
             errors.append(f"terminal workflow requires exact node artifact records {sorted(required_records)}")
@@ -1192,7 +1393,10 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
         except (SystemExit,subprocess.TimeoutExpired) as error:
             errors.append(f"node {node} semantic artifact validation failed: {error}")
     if task.get("mode") in {"standard","release"}:
-        for node,gate in ((4,"solution"),(7,"acceptance")):
+        # The lightweight standard projection has no node 4 solution gate; the
+        # release projection stays full through "lightweight-release".
+        gate_nodes=((7,"acceptance"),) if lightweight_standard(task) else ((4,"solution"),(7,"acceptance"))
+        for node,gate in gate_nodes:
             approval=task.get("gate_approvals",{}).get(gate,{}) if isinstance(task.get("gate_approvals"),dict) else {}
             record=artifacts.get(str(node),{})
             if node in accepted and not human_gate_approval_valid(task,gate,approval,record):
@@ -1209,21 +1413,75 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
     if not stage_validator.is_file() or not STAGE_PATH.is_file():
         errors.append("stage index validator or stage index is missing")
     else:
-        stage=subprocess.run([sys.executable,str(stage_validator),str(STAGE_PATH)],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
-        if stage.returncode: errors.append("stage index drifted from canonical TASK state")
+        try:
+            stage=subprocess.run([sys.executable,str(stage_validator),str(STAGE_PATH)],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            if stage.returncode: errors.append("stage index drifted from canonical TASK state")
+        except subprocess.TimeoutExpired:
+            errors.append("stage index validation timed out")
     if require_full:
-        template=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/templatectl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
-        if template.returncode: errors.append("terminal workflow template state is invalid")
-        delivery=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/deliveryctl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
-        if delivery.returncode: errors.append("terminal workflow delivery state is invalid")
+        try:
+            template=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/templatectl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            if template.returncode: errors.append("terminal workflow template state is invalid")
+        except subprocess.TimeoutExpired:
+            errors.append("terminal workflow template validation timed out")
+        try:
+            delivery=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/deliveryctl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            if delivery.returncode: errors.append("terminal workflow delivery state is invalid")
+        except subprocess.TimeoutExpired:
+            errors.append("terminal workflow delivery validation timed out")
     return errors
+
+
+SCHEDULER_NONCE_PATH = AGENT_DIR / "state" / ".scheduler-receipt-nonces.json"
+
+
+def consumed_scheduler_nonces() -> Dict[str, str]:
+    """Live nonce -> expiry map from the consumed scheduler receipt registry."""
+    try:
+        value = json.loads(SCHEDULER_NONCE_PATH.read_text(encoding="utf-8")) if SCHEDULER_NONCE_PATH.is_file() else {}
+    except (OSError, ValueError):
+        return {}
+    raw = value.get("nonces") if isinstance(value, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    now = dt.datetime.now(dt.timezone.utc)
+    live: Dict[str, str] = {}
+    for nonce, expiry in raw.items():
+        try:
+            observed = dt.datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if observed.tzinfo is not None and observed.astimezone(dt.timezone.utc) > now:
+            live[str(nonce)] = str(expiry)
+    return live
+
+
+def record_scheduler_nonce(nonce: str, expiry: dt.datetime) -> None:
+    """Consume a verified scheduler nonce, pruning expired entries atomically."""
+    live = consumed_scheduler_nonces()
+    live[nonce] = expiry.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+    fd, raw_path = tempfile.mkstemp(prefix=".scheduler-receipt-nonces.", dir=str(SCHEDULER_NONCE_PATH.parent))
+    temporary = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"schema": "agent-scheduler-receipt-nonces/v1", "nonces": live}, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, SCHEDULER_NONCE_PATH)
+    finally:
+        if temporary.exists(): temporary.unlink()
 
 
 def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, object], config: Dict[str, object]) -> bool:
     if not raw:
         return False
-    scheduler = config.get("agent_control", {}).get("scheduler", {})
-    adapter = humandecision.adapter_path(ROOT, scheduler.get("signed_adapter") if isinstance(scheduler, dict) else None)
+    agent_control = config.get("agent_control", {})
+    scheduler = agent_control.get("scheduler", {}) if isinstance(agent_control, dict) else {}
+    if not isinstance(scheduler, dict):
+        scheduler = {}
+    adapter = humandecision.try_adapter_path(ROOT, scheduler.get("signed_adapter"))
+    if adapter is None:
+        raise SystemExit("host scheduler resume adapter is not configured")
     path = (ROOT / raw).resolve()
     try: path.relative_to(ROOT)
     except ValueError: raise SystemExit("scheduler receipt escapes project")
@@ -1236,13 +1494,57 @@ def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, o
     except ValueError: raise SystemExit("scheduler receipt timestamp is invalid")
     if observed.tzinfo is None: raise SystemExit("scheduler receipt timestamp lacks timezone")
     age = (dt.datetime.now(dt.timezone.utc) - observed.astimezone(dt.timezone.utc)).total_seconds()
-    maximum = int(scheduler.get("max_receipt_age_seconds", 300))
+    raw_maximum = scheduler.get("max_receipt_age_seconds", 300)
+    maximum = raw_maximum if isinstance(raw_maximum, int) and not isinstance(raw_maximum, bool) and raw_maximum > 0 else 300
     if age < -30 or age > maximum: raise SystemExit("scheduler receipt is stale or future-dated")
+    nonce = str(value["nonce"])
+    if nonce in consumed_scheduler_nonces():
+        raise SystemExit("scheduler receipt nonce was already consumed")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     result = subprocess.run([str(adapter), "verify-scheduler-resume", "--receipt", str(path)], cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
     if result.returncode or result.stdout.strip() != f"VERIFIED SCHEDULER RESUME sha256={digest}":
         raise SystemExit("host scheduler adapter rejected the resume receipt")
+    record_scheduler_nonce(nonce, observed.astimezone(dt.timezone.utc) + dt.timedelta(seconds=maximum))
     return True
+
+
+def terminal_binding_error() -> Optional[str]:
+    """Read-only ledger/runtime proof required before a terminal route receipt."""
+    checks = (
+        (
+            [sys.executable, str(AGENT_DIR/"skills/manage-agent-team/scripts/agentledger.py"), "validate", "--require-empty"],
+            "Agent ledger empty-state validation",
+        ),
+        (
+            [sys.executable, str(AGENT_DIR/"scripts/agentctl.py"), "assert-clean"],
+            "runtime residual check",
+        ),
+    )
+    for command, label in checks:
+        try:
+            result = subprocess.run(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        except subprocess.TimeoutExpired:
+            return f"{label} timed out"
+        if result.returncode:
+            detail = result.stdout.decode("utf-8", errors="replace").strip().replace("\n", " | ")[:500]
+            return label + (f" failed: {detail}" if detail else " failed")
+    return None
+
+
+def transition_journal_recovery() -> Optional[str]:
+    """Concrete recovery command for a leftover transition journal, or None."""
+    try:
+        status = contexttx.transition_journal_status()
+    except (OSError, ValueError, TypeError) as error:
+        return f"inspect .agent/state/.context-transition-journal.json manually: {error}"
+    if status is None:
+        return None
+    state = str(status.get("state", "")) if isinstance(status, dict) else ""
+    if state == "interrupted":
+        return "python3 .agent/scripts/contextctl.py journal --restore"
+    if state in {"committed", "rolled_back"}:
+        return "python3 .agent/scripts/contextctl.py journal --discard"
+    return str(status.get("recovery") or "inspect .agent/state/.context-transition-journal.json manually") if isinstance(status, dict) else "inspect .agent/state/.context-transition-journal.json manually"
 
 
 def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
@@ -1255,26 +1557,38 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
     })
     if args is not None and getattr(args,"after_cursor",None) not in {None,cursor}:
         raise SystemExit("resume cursor is stale; run route-resume without --after-cursor to obtain the current command")
-    context_result=subprocess.run(
-        [sys.executable,str(CONTEXT_TOOL),"check","--quiet"],cwd=str(ROOT),
-        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120,
-    )
+    try:
+        context_result=subprocess.run(
+            [sys.executable,str(CONTEXT_TOOL),"check","--quiet"],cwd=str(ROOT),
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120,
+        )
+        context_invalid = context_result.returncode != 0
+    except subprocess.TimeoutExpired:
+        context_invalid = True
     config=load(AGENT_DIR/"config.json")
     errors=workflow_validation_errors(task,require_full=task.get("status") in {"ready_to_complete","accepted"})
-    if context_result.returncode: errors.append("context capsule is invalid or stale")
+    if context_invalid: errors.append("context capsule is invalid or stale")
+    recovery=transition_journal_recovery()
+    if recovery is not None:
+        errors.append(f"interrupted context transition requires recovery: run `{recovery}`")
     effective_budget_state="hard_blocked"
     try:
         active=copy.deepcopy(task); freshness=context.get("usage_freshness",{})
         active["tokens_used"]=max(int(task.get("tokens_used",0)),int(freshness.get("estimated_tokens",0)))
         ledger_path=AGENT_DIR/"state/agents.json"; ledger=load(ledger_path) if ledger_path.is_file() else None
         effective_budget_state=str(total_budget.snapshot(active,config,ledger)["state"])
-    except (ValueError,TypeError,OSError,KeyError):
+    except (ValueError,TypeError,OSError,KeyError,SystemExit):
         errors.append("effective unified Token budget is invalid")
-    action="continue"; terminal=False; control="resume-current-node"
+    action="continue"; terminal=False; control="resume-current-node"; cleanup=None
     if errors:
         action="waiting_human"; control="repair-context-or-workflow-state"
     elif task.get("status")=="accepted":
         action="complete"; terminal=True; control="explicit-complete-task-checkpoint"
+        binding_error=terminal_binding_error()
+        if binding_error is not None:
+            terminal=False; action="waiting_human"; control="cleanup-agent-ledger-and-runtime"
+            cleanup="python3 .agent/scripts/agentctl.py cleanup"
+            errors.append(f"terminal route requires an empty verified Agent ledger and clean runtime: {binding_error}")
     elif task.get("status")=="idle":
         action="waiting_human"; control="clarify-next-requirement"
     elif task.get("status")=="waiting_human" or effective_budget_state=="hard_blocked":
@@ -1285,9 +1599,12 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
             action="compact"; control="create-verified-compact-handoff"
         else:
             control="verified-compact-handoff-resume"
-    scheduler_available=False
+    scheduler_available=False; scheduler_error=None
     if not terminal and action=="continue":
-        scheduler_available=verified_scheduler_resume(getattr(args,"scheduler_receipt",None) if args is not None else None,cursor,task,config)
+        try:
+            scheduler_available=verified_scheduler_resume(getattr(args,"scheduler_receipt",None) if args is not None else None,cursor,task,config)
+        except (SystemExit,subprocess.TimeoutExpired,OSError,ValueError) as error:
+            scheduler_error=str(error)
     resume_command=None
     if not terminal and action=="continue" and not scheduler_available:
         action="waiting_host_resume"; control="scheduler-unavailable-manual-resume"
@@ -1297,6 +1614,7 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
         "status":task.get("status"),"current_node":task.get("current_node"),
         "next_action":task.get("next_action"),"budget_state":effective_budget_state,
         "control":control,"errors":errors,"scheduler_available":scheduler_available,
+        "scheduler_error":scheduler_error,"recovery":recovery,"cleanup":cleanup,
         "resume_cursor":cursor,"resume_command":resume_command,
     }
     print(json.dumps(receipt,ensure_ascii=False,sort_keys=True,separators=(",",":")))
@@ -1320,12 +1638,13 @@ def main() -> int:
     approve=sub.add_parser("approve-gate"); approve.add_argument("--gate",choices=tuple(GATE_NODE),required=True); approve.add_argument("--source",required=True); approve.add_argument("--artifact-sha256",required=True); approve.add_argument("--human-decision-receipt"); approve.add_argument("--platform-transcript-verified-sha256"); approve.add_argument("--supervision-debt-waiver-sha256")
     advance=sub.add_parser("advance"); advance.add_argument("--node",type=int,required=True); advance.add_argument("--artifact",required=True)
     back=sub.add_parser("return-node"); back.add_argument("--from-node",type=int,required=True); back.add_argument("--to",type=int,required=True); back.add_argument("--issue-id",required=True); back.add_argument("--cause-category",choices=("requirements","provenance","scope","solution","tests","implementation","acceptance","runtime","delivery","agent-control"),required=True); back.add_argument("--subtask",required=True); back.add_argument("--root-cause",required=True); back.add_argument("--change",required=True)
+    resolve=sub.add_parser("resolve-failure"); resolve.add_argument("--source",required=True); resolve.add_argument("--human-decision-receipt")
     complete=sub.add_parser("complete-task"); complete.add_argument("--retrospective",required=True); complete.add_argument("--knowledge-candidates",action="append"); complete.add_argument("--platform-snapshot",required=True); complete.add_argument("--completion-source"); complete.add_argument("--completion-platform-transcript-verified-sha256"); complete.add_argument("--human-decision-receipt")
     sub.add_parser("compact-state")
     resume=sub.add_parser("route-resume"); resume.add_argument("--after-cursor"); resume.add_argument("--scheduler-receipt")
     sub.add_parser("validate")
     args=parser.parse_args()
-    return {"submit-gate":lambda:command_submit(args),"approve-gate":lambda:command_approve(args),"advance":lambda:command_advance(args),"return-node":lambda:command_return(args),"complete-task":lambda:command_complete(args),"compact-state":command_compact_state,"route-resume":lambda:command_route_resume(args),"validate":command_validate}[args.command]()
+    return {"submit-gate":lambda:command_submit(args),"approve-gate":lambda:command_approve(args),"advance":lambda:command_advance(args),"return-node":lambda:command_return(args),"resolve-failure":lambda:command_resolve_failure(args),"complete-task":lambda:command_complete(args),"compact-state":command_compact_state,"route-resume":lambda:command_route_resume(args),"validate":command_validate}[args.command]()
 
 
 if __name__=="__main__": raise SystemExit(main())

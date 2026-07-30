@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""Single controlled full-suite entry across three private-state contexts."""
+"""Bounded self-suite entry across private-state install contexts.
 
+Default run: source-level checks plus the idle-source context only.
+Use --full for all three contexts (idle-source, polluted-source,
+installed-project).  Use --shard K/N for deterministic modulo sharding
+over the registered self-test list and --only NAME... for a named subset.
+Every test runs with a per-test subprocess timeout (default 120s); on
+timeout the whole process group is killed and the test is recorded as a
+failure with its elapsed time.  The process exits non-zero if any test,
+setup step, or cleanup control fails.
+"""
+
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import argparse
 import json
@@ -40,17 +51,20 @@ SELF_TEST_ARGUMENTS = {
     ".agent/scripts/self_test_template_lifecycle.py": ("--template-root", "."),
 }
 
+ALL_CONTEXTS = ("idle-source", "polluted-source", "installed-project")
+DEFAULT_CONTEXTS = ("idle-source",)
+
+SOURCE_CHECKS = (
+    ("install-lifecycle", ("tests/test_install_lifecycle.py", "--template-root", ".")),
+    ("pxpipe-self-test", ("plugins/pxpipe-context/scripts/self-test.mjs",)),
+    ("pxpipe-provider-integration", ("plugins/pxpipe-context/scripts/provider-integration-self-test.mjs",)),
+)
+
 
 class RunFailure(RuntimeError):
     def __init__(self, record):
         super().__init__(json.dumps(record, ensure_ascii=False))
         self.record = record
-
-
-class CleanupFailure(RuntimeError):
-    def __init__(self, records):
-        super().__init__("one or more cleanup controls failed")
-        self.records = records
 
 
 def output_text(value):
@@ -95,6 +109,16 @@ def run(command, cwd, timeout=900, expected=(0,)):
     if exit_code not in expected:
         raise RunFailure(record)
     return record
+
+
+def execute(name, command, cwd, timeout):
+    """Run one check, converting any failure into a result row."""
+    try:
+        record = run(command, cwd, timeout=timeout)
+        return {"name": name, "status": "pass", **record}
+    except RunFailure as error:
+        status = "timeout" if error.record["exit_code"] == 124 else "fail"
+        return {"name": name, "status": status, **error.record}
 
 
 def copy_project_without_agent(source: Path, target: Path) -> None:
@@ -179,93 +203,240 @@ def self_test_command(relative: str):
     ]
 
 
-def clean_context(root: Path) -> list[dict]:
-    records = []
-    failed = False
-    for name, command in (
-        ("cleanup", [sys.executable, ".agent/scripts/agentctl.py", "cleanup"]),
-        ("assert-clean", [sys.executable, ".agent/scripts/agentctl.py", "assert-clean"]),
-    ):
-        try:
-            record = run(command, root, timeout=60)
-        except RunFailure as error:
-            record = error.record
-            failed = True
-        records.append({"name": name, **record})
-    if failed:
-        raise CleanupFailure(records)
-    return records
+def source_check_command(entry):
+    name, arguments = entry
+    if arguments[0].endswith(".py"):
+        return name, [sys.executable, *arguments]
+    return name, ["node", *arguments]
 
 
-def append_cleanup(records: list[dict], context: str, root: Path) -> None:
+def parse_shard(text: str):
     try:
-        cleanup_records = clean_context(root)
-    except CleanupFailure as error:
-        cleanup_records = error.records
-        for record in cleanup_records:
-            records.append({"context": context, **record})
-        raise
-    for record in cleanup_records:
-        records.append({"context": context, **record})
+        k_text, n_text = text.split("/", 1)
+        k, n = int(k_text), int(n_text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid shard {text!r}: expected K/N with integer K and N"
+        )
+    if n < 1 or not 1 <= k <= n:
+        raise argparse.ArgumentTypeError(
+            f"invalid shard {text!r}: expected 1 <= K <= N"
+        )
+    return (k, n)
+
+
+def resolve_only(names) -> list:
+    by_basename = {}
+    for relative in SELF_TESTS:
+        by_basename.setdefault(Path(relative).name, relative)
+        by_basename.setdefault(Path(relative).stem, relative)
+    wanted = set()
+    unknown = []
+    for name in names:
+        if name in SELF_TESTS:
+            wanted.add(name)
+        elif name in by_basename:
+            wanted.add(by_basename[name])
+        else:
+            unknown.append(name)
+    if unknown:
+        raise SystemExit(
+            "unknown self-test name(s): {}\nregistered tests:\n  {}".format(
+                ", ".join(unknown), "\n  ".join(SELF_TESTS),
+            )
+        )
+    return [relative for relative in SELF_TESTS if relative in wanted]
+
+
+def select_tests(shard, only) -> list:
+    tests = list(SELF_TESTS)
+    if shard:
+        k, n = shard
+        tests = [t for i, t in enumerate(tests) if i % n == k - 1]
+    if only:
+        wanted = set(resolve_only(only))
+        tests = [t for t in tests if t in wanted]
+    return tests
+
+
+def run_batch(context, items, cwd, timeout, jobs):
+    """Run (name, command) items, preserving order; capture output per test."""
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        futures = [
+            pool.submit(execute, name, command, cwd, timeout)
+            for name, command in items
+        ]
+        results = [future.result() for future in futures]
+    for result in results:
+        result["context"] = context
+    return results
+
+
+def print_failures(records) -> None:
+    for record in records:
+        if record["status"] == "pass":
+            continue
+        print(
+            f"--- FAIL {record['context']} :: {record['name']} "
+            f"({record['status']}, exit={record['exit_code']}, "
+            f"{record['seconds']:.1f}s) ---"
+        )
+        tail = output_text(record.get("output"))[-4000:]
+        if tail.strip():
+            print(tail)
+        print("---")
+
+
+def print_summary(records, wall_seconds) -> int:
+    width = max((len(Path(r["name"]).name) for r in records), default=4)
+    print("\ncontext            {:<{w}}  result   seconds".format("test", w=width))
+    failures = 0
+    for record in records:
+        if record["status"] != "pass":
+            failures += 1
+        print(
+            "{:<18} {:<{w}}  {:<8} {:>7.1f}".format(
+                record["context"], Path(record["name"]).name,
+                record["status"], record["seconds"], w=width,
+            )
+        )
+    print(
+        f"\ntotal={len(records)} passed={len(records) - failures} "
+        f"failed={failures} wall={wall_seconds:.1f}s"
+    )
+    return failures
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template-root", default=".")
     parser.add_argument("--report", default="outputs/full-suite.json")
+    parser.add_argument(
+        "--shard", type=parse_shard, default=None, metavar="K/N",
+        help="run shard K of N over the registered self-test list",
+    )
+    parser.add_argument(
+        "--only", nargs="+", default=None, metavar="NAME",
+        help="run only the named self-tests (path, basename, or stem)",
+    )
+    parser.add_argument(
+        "--test-timeout", type=int, default=300, metavar="SECONDS",
+        help="per-test subprocess timeout (default: 300)",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="run all three install contexts (default: idle-source only)",
+    )
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=4, metavar="N",
+        help="parallel tests within a context (default: 4)",
+    )
     args = parser.parse_args()
+    started = time.monotonic()
     source = Path(args.template_root).resolve()
     report = (source / args.report).resolve()
-    records = []
+    # Hard tripwire: the registered list must match the on-disk inventory.
     assert_self_test_inventory(source)
-    failure = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="agent-workflow-full-suite-") as raw:
-            workspace = Path(raw)
-            for name in ("idle-source", "polluted-source", "installed-project"):
-                context = make_context(source, workspace, name)
-                try:
-                    records.append({
-                        "context": name,
-                        "name": "capture-runtime-baseline",
-                        **run([
-                            sys.executable, ".agent/scripts/agentctl.py",
-                            "capture-runtime-baseline", "--source", "user:full-suite-controller",
-                        ], context, timeout=60),
-                    })
-                    assert_self_test_inventory(context)
-                    if name == "polluted-source":
-                        records.append({"context": name,"name": "agent-state-validation",**run([sys.executable, ".agent/scripts/agentctl.py", "validate"],context)})
-                        records.append({"context": name,"name": "context-validation",**run([sys.executable, ".agent/scripts/contextctl.py", "check"],context)})
-                    for relative in SELF_TESTS:
-                        records.append({"context": name,"name": relative,**run(self_test_command(relative), context)})
-                finally:
-                    append_cleanup(records, name, context)
+    tests = select_tests(args.shard, args.only)
+    if not tests:
+        print("warning: selection is empty (no registered self-test matched)")
+    contexts = ALL_CONTEXTS if args.full else DEFAULT_CONTEXTS
+    records = []
+    with tempfile.TemporaryDirectory(prefix="agent-workflow-self-suite-") as raw:
+        workspace = Path(raw)
+        for name in contexts:
+            print(f"== context {name}: {len(tests)} self-tests "
+                  f"(jobs={args.jobs}, timeout={args.test_timeout}s) ==")
             try:
-                records.append({"context": "source","name": "install-lifecycle",**run([sys.executable, "tests/test_install_lifecycle.py","--template-root", "."], source)})
-                records.append({"context": "source","name": "pxpipe-self-test",**run(["node", "plugins/pxpipe-context/scripts/self-test.mjs"], source)})
-                records.append({"context": "source","name": "pxpipe-provider-integration",**run(["node","plugins/pxpipe-context/scripts/provider-integration-self-test.mjs"], source)})
-            finally:
-                append_cleanup(records, "source", source)
-    except Exception as error:
-        if isinstance(error, RunFailure):
-            records.append({"context": "failed-command", **error.record})
-        failure = f"{type(error).__name__}: {error}"
+                context = make_context(source, workspace, name)
+            except RunFailure as error:
+                records.append({
+                    "context": name, "name": "install-context",
+                    "status": "fail", **error.record,
+                })
+                continue
+            context_records = []
+            context_records.append(execute(
+                "capture-runtime-baseline",
+                [
+                    sys.executable, ".agent/scripts/agentctl.py",
+                    "capture-runtime-baseline",
+                    "--source", "user:full-suite-controller",
+                ],
+                context, timeout=60,
+            ))
+            try:
+                assert_self_test_inventory(context)
+            except RuntimeError as error:
+                context_records.append({
+                    "context": name, "name": "self-test-inventory",
+                    "status": "fail", "command": [], "cwd": str(context),
+                    "exit_code": 1, "seconds": 0.0, "output": str(error),
+                })
+            if name == "polluted-source":
+                context_records.append(execute(
+                    "agent-state-validation",
+                    [sys.executable, ".agent/scripts/agentctl.py", "validate"],
+                    context, timeout=args.test_timeout,
+                ))
+                context_records.append(execute(
+                    "context-validation",
+                    [sys.executable, ".agent/scripts/contextctl.py", "check"],
+                    context, timeout=args.test_timeout,
+                ))
+            batch = run_batch(
+                name,
+                [(relative, self_test_command(relative)) for relative in tests],
+                context, timeout=args.test_timeout, jobs=args.jobs,
+            )
+            context_records.extend(batch)
+            for control, command in (
+                ("cleanup", [sys.executable, ".agent/scripts/agentctl.py", "cleanup"]),
+                ("assert-clean", [sys.executable, ".agent/scripts/agentctl.py", "assert-clean"]),
+            ):
+                row = execute(control, command, context, timeout=60)
+                row["context"] = name
+                context_records.append(row)
+            for row in context_records:
+                row.setdefault("context", name)
+            print_failures(context_records)
+            records.extend(context_records)
+        print(f"== context source: {len(SOURCE_CHECKS)} source-level checks ==")
+        source_records = run_batch(
+            "source",
+            [source_check_command(entry) for entry in SOURCE_CHECKS],
+            source, timeout=args.test_timeout, jobs=args.jobs,
+        )
+        for control, command in (
+            ("cleanup", [sys.executable, ".agent/scripts/agentctl.py", "cleanup"]),
+            ("assert-clean", [sys.executable, ".agent/scripts/agentctl.py", "assert-clean"]),
+        ):
+            row = execute(control, command, source, timeout=60)
+            row["context"] = "source"
+            source_records.append(row)
+        print_failures(source_records)
+        records.extend(source_records)
+    wall_seconds = time.monotonic() - started
+    failures = print_summary(records, wall_seconds)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(json.dumps({
         "schema": "agent-workflow-full-suite/v1",
-        "status": "failed" if failure else "passed",
-        "failure": failure,
+        "status": "failed" if failures else "passed",
+        "shard": f"{args.shard[0]}/{args.shard[1]}" if args.shard else None,
+        "full": bool(args.full),
+        "jobs": args.jobs,
+        "test_timeout": args.test_timeout,
+        "wall_seconds": round(wall_seconds, 3),
         "runs": records,
     }, ensure_ascii=False, indent=2) + "\n")
     try:
         display_report = report.relative_to(source)
     except ValueError:
         display_report = report
-    if failure:
-        print(f"FULL SUITE FAIL: runs={len(records)} report={display_report}")
+    if failures:
+        print(f"SELF SUITE FAIL: failures={failures} runs={len(records)} report={display_report}")
         return 1
-    print(f"FULL SUITE PASS: runs={len(records)} report={display_report}")
+    print(f"SELF SUITE PASS: runs={len(records)} report={display_report}")
     return 0
 
 

@@ -14,6 +14,8 @@ Read only the active node.
 | 7 Accept | integrated artifact | targeted, independent, or live-adapter evidence by mode | success criteria and the exact review policy are bound | root cause node |
 | 8 Deliver | accepted artifact | environment promotion, verification, rollback, compacted knowledge | environment gate and human production approval | 4–8 |
 
+Node 0 carries a minimal machine contract: `agentctl.py start` auto-accepts it only after validating that the required TASK fields are present (non-empty title, valid task type and mode) and a routing decision receipt (`decision_policy_version`) exists; otherwise start refuses.
+
 ## Mode projection
 
 - Fast projects nodes 2–6 into one machine receipt after node 1, then runs targeted node 7 evidence; it never renders unavailable standard templates.

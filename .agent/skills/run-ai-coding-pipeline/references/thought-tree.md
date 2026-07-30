@@ -6,7 +6,7 @@ request or resume
 ├─ canonical TASK/context/stage bindings valid? no → repair with evidence; stop
 ├─ requirement contract approved by a human? no → node 1 clarify-task; stop
 ├─ unresolved fact/assumption changes scope, acceptance or risk? yes → ask human; stop
-├─ budget hard_blocked? → cleanup, split or human decision; stop
+├─ budget hard_blocked? → cleanup, split, escalate within the mode ceiling, or human decision; stop
 ├─ budget must_compact? → verified compact handoff + unload stale references; re-read index and continue
 ├─ repeated same-root-cause failure?
 │  ├─ second → return to node 4 solution/re-split

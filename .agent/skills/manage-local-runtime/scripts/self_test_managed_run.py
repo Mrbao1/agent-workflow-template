@@ -27,6 +27,7 @@ def copy_policy_runtime(project: Path) -> None:
     shutil.copy2(ROOT / ".agent/INDEX.md", project / ".agent/INDEX.md")
     shutil.copytree(ROOT / ".agent/workflows", project / ".agent/workflows")
     shutil.copytree(ROOT / ".agent/templates", project / ".agent/templates")
+    shutil.copytree(ROOT / ".agent/policies", project / ".agent/policies")
     shutil.copytree(
         ROOT / ".agent/skills/run-ai-coding-pipeline",
         project / ".agent/skills/run-ai-coding-pipeline",
@@ -43,6 +44,7 @@ shutil.copy2(ROOT / ".agent/config.json", CONTROL_ROOT / ".agent/config.json")
 shutil.copy2(ROOT / ".agent/INDEX.md", CONTROL_ROOT / ".agent/INDEX.md")
 shutil.copytree(ROOT / ".agent/workflows", CONTROL_ROOT / ".agent/workflows")
 shutil.copytree(ROOT / ".agent/templates", CONTROL_ROOT / ".agent/templates")
+shutil.copytree(ROOT / ".agent/policies", CONTROL_ROOT / ".agent/policies")
 shutil.copytree(
     ROOT / ".agent/skills/run-ai-coding-pipeline",
     CONTROL_ROOT / ".agent/skills/run-ai-coding-pipeline",
@@ -53,7 +55,7 @@ control_contract = "# Requirement Contract\n\n- Human decisions: user:runtime-se
 control_task.update({
     "title": "managed-runtime-self-test",
     "mode": "standard",
-    "token_budget": 24000,
+    "token_budget": 48000,
     "tokens_used": 0,
     "budget_state": "ok",
     "status": "in_progress",

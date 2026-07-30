@@ -104,6 +104,7 @@ def fixture(root: Path) -> None:
     shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
     shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows")
     shutil.copytree(SOURCE_AGENT / "templates", root / ".agent/templates")
+    shutil.copytree(SOURCE_AGENT / "policies", root / ".agent/policies")
     shutil.copytree(SOURCE_AGENT / "skills/run-ai-coding-pipeline", root / ".agent/skills/run-ai-coding-pipeline")
     shutil.copytree(SOURCE_AGENT / "skills/clarify-task", root / ".agent/skills/clarify-task")
     host_adapter = root / "host-compaction-adapter.py"

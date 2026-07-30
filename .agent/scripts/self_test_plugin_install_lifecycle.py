@@ -151,8 +151,8 @@ def main():
         manifest=json.loads((target/".agent/.workflow-manifest.json").read_text(encoding="utf-8"))
         if (
             manifest.get("schema")!="agent-workflow-install/v4"
-            or manifest.get("version")!="3.1.42"
-            or manifest.get("migration_version")!=35
+            or manifest.get("version")!="3.1.43"
+            or manifest.get("migration_version")!=36
             or not isinstance(manifest.get("agent_files"),dict)
             or not isinstance(manifest.get("repo_plugin_files"),dict)
             or manifest.get("marketplace_entry",{}).get("name")!="pxpipe-context"
@@ -233,8 +233,16 @@ def main():
             raise SystemExit("v1 manifest was not migrated to v4")
 
         # Adopt records canonical plugin expectations but leaves a project
-        # marketplace byte-for-byte untouched.
+        # marketplace byte-for-byte untouched.  The repository's own live
+        # state is intentionally stale between re-seals, so the adopted tree
+        # seeds its private state from the canonical fresh-state seed instead
+        # of copying that drift (adopt matches only the managed tree anyway).
         adopted=root/"adopted"; adopted.mkdir(); shutil.copytree(template/".agent",adopted/".agent")
+        seed=template/".agent/assets/fresh-state/v1"
+        shutil.rmtree(adopted/".agent/state"); shutil.rmtree(adopted/".agent/policies")
+        shutil.copytree(seed/"state",adopted/".agent/state")
+        shutil.copytree(seed/"policies",adopted/".agent/policies")
+        shutil.copy2(seed/"config.json",adopted/".agent/config.json")
         (adopted/".agent/.workflow-manifest.json").unlink(missing_ok=True)
         adopted_market=json.loads((template/MARKET).read_text(encoding="utf-8")); adopted_market["plugins"]=[]
         (adopted/MARKET).parent.mkdir(parents=True); (adopted/MARKET).write_text(json.dumps(adopted_market,indent=2)+"\n",encoding="utf-8")

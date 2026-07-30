@@ -9,7 +9,7 @@ Use the ledger as the machine authority. Read [coordination-contract.md](referen
 
 ## Dispatch
 
-1. Read `.agent/config.json`, `.agent/state/TASK.json`, and the current context capsule. Before the first dispatch of each task, obtain one fresh provider/platform empty snapshot and run `agentledger.py init --platform-snapshot <snapshot>` (add `--archive-existing` only for an explicitly closed prior ledger). This is the mechanical proof that no untracked old child is still consuming capacity. Reserve one root slot and obey the lower of the platform and mode child limits.
+1. Read `.agent/config.json`, `.agent/state/TASK.json`, and the current context capsule. Before the first dispatch of each task, obtain one fresh provider/platform empty snapshot and run `agentledger.py init --platform-snapshot <snapshot>` (add `--archive-existing` only for an explicitly closed prior ledger; it refuses while members are still active unless `--force --force-reason <why> --source user:<message>` binds a human decision). This is the mechanical proof that no untracked old child is still consuming capacity. The ledger keeps an append hash chain: a legacy ledger without chain fields is accepted once and upgraded on the next save, after which any break fails closed. Reserve one root slot and obey the lower of the platform and mode child limits.
 2. Split tasks by exclusive file ownership, bounded inputs/outputs, forbidden files, evidence, deadline, and acceptance. Keep implementer, adversarial, cross, and integrator identities distinct.
 3. Create `agent-task-payload-draft/v1`, then seal it:
 
@@ -58,7 +58,7 @@ Classify a failure as `candidate`, `test`, or `infrastructure`. An infrastructur
 
 ## Monitor and recover
 
-After registration, call `watchdog-plan` before each bounded host wait. Use the real platform list/status tool at the returned deadline and submit a complete `agent-platform-snapshot/v3` to `check`. Request status after the first unchanged interval. Interrupt only at the configured deadline or after an actually observed unchanged real-progress gap beyond `stall_timeout_seconds`; a missed poll is audit debt, not proof of a dead child.
+After registration, call `watchdog-plan` before each bounded host wait. Use the real platform list/status tool at the returned deadline and submit a complete `agent-platform-snapshot/v3` to `check`. Request status after the first unchanged interval. Interrupt only at the configured deadline or after an actually observed unchanged real-progress gap beyond `stall_timeout_seconds`; a missed poll is audit debt, not proof of a dead child. A child absent from three consecutive fresh platform observations, or one a human declares lost, is closed as platform-lost with `finish --id <id> --status lost --lost --conclusion <bounded-loss-summary>` against a fresh absence-proving snapshot (add `--source user:<message>` for the human-decision path).
 
 Redispatch at most once with a new canonical ID and envelope, but the same model, payload, root task, review chain, subject, and terminal predecessor. Preserve both attempts. A second stable failure returns to node 4; a third requires human judgment.
 

@@ -33,6 +33,12 @@ TASK = AGENT / "state" / "TASK.json"
 CONFIG = AGENT / "config.json"
 CONTRACT = AGENT / "state" / "REQUIREMENT_CONTRACT.md"
 LOCK = AGENT / "state" / ".delivery.lock"
+DELIVERY_ARCHIVES = AGENT / "state" / "evidence" / "delivery-archives"
+DELIVERY_RECEIPT_FIELDS = (
+    "artifact", "test_receipt", "provider_preflight", "production_approval",
+    "deployment_attempt", "promotion_receipt", "rollback_receipt", "legacy_production_chain",
+)
+DELIVERY_CHAIN_LIMIT = 256
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
@@ -444,9 +450,133 @@ def deployment_decision_packet(
     }
 
 
+def current_delivery_bytes() -> Optional[bytes]:
+    """Exact current delivery.json bytes for task-archive inclusion.
+
+    Exported for `agentctl.py build_task_archive` (another workstream): bind
+    the returned bytes with sha256 in the task-archive head. Returns None
+    when no delivery state exists yet. Read-only.
+    """
+    if not STATE.is_file() or STATE.is_symlink():
+        return None
+    return STATE.read_bytes()
+
+
+def delivery_state_empty(value: object) -> bool:
+    """True when a reset loses nothing: no receipts and a pre-artifact status."""
+    return (
+        isinstance(value, dict)
+        and value.get("status") in {"not_requested", "awaiting_artifact"}
+        and all(value.get(field) is None for field in DELIVERY_RECEIPT_FIELDS)
+    )
+
+
+def archive_delivery_state(raw: bytes) -> Dict[str, object]:
+    """Content-address the exact prior delivery.json bytes into evidence."""
+    value_sha = hashlib.sha256(raw).hexdigest()
+    DELIVERY_ARCHIVES.mkdir(parents=True, exist_ok=True)
+    target = DELIVERY_ARCHIVES / f"{value_sha}.json"
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != raw:
+            raise SystemExit("delivery state archive digest collision")
+    else:
+        descriptor, temp_raw = tempfile.mkstemp(prefix=".delivery-archive.", dir=str(DELIVERY_ARCHIVES))
+        temporary = Path(temp_raw)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(raw); output.flush(); os.fsync(output.fileno())
+            os.replace(temporary, target); target.chmod(0o444)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return {"path": str(target.relative_to(ROOT)), "sha256": value_sha, "bytes": len(raw)}
+
+
+def delivery_chain_errors(state: Dict[str, object]) -> List[str]:
+    """Verify the epoch/previous_head hash chain across `init` resets.
+
+    Every reset of a non-empty state archives the exact prior bytes under
+    evidence/delivery-archives/ and links the fresh state to that receipt.
+    Legacy states (neither epoch nor previous_head) predate the chain and
+    are accepted as chain-terminal.
+    """
+    epoch = state.get("epoch")
+    head = state.get("previous_head")
+    if epoch is None and head is None:
+        return []
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1:
+        return ["delivery epoch is invalid"]
+    errors: List[str] = []
+    seen = set()
+    current_epoch = epoch
+    depth = 0
+    while head is not None:
+        depth += 1
+        if depth > DELIVERY_CHAIN_LIMIT:
+            errors.append("delivery archive chain exceeds its depth bound")
+            break
+        if not isinstance(head, dict) or set(head) != {"path", "sha256", "bytes"}:
+            errors.append("delivery archive head fields are invalid")
+            break
+        value_sha = str(head.get("sha256", ""))
+        expected = DELIVERY_ARCHIVES / f"{value_sha}.json"
+        path = (ROOT / str(head.get("path", ""))).resolve()
+        if (
+            not HEX64.fullmatch(value_sha) or path != expected.resolve()
+            or not isinstance(head.get("bytes"), int) or head["bytes"] < 1
+            or value_sha in seen or not path.is_file() or path.is_symlink()
+        ):
+            errors.append("delivery archive head is invalid or missing")
+            break
+        seen.add(value_sha)
+        data = path.read_bytes()
+        if len(data) != head["bytes"] or hashlib.sha256(data).hexdigest() != value_sha:
+            errors.append("delivery archive bytes drifted")
+            break
+        try:
+            archived = json.loads(data)
+        except (ValueError, json.JSONDecodeError):
+            archived = None
+        if not isinstance(archived, dict) or archived.get("schema") not in {"agent-delivery/v2", "agent-delivery/v3"}:
+            errors.append("delivery archive content is not a delivery state")
+            break
+        archived_epoch = archived.get("epoch")
+        if archived_epoch is None and archived.get("previous_head") is None:
+            archived_epoch = 1  # legacy archived state predating the chain
+        if archived_epoch != current_epoch - 1:
+            errors.append("delivery archive chain is not continuous across resets")
+            break
+        current_epoch -= 1
+        head = archived.get("previous_head")
+    if head is None and current_epoch != 1 and not errors:
+        errors.append("delivery archive chain does not terminate at the first epoch")
+    return errors
+
+
 def command_init(_: argparse.Namespace) -> int:
     task = load(TASK)
     status = "awaiting_artifact" if task.get("deployment_requested") else "not_requested"
+    epoch, previous_head = 1, None
+    if STATE.is_file() and not STATE.is_symlink():
+        raw = STATE.read_bytes()
+        try:
+            current = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            current = None
+        old_epoch = current.get("epoch") if isinstance(current, dict) else None
+        if not isinstance(old_epoch, int) or isinstance(old_epoch, bool) or old_epoch < 1:
+            old_epoch = 1
+        if delivery_state_empty(current):
+            # Empty/fresh states carry no receipts worth archiving; keep the
+            # established chain so a later archival still links across resets.
+            epoch = old_epoch
+            head = current.get("previous_head") if isinstance(current, dict) else None
+            previous_head = head if isinstance(head, dict) else None
+        else:
+            # A non-empty delivery state is audit evidence: archive its exact
+            # bytes BEFORE resetting, and refuse to reset when archival fails.
+            previous_head = archive_delivery_state(raw)
+            epoch = old_epoch + 1
     save({
         "schema": "agent-delivery/v3",
         "environment": task.get("environment"),
@@ -460,6 +590,8 @@ def command_init(_: argparse.Namespace) -> int:
         "promotion_receipt": None,
         "rollback_receipt": None,
         "legacy_production_chain": None,
+        "epoch": epoch,
+        "previous_head": previous_head,
         "updated_at": timestamp(),
     })
     print(f"DELIVERY INITIALIZED: {status}")
@@ -756,12 +888,14 @@ def command_validate(_: argparse.Namespace) -> int:
     errors: List[str] = []
     if state.get("schema") != "agent-delivery/v3":
         errors.append("invalid schema")
-    if set(state) != {
+    base_fields = {
         "schema", "environment", "deployment_requested", "status", "artifact", "test_receipt",
         "provider_preflight", "production_approval", "deployment_attempt", "promotion_receipt",
         "rollback_receipt", "legacy_production_chain", "updated_at",
-    }:
+    }
+    if set(state) not in (base_fields, base_fields | {"epoch", "previous_head"}):
         errors.append("delivery state fields are invalid")
+    errors.extend(delivery_chain_errors(state))
     if state.get("environment") != task.get("environment") or state.get("deployment_requested") != task.get("deployment_requested"):
         errors.append("delivery state differs from task target")
     allowed = {

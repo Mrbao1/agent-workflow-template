@@ -356,24 +356,38 @@ def validate_context_transport_vars(task: Dict[str, object], variables: Dict[str
     plugin_files = workflow_manifest.get("repo_plugin_files")
     workflow_schema = workflow_manifest.get("schema")
     bootstrap = workflow_manifest.get("agents_bootstrap")
+    claude_bootstrap = workflow_manifest.get("claude_bootstrap")
+    bootstrap_schemas = {"agent-workflow-install/v3", "agent-workflow-install/v4"}
     if (
-        workflow_schema not in {"agent-workflow-install/v2", "agent-workflow-install/v3"}
+        workflow_schema not in {"agent-workflow-install/v2", *bootstrap_schemas}
         or not isinstance(plugin_files, dict)
         or not re.fullmatch(r"[0-9a-f]{64}", str(workflow_manifest.get("source_tree_sha256", "")))
         or (
-            workflow_schema == "agent-workflow-install/v3"
+            workflow_schema in bootstrap_schemas
             and (
                 not isinstance(bootstrap, dict)
                 or bootstrap.get("path") != "AGENTS.md"
                 or not re.fullmatch(r"[0-9a-f]{64}", str(bootstrap.get("sha256", "")))
             )
         )
+        or (
+            workflow_schema == "agent-workflow-install/v4"
+            and (
+                not isinstance(claude_bootstrap, dict)
+                or claude_bootstrap.get("path") != "CLAUDE.md"
+                or not re.fullmatch(r"[0-9a-f]{64}", str(claude_bootstrap.get("sha256", "")))
+            )
+        )
     ):
-        raise SystemExit("pxpipe requires a valid v2/v3 workflow installation manifest with plugin hashes")
-    if workflow_schema == "agent-workflow-install/v3":
+        raise SystemExit("pxpipe requires a valid v2 or later workflow installation manifest with plugin hashes")
+    if workflow_schema in bootstrap_schemas:
         bootstrap_path = relative_real_file(ROOT / "AGENTS.md", ROOT, "workflow AGENTS bootstrap")
         if sha256_bytes(bootstrap_path.read_bytes()) != bootstrap.get("sha256"):
-            raise SystemExit("workflow AGENTS bootstrap differs from the v3 installation anchor")
+            raise SystemExit("workflow AGENTS bootstrap differs from the installation anchor")
+    if workflow_schema == "agent-workflow-install/v4":
+        claude_path = relative_real_file(ROOT / "CLAUDE.md", ROOT, "workflow CLAUDE bootstrap")
+        if sha256_bytes(claude_path.read_bytes()) != claude_bootstrap.get("sha256"):
+            raise SystemExit("workflow CLAUDE bootstrap differs from the v4 installation anchor")
     critical_plugin_files = {
         ".codex-plugin/plugin.json": "plugin_manifest_sha256",
         "integrity.json": "plugin_integrity_sha256",
@@ -446,9 +460,10 @@ def validate_context_transport_vars(task: Dict[str, object], variables: Dict[str
         or provenance.get("plugin_version") != variables.get("plugin_version")
         or any(provenance.get(key) != variables.get(key) for key in digest_keys if key not in {"source_sha256", "analyze_receipt_sha256"})
         or provenance.get("provenance_assurance") != "content-and-install-anchored;no-host-signature"
-        or provenance.get("attestation_mode") != (
-            "agent-workflow-v3" if workflow_schema == "agent-workflow-install/v3" else "agent-workflow-v2"
-        )
+        or provenance.get("attestation_mode") != {
+            "agent-workflow-install/v3": "agent-workflow-v3",
+            "agent-workflow-install/v4": "agent-workflow-v4",
+        }.get(workflow_schema, "agent-workflow-v2")
         or provenance.get("trusted_root_source") not in {
             "mcp-roots/list", "host-env:CODEX_PROJECT_ROOT",
             "host-env:PXPIPE_CONTEXT_PROJECT_ROOT",

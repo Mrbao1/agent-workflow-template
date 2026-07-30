@@ -8,7 +8,7 @@ Search this index before planning. Keep it short.
 
 ## Candidate protocol
 
-Retrospectives may emit a candidate with observation, evidence, reuse scope, counterexample and expiry/review date. A candidate is not a rule and must not change behavior.
+Retrospectives may emit a candidate with observation, evidence, reuse scope, counterexample and expiry/review date. A candidate is not a rule and must not change behavior. Candidates are collected into `.agent/state/knowledge-pending.json` when a new task starts and wait there until a human promotes one with `python3 .agent/scripts/agentctl.py promote-knowledge <index> --target knowledge|capabilities --source user:<decision>`.
 
 Promotion requires:
 

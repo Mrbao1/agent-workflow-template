@@ -26,7 +26,7 @@
 ## Supervision and retry
 
 - Use one-shot `watchdog-plan`; the host performs real platform observations at bounded intervals. Do not start a daemon.
-- Record missed polling as supervisor debt. Interrupt only for deadline or a proven unchanged progress gap beyond the stall timeout.
+- Record missed polling as supervisor debt. Interrupt only for deadline or a proven unchanged progress gap beyond the stall timeout. Close a platform-lost child with `finish --lost` only after three consecutive missing platform observations or a bound human decision, each against a fresh absence-proving snapshot.
 - Redispatch once at most with a new ID/envelope and the same model, payload, root task, subject, chain, and predecessor. Preserve failed attempts.
 - Stop the automatic chain when the mode's wall-time or attempt budget is exhausted.
 
@@ -36,3 +36,4 @@
 - Reuse a test receipt only when candidate fingerprint, runner, command plan, environment profile, and gate tool still match.
 - Abort unfinished replay authority on unsuccessful integrator termination. Never reinterpret infrastructure failure as candidate failure or root completion.
 - Require zero residual runtime and a fresh platform-empty observation before final integration. `route-resume` is the only root terminal decision.
+- Trust the ledger only through its append hash chain; a legacy chainless ledger upgrades once on save, and any later break fails closed. `init --archive-existing` refuses while members are active unless `--force --force-reason <why> --source user:<message>` binds a human decision.

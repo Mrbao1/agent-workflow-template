@@ -97,15 +97,32 @@ def downgrade_empty_v8_to_v7(target: Path) -> Path:
 
 
 def activate_migration22_hot_state(target: Path) -> None:
-    """Build an integrity-bound active predecessor with oversized hot ledgers."""
+    """Build an integrity-bound active predecessor with oversized hot ledgers.
+
+    The predecessor carries the authentic pre-recalibration policy shape:
+    the deprecated ``automatic_transition_token_increment`` alias with its
+    legacy arithmetic (no bootstrap floor, no inherited-turn surcharge), the
+    old child system/tool margin and the migration-30..34 default budgets.
+    Its release budget is 40000 — the largest legacy default that still
+    satisfies the fail-closed budget invariant under legacy arithmetic — so
+    the pre-migration capsule validates while the migration chain still
+    rewrites it (40000 -> 48000 -> 96000).
+    """
     agent = target / ".agent"; state = agent / "state"
     config_path = agent / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["context"]["max_rollback_entries"] = 8
     config["context"].pop("max_failure_entries", None)
     config["context"].pop("max_failure_archive_depth", None)
+    config["context"].pop("estimated_turn_overhead_tokens", None)
+    config["context"].pop("bootstrap_overhead_tokens", None)
+    config["context"]["automatic_transition_token_increment"] = {
+        "fast": 150, "standard": 300, "release": 500,
+    }
+    config["agent_control"]["child_system_tool_margin_tokens"] = 1000
     config.pop("evidence_retention", None)
-    config["routing"]["modes"]["release"]["token_budget"] = 30000
+    for mode, budget in (("fast", 12000), ("standard", 24000), ("release", 40000)):
+        config["routing"]["modes"][mode]["token_budget"] = budget
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     contract = "# Requirement Contract\n\n- Human decisions: user:migration-fixture\n- Clarified: true\n"
@@ -113,7 +130,7 @@ def activate_migration22_hot_state(target: Path) -> None:
     task_path = state / "TASK.json"; task = json.loads(task_path.read_text(encoding="utf-8"))
     task.update({
         "title": "migration 22 active hot-state fixture",
-        "mode": "release", "complexity": "complex", "token_budget": 30000,
+        "mode": "release", "complexity": "complex", "token_budget": 40000,
         "status": "in_progress", "phase": "structuring",
         "requirements_clarified": True, "requirement_source": "user:migration-fixture",
         "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
@@ -203,7 +220,7 @@ def main() -> int:
             or fresh_agents.get("replay_runs") != []
             or fresh_agents.get("task_payload_schema") != "agent-task-payload/v2"
             or fresh_agents.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 48000,
                 "settled_tokens": 0,
             }
             or fresh_agents.get("task_payload_limits") != {
@@ -211,8 +228,13 @@ def main() -> int:
                 "max_total_bytes": 262144, "max_estimated_tokens": 65536,
             }
             or {name: entry.get("token_budget") for name, entry in fresh_full_config.get("routing", {}).get("modes", {}).items()} != {
-                "fast": 12000, "standard": 24000, "release": 48000,
+                "fast": 16000, "standard": 48000, "release": 96000,
             }
+            or fresh_full_config.get("context", {}).get("estimated_turn_overhead_tokens") != {
+                "fast": 2000, "standard": 3000, "release": 4000,
+            }
+            or fresh_full_config.get("context", {}).get("bootstrap_overhead_tokens") != 7000
+            or "automatic_transition_token_increment" in fresh_full_config.get("context", {})
             or fresh_config.get("status_interval_seconds") != 30
             or fresh_config.get("monitor_grace_seconds") != 30
             or fresh_config.get("stall_timeout_seconds") != 300
@@ -230,7 +252,7 @@ def main() -> int:
             }
             or fresh_config.get("default_fork_turns") != 0
             or fresh_config.get("inherited_turn_estimated_tokens") != 800
-            or fresh_config.get("child_system_tool_margin_tokens") != 1000
+            or fresh_config.get("child_system_tool_margin_tokens") != 4000
             or fresh_config.get("child_output_margin_tokens") != 2000
             or fresh_config.get("allowed_role_types") != [
                 "worker", "researcher", "documentation-worker", "implementer",
@@ -393,6 +415,15 @@ def main() -> int:
         run(sys.executable, str(installer), str(target), "--check")
         if (target/".agent/state/agents.json").read_bytes()!=fresh_agents_before:
             raise SystemExit("idempotent v9 update rewrote the Agent ledger")
+        idle_context_before=(target/".agent/state/CONTEXT.json").read_bytes()
+        idle_stage_before=(target/".agent/state/STAGE_INDEX.md").read_bytes()
+        run(sys.executable, str(installer), str(target), "--update")
+        if (
+            (target/".agent/state/CONTEXT.json").read_bytes()!=idle_context_before
+            or (target/".agent/state/STAGE_INDEX.md").read_bytes()!=idle_stage_before
+        ):
+            raise SystemExit("write-free update reseeded the idle CONTEXT/STAGE_INDEX bytes")
+        run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=target)
 
         # Migration 29 preserves the v9 ledger, adaptive decision/archive state,
         # and rebinds active context after canonical task migration.
@@ -413,7 +444,7 @@ def main() -> int:
         if (
             migrated_v8.get("schema") != "agent-team/v9"
             or migrated_v8.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 48000,
                 "settled_tokens": 0,
             }
         ):
@@ -429,11 +460,31 @@ def main() -> int:
         )
         run(
             sys.executable, ".agent/scripts/contextctl.py", "sync",
-            "--source-tokens", "4000", "--reason", "migration-34-preservation-fixture",
+            "--source-tokens", "8000", "--reason", "migration-34-preservation-fixture",
             "--summary", "preserve complete active context across migration",
             "--source", "fixture:migration-34", "--fact", "context fact must survive",
             "--file", ".agent/state/TASK.json", "--evidence", ".agent/state/TASK.json",
-            "--risk", "context risk must survive", "--request-host-compaction", cwd=migration28,
+            "--risk", "context risk must survive", cwd=migration28,
+        )
+        # Entering the awaiting state requires a configured host compaction
+        # observer adapter (fail-closed entry), which an installed project does
+        # not have. Model the awaiting state directly so the migration-34
+        # preservation assertion stays independent of a host adapter.
+        run(
+            sys.executable, "-c", (
+                "import json,sys;sys.path.insert(0,'.agent/scripts');import contextctl;"
+                "p='.agent/state/CONTEXT.json';v=json.load(open(p));"
+                "v['host_compaction']={'schema':'agent-host-compaction-state/v1',"
+                "'state':'awaiting_host_compaction','history':['handoff_written'],'receipt':None};"
+                "comp=v['compaction'];est=contextctl.normalized_token_estimate(v);"
+                "comp['capsule_estimated_tokens']=est;"
+                "comp['tokens_removed']=int(comp['source_estimated_tokens'])-est;"
+                "comp['compression_ratio']=round(int(comp['source_estimated_tokens'])/max(est,1),2);"
+                "v['integrity']['content_sha256']='0'*64;"
+                "v['integrity']['content_sha256']=contextctl.content_sha256(v);"
+                "open(p,'w').write(json.dumps(v,ensure_ascii=False,indent=2)+'\\n')"
+            ),
+            cwd=migration28,
         )
         context_path = migration28 / ".agent/state/CONTEXT.json"
         context_bytes_before = context_path.read_bytes()
@@ -475,7 +526,8 @@ def main() -> int:
         run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=migration28)
 
         # Migration 35 raises the exact old routing/token defaults
-        # (6000/20000/40000) to 12000/24000/48000 without disturbing a
+        # (6000/20000/40000) to 12000/24000/48000 and migration 36 then lifts
+        # them to the recalibrated 16000/48000/96000 without disturbing a
         # project-owned custom budget.
         migration35 = workspace / "migration35-token-budgets"
         run(sys.executable, str(installer), str(migration35), "--project-name", "fixture-migration35")
@@ -500,19 +552,19 @@ def main() -> int:
         run(sys.executable, str(installer), str(migration35), "--update")
         m35_migrated = json.loads(m35_config_path.read_text(encoding="utf-8"))
         if {mode: m35_migrated["routing"]["modes"][mode]["token_budget"] for mode in ("fast", "standard", "release")} != {
-            "fast": 12000, "standard": 24000, "release": 48000,
+            "fast": 16000, "standard": 48000, "release": 96000,
         }:
-            raise SystemExit("migration 35 did not raise the exact old routing token budgets")
+            raise SystemExit("migrations 35/36 did not raise the exact old routing token budgets")
         m35_task_after = json.loads(m35_task_path.read_text(encoding="utf-8"))
-        if m35_task_after["token_budget"] != 24000:
-            raise SystemExit("migration 35 did not rebind the active standard task budget")
+        if m35_task_after["token_budget"] != 48000:
+            raise SystemExit("migrations 35/36 did not rebind the active standard task budget")
         run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=migration35)
 
         custom35 = workspace / "migration35-custom-budgets"
         run(sys.executable, str(installer), str(custom35), "--project-name", "fixture-migration35-custom")
         custom35_config_path = custom35 / ".agent/config.json"
         custom35_config = json.loads(custom35_config_path.read_text(encoding="utf-8"))
-        custom35_config["routing"]["modes"]["fast"]["token_budget"] = 9000
+        custom35_config["routing"]["modes"]["fast"]["token_budget"] = 11000
         custom35_config_path.write_text(json.dumps(custom35_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         custom35_manifest_path = custom35 / ".agent/.workflow-manifest.json"
         custom35_manifest = json.loads(custom35_manifest_path.read_text(encoding="utf-8"))
@@ -521,8 +573,49 @@ def main() -> int:
         custom35_manifest_path.write_text(json.dumps(custom35_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(custom35), "--update")
         custom35_migrated = json.loads(custom35_config_path.read_text(encoding="utf-8"))
-        if custom35_migrated["routing"]["modes"]["fast"]["token_budget"] != 9000:
-            raise SystemExit("migration 35 overwrote a project-owned custom fast token budget")
+        if custom35_migrated["routing"]["modes"]["fast"]["token_budget"] != 11000:
+            raise SystemExit("migrations 35/36 overwrote a project-owned custom fast token budget")
+
+        # An install from before the budget recalibration that has NOT been
+        # migrated still validates: the deprecated transition-increment alias
+        # keeps its exact legacy arithmetic (no bootstrap floor, no
+        # inherited-turn surcharge), so its old budgets stay inside the
+        # fail-closed invariant.
+        legacy35 = workspace / "legacy-unmigrated-budgets"
+        run(sys.executable, str(installer), str(legacy35), "--project-name", "fixture-legacy35")
+        legacy_config_path = legacy35 / ".agent/config.json"
+        legacy_config = json.loads(legacy_config_path.read_text(encoding="utf-8"))
+        for mode, budget in (("fast", 12000), ("standard", 24000), ("release", 48000)):
+            legacy_config["routing"]["modes"][mode]["token_budget"] = budget
+        legacy_config["context"].pop("estimated_turn_overhead_tokens", None)
+        legacy_config["context"].pop("bootstrap_overhead_tokens", None)
+        legacy_config["context"]["automatic_transition_token_increment"] = {
+            "fast": 150, "standard": 300, "release": 500,
+        }
+        legacy_config["agent_control"]["child_system_tool_margin_tokens"] = 1000
+        legacy_config_path.write_text(json.dumps(legacy_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        legacy_task_path = legacy35 / ".agent/state/TASK.json"
+        legacy_task = json.loads(legacy_task_path.read_text(encoding="utf-8"))
+        legacy_task["token_budget"] = 24000
+        legacy_task_path.write_text(json.dumps(legacy_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        legacy_agents_path = legacy35 / ".agent/state/agents.json"
+        legacy_agents = json.loads(legacy_agents_path.read_text(encoding="utf-8"))
+        legacy_agents["token_accounting"]["token_budget"] = 24000
+        legacy_agents_path.write_text(json.dumps(legacy_agents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # Re-seal the idle capsule against the legacy-shaped policy so the
+        # fixture is an authentic unmigrated install, not canonical drift.
+        run(
+            sys.executable, "-c",
+            "import argparse,hashlib,json,sys;from pathlib import Path;"
+            "sys.path.insert(0,'.agent/scripts');import contextctl;"
+            "p=contextctl.CONTEXT_PATH;previous=json.loads(p.read_text());"
+            "args=argparse.Namespace(reason='legacy-unmigrated-fixture',summary='pre-recalibration idle state',source='migration-fixture',source_tokens=800,fact=[],file=[],evidence=[],risk=[],resolve_risk=[],transition=False,reset=True);"
+            "capsule=contextctl.build_capsule(args,'verified',previous,hashlib.sha256(p.read_bytes()).hexdigest());"
+            "contextctl.atomic_json(p,capsule);raise SystemExit(contextctl.validate_context())",
+            cwd=legacy35,
+        )
+        run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=legacy35)
+        run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=legacy35)
 
         # If a template-managed reference was actively loaded under v33, its
         # purpose/phase stay live while migration 34 rebinds the changed bytes.
@@ -657,13 +750,31 @@ def main() -> int:
             or migrated_task.get("failure_archive", {}).get("depth") != 1
         ):
             raise SystemExit("migration 23 did not transactionally compact active hot state")
+        migrated22_config = json.loads((migration22 / ".agent/config.json").read_text(encoding="utf-8"))
+        if (
+            {mode: migrated22_config["routing"]["modes"][mode]["token_budget"] for mode in ("fast", "standard", "release")}
+            != {"fast": 16000, "standard": 48000, "release": 96000}
+            or migrated22_config["context"].get("estimated_turn_overhead_tokens")
+            != {"fast": 2000, "standard": 3000, "release": 4000}
+            or migrated22_config["context"].get("bootstrap_overhead_tokens") != 7000
+            or "automatic_transition_token_increment" in migrated22_config["context"]
+            or migrated22_config["agent_control"].get("child_system_tool_margin_tokens") != 4000
+            or migrated_task.get("token_budget") != 96000
+        ):
+            raise SystemExit("migration 36 did not recalibrate the legacy budget policy of the active predecessor")
         run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=migration22)
         run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=migration22)
         run(sys.executable, ".agent/scripts/evidencectl.py", "verify", "--deep", cwd=migration22)
         migrated_task_before = migrated_task_path.read_bytes()
+        migrated_context_before = (migration22 / ".agent/state/CONTEXT.json").read_bytes()
+        migrated_stage_before = (migration22 / ".agent/state/STAGE_INDEX.md").read_bytes()
         run(sys.executable, str(installer), str(migration22), "--update")
-        if migrated_task_path.read_bytes() != migrated_task_before:
-            raise SystemExit("idempotent migration-23 update rewrote compacted TASK")
+        if (
+            migrated_task_path.read_bytes() != migrated_task_before
+            or (migration22 / ".agent/state/CONTEXT.json").read_bytes() != migrated_context_before
+            or (migration22 / ".agent/state/STAGE_INDEX.md").read_bytes() != migrated_stage_before
+        ):
+            raise SystemExit("idempotent migration-23 update rewrote compacted TASK or CONTEXT/STAGE_INDEX")
 
         corrupt22 = workspace / "migration22-corrupt-context"
         run(sys.executable, str(installer), str(corrupt22), "--project-name", "fixture-corrupt22")
@@ -847,7 +958,7 @@ def main() -> int:
         if (
             adopted_v8_agents.get("schema") != "agent-team/v9"
             or adopted_v8_agents.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 24000,
+                "schema": "agent-child-token-accounting/v1", "token_budget": 48000,
                 "settled_tokens": 0,
             }
         ):

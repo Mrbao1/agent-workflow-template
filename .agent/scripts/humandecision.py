@@ -89,22 +89,27 @@ def decision_policy_version(
     return PROVIDER_POLICY_VERSION
 
 
-def local_approval(source: str, artifact_sha256: str) -> Dict[str, object]:
+def local_approval(source: str, artifact_sha256: str, task: Optional[Dict[str, object]] = None) -> Dict[str, object]:
     if not source.startswith("user:") or HEX64.fullmatch(artifact_sha256) is None:
         raise SystemExit("local human decision must bind a user source and exact artifact SHA-256")
-    return {
+    approval: Dict[str, object] = {
         "source": source,
         "artifact_sha256": artifact_sha256,
         "assurance": LOCAL_ASSURANCE,
     }
+    if task is not None:
+        # Bind the same routing profile the provider receipts bind, so a local
+        # approval cannot be replayed against a rerouted or escalated task.
+        approval["routing_profile_sha256"] = routing_profile_sha256(task)
+    return approval
 
 
 def local_approval_valid(
     task: Dict[str, object], approval: object, *, source: str,
-    artifact_sha256: str,
+    artifact_sha256: str, config: Optional[Dict[str, object]] = None,
 ) -> bool:
     risks = task.get("risk_flags")
-    return (
+    if not (
         task.get("decision_policy_version") == LOCAL_POLICY_VERSION
         and task.get("environment") == "local"
         and task.get("mode") in {"fast", "standard", "release"}
@@ -112,13 +117,32 @@ def local_approval_valid(
         and isinstance(risks, dict)
         and not any(risks.get(name) is True for name in {"deploy", "irreversible", "external_impact"})
         and isinstance(approval, dict)
-        and set(approval) == {"source", "artifact_sha256", "assurance"}
         and approval.get("source") == source
         and approval.get("artifact_sha256") == artifact_sha256
         and approval.get("assurance") == LOCAL_ASSURANCE
         and source.startswith("user:")
         and HEX64.fullmatch(artifact_sha256) is not None
-    )
+    ):
+        return False
+    keys = set(approval)
+    if keys == {"source", "artifact_sha256", "assurance"}:
+        pass  # legacy record predating the routing-profile binding
+    elif keys == {"source", "artifact_sha256", "assurance", "routing_profile_sha256"}:
+        if approval.get("routing_profile_sha256") != routing_profile_sha256(task):
+            return False
+    else:
+        return False
+    if task.get("mode") == "release" and config is not None:
+        # Config tightening is retroactive: a release task that was approved
+        # under a formerly permissive local boundary loses that approval once
+        # the project withdraws allow_current_chat_local_release.
+        try:
+            observed = policy(config)
+        except SystemExit:
+            return False
+        if observed.get("allow_current_chat_local_release") is not True:
+            return False
+    return True
 
 
 def resolve_receipt(root: Path, raw: str) -> Path:
@@ -195,6 +219,18 @@ def adapter_path(root: Path, raw: object) -> Path:
     if not protected_path_chain(path):
         raise SystemExit("human decision adapter and every parent must be OS-owned and non-writable by the Agent")
     return path
+
+
+def try_adapter_path(root: Path, raw: object) -> Optional[Path]:
+    """Resolve a configured adapter path, or return None when none is configured.
+
+    Unlike adapter_path this does not raise for an unconfigured (null or blank)
+    adapter, so callers can probe availability; a configured but invalid
+    adapter still fails closed through adapter_path.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    return adapter_path(root, raw)
 
 
 def health(root: Path, config: Dict[str, object]) -> Dict[str, object]:
@@ -286,3 +322,50 @@ def reverify(root: Path, config: Dict[str, object], task: Dict[str, object], *, 
         )
     except (SystemExit, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, subprocess.TimeoutExpired):
         return False
+
+
+def record_decision_approval(
+    root: Path, config: Dict[str, object], task: Dict[str, object], *,
+    gate: str, artifact_sha256: str, source: str, receipt: Optional[str] = None,
+) -> Dict[str, object]:
+    """Record a fresh human decision under the task's stored decision policy.
+
+    This is the single approval routing shared by every human gate: a task on
+    the policy-v2 local boundary accepts a bound local user-message approval,
+    while every other route requires a provider-signed receipt for the exact
+    gate and artifact.  Returns the approval record to store alongside the
+    artifact; raises SystemExit with an actionable message on any violation.
+    """
+    if task.get("decision_policy_version") == LOCAL_POLICY_VERSION:
+        if receipt:
+            raise SystemExit("local user-message approval does not accept an unaudited provider receipt")
+        approval = local_approval(source, artifact_sha256, task)
+        if not local_approval_valid(task, approval, source=source, artifact_sha256=artifact_sha256, config=config):
+            raise SystemExit(
+                f"local approval for gate {gate} is outside the current local decision boundary; "
+                "re-approve the task under the active policy or configure a provider adapter"
+            )
+        return approval
+    if not receipt:
+        raise SystemExit(f"gate {gate} approval requires a provider-signed human decision receipt")
+    return verify(root, config, task, gate=gate, artifact_sha256=artifact_sha256, source=source, receipt=receipt)
+
+
+def decision_approval_valid(
+    root: Path, config: Dict[str, object], task: Dict[str, object], *,
+    gate: str, artifact_sha256: str, source: str, record: object,
+) -> bool:
+    """Re-validate a stored human-decision approval under the task's decision policy.
+
+    Mirror of record_decision_approval for persisted records: policy-v2 local
+    tasks re-check the local approval (including the routing-profile binding
+    and retroactive config tightening for release mode), provider-routed tasks
+    re-verify the signed receipt, and any other stored policy version fails
+    closed.
+    """
+    version = task.get("decision_policy_version")
+    if version == LOCAL_POLICY_VERSION:
+        return local_approval_valid(task, record, source=source, artifact_sha256=artifact_sha256, config=config)
+    if version == PROVIDER_POLICY_VERSION:
+        return reverify(root, config, task, gate=gate, artifact_sha256=artifact_sha256, source=source, record=record)
+    return False

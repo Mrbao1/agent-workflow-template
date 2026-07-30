@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -284,6 +285,63 @@ def main() -> int:
             raise SystemExit("adopt replaced installed project-private evidence")
         assert_no_sentinel(target)
         run(sys.executable, str(installer), str(target), "--check", cwd=polluted)
+
+        # An older installer must never silently downgrade a newer install.
+        newer = workspace / "newer-install"
+        run(sys.executable, str(installer), str(newer), "--project-name", "downgrade-fixture", cwd=polluted)
+        newer_manifest_path = newer / ".agent/.workflow-manifest.json"
+        newer_manifest = json.loads(newer_manifest_path.read_text(encoding="utf-8"))
+        newer_manifest["version"] = "99.0.0"; newer_manifest["migration_version"] = 99
+        newer_manifest_path.write_text(json.dumps(newer_manifest, indent=2) + "\n", encoding="utf-8")
+        newer_before = tree(newer)
+        refused = run(sys.executable, str(installer), str(newer), "--update", cwd=polluted, expected=(2,))
+        if "UPDATE REFUSED" not in refused.stdout or tree(newer) != newer_before:
+            raise SystemExit("older installer did not refuse a newer target byte-for-byte")
+        check_newer = run(sys.executable, str(installer), str(newer), "--check", cwd=polluted, expected=(3,))
+        if "TARGET NEWER" not in check_newer.stdout or tree(newer) != newer_before:
+            raise SystemExit("--check did not flag a newer target with its distinct exit code")
+        downgraded = run(
+            sys.executable, str(installer), str(newer), "--update", "--allow-downgrade", cwd=polluted,
+        )
+        if "WARNING" not in downgraded.stdout:
+            raise SystemExit("--allow-downgrade did not print a loud downgrade warning")
+        run(sys.executable, str(installer), str(newer), "--check", cwd=polluted)
+
+        # Read-only modes never create directories for missing targets.
+        ghost = workspace / "ghost-parent" / "ghost-project"
+        run(sys.executable, str(installer), str(ghost), "--check", cwd=polluted, expected=(1,))
+        if (workspace / "ghost-parent").exists():
+            raise SystemExit("--check created directories for a missing target")
+        dry_ghost = run(
+            sys.executable, str(installer), str(ghost), "--project-name", "ghost", "--dry-run", cwd=polluted,
+        )
+        if "DRY RUN" not in dry_ghost.stdout or (workspace / "ghost-parent").exists():
+            raise SystemExit("--dry-run install created directories for a missing target")
+
+        # A dedicated executable stub emitting the exact provider-preflight
+        # health line passes the health protocol; wrong output is rejected.
+        installer_spec = importlib.util.spec_from_file_location("workflow_installer", installer)
+        installer_module = importlib.util.module_from_spec(installer_spec)
+        installer_spec.loader.exec_module(installer_module)
+        real_guard = installer_module.protected_external_adapter
+        installer_module.protected_external_adapter = lambda owner, raw: True
+        try:
+            stub = workspace / "provider-preflight-stub"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "PROVIDER PREFLIGHT ADAPTER READY"\n', encoding="utf-8")
+            stub.chmod(0o755)
+            if installer_module.bootstrap_provider_preflight_adapter(workspace, str(stub)) != str(stub.resolve()):
+                raise SystemExit("provider preflight stub with the exact health output was not accepted")
+            wrong = workspace / "provider-preflight-wrong"
+            wrong.write_text('#!/bin/sh\nprintf "%s\\n" "WRONG HEALTH OUTPUT"\n', encoding="utf-8")
+            wrong.chmod(0o755)
+            try:
+                installer_module.bootstrap_provider_preflight_adapter(workspace, str(wrong))
+            except RuntimeError:
+                pass
+            else:
+                raise SystemExit("provider preflight stub with wrong health output was accepted")
+        finally:
+            installer_module.protected_external_adapter = real_guard
 
     print("INSTALL LIFECYCLE PASS: idle/polluted/installed isolation and rollback")
     return 0

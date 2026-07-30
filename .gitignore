@@ -7,3 +7,4 @@ __pycache__/
 .agent/state/.project-init.lock
 outputs/
 .idea/
+.agent/state/evidence/

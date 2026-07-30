@@ -4,8 +4,8 @@
 from pathlib import Path
 import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 
-VERSION="3.1.42"
-MIGRATION_VERSION=35
+VERSION="3.1.43"
+MIGRATION_VERSION=36
 MANAGED=("INDEX.md","scripts","skills","templates","workflows","assets","capabilities")
 MANAGED_FILES=("knowledge/INDEX.md",)
 FRESH_STATE_RELATIVE=Path("assets")/"fresh-state"/"v1"
@@ -27,7 +27,7 @@ BOOTSTRAP_START="<!-- agent-workflow-bootstrap:start -->"
 BOOTSTRAP_END="<!-- agent-workflow-bootstrap:end -->"
 BOOTSTRAP_BODY="""# Agent Bootstrap
 
-Before project work, read `.agent/INDEX.md`, `.agent/config.json`, `.agent/state/TASK.json`, and `.agent/policies/PROJECT_GUARDRAILS.md`. Load `.agent/skills/` only when routed. Before starting the first task, run `python3 .agent/scripts/agentctl.py bootstrap-check`. Without a provider decision adapter, local non-deploy fast/standard tasks may use explicitly recorded current-chat decisions. Projects may explicitly opt local, reversible and non-external release-mode implementation into the same boundary; test, production, deploy, irreversible and external-impact gates remain blocked. Requirements must be clarified before design or implementation; local runtimes must be bounded and cleaned with `.agent/scripts/agentctl.py`.
+Before project work, read `.agent/INDEX.md`, `.agent/config.json`, `.agent/state/TASK.json`, `.agent/state/CONTEXT.json`, and `.agent/policies/PROJECT_GUARDRAILS.md`. The guardrails are hash-bound (`project_initialization.guardrails_sha256`) and verified by bootstrap-check. Load `.agent/skills/` only when routed. Before starting the first task, run `python3 .agent/scripts/agentctl.py bootstrap-check`. Without a provider decision adapter, local non-deploy fast/standard tasks may use explicitly recorded current-chat decisions. Projects may explicitly opt local, reversible and non-external release-mode implementation into the same boundary; test, production, deploy, irreversible and external-impact gates remain blocked. Requirements must be clarified before design or implementation; local runtimes must be bounded and cleaned with `.agent/scripts/agentctl.py`.
 
 After every child-agent terminal event, after every compaction, and immediately before any final reply, run `python3 .agent/scripts/workflowctl.py route-resume`. Treat that receipt as the only root-task terminal decision: when `terminal=false`, do not present the root task as complete. Repository state preserves a deterministic resume contract, but only the host scheduler can start a later model turn.
 """
@@ -166,6 +166,22 @@ def tree_sha256(entries):
 def canonical_sha256(value):
     payload=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def version_triplet(value):
+    if not isinstance(value,str): return None
+    parts=value.split(".")
+    if len(parts)!=3 or any(not part.isdigit() for part in parts): return None
+    return tuple(int(part) for part in parts)
+
+
+def version_relation(installed,current):
+    """Three-way semantic comparison; unparseable versions keep legacy equality semantics."""
+    left,right=version_triplet(installed),version_triplet(current)
+    if left is None or right is None: return "same" if installed==current else "target_older"
+    if left>right: return "target_newer"
+    if left<right: return "target_older"
+    return "same"
 
 
 def repo_plugin_files(root):
@@ -1429,18 +1445,25 @@ def fresh_empty_platform_snapshot(raw):
     return data,hashlib.sha256(data).hexdigest()
 
 
-def migrate_private(source,destination,agent_platform_snapshot=None,project_root=None,allow_current_chat_local_release=False):
+def migrate_private(source,destination,agent_platform_snapshot=None,project_root=None,allow_current_chat_local_release=False,idle_reseed=True):
     prior_install=manifest(destination/".workflow-manifest.json",required=True)
     prior_migration=int(prior_install.get("migration_version",0))
     seed=fresh_state_seed(source)
     config_path=destination/"config.json"; task_path=destination/"state/TASK.json"
     config=json.loads(config_path.read_text(encoding="utf-8")); defaults=json.loads((seed/"config.json").read_text(encoding="utf-8"))
     control=config.setdefault("agent_control",{})
+    control_order=list(control)
     observer_names=("platform_observer","human_decision_observer","provider_preflight_observer")
     observer_presence={name for name in observer_names if name in control}
     observer_overrides={name:control.pop(name) for name in observer_names if name in control}
     deep_fill(config,defaults)
-    config["agent_control"].update(observer_overrides)
+    control=config["agent_control"]
+    for name in observer_names:
+        if name in observer_overrides: control[name]=observer_overrides[name]
+    # Re-inserting the preserved observers must not reorder project keys: a
+    # no-op migration leaves config.json byte-identical and the context
+    # capsule's policy-bundle binding intact.
+    config["agent_control"]={name:control[name] for name in (*control_order,*control) if name in control}
     for name,entry in list(config.get("environments",{}).items()):
         if "deploy" in entry:
             deploy=bool(entry.pop("deploy")); entry.setdefault("deploy_allowed",deploy); entry.setdefault("deploy_required",name=="production" and deploy)
@@ -1490,6 +1513,21 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
             entry=modes.setdefault(mode,{})
             if entry.get("token_budget")==previous_budgets[mode]:
                 entry["token_budget"]=new_budget
+    if prior_migration<36:
+        previous_budgets={"fast":12000,"standard":24000,"release":48000}
+        current_budgets={"fast":16000,"standard":48000,"release":96000}
+        modes=config.setdefault("routing",{}).setdefault("modes",{})
+        for mode,new_budget in current_budgets.items():
+            entry=modes.setdefault(mode,{})
+            if entry.get("token_budget")==previous_budgets[mode]:
+                entry["token_budget"]=new_budget
+        # Retire the deprecated transition-increment alias: deep_fill has
+        # already supplied the honest per-turn overhead and bootstrap floor
+        # from the seed, so the alias must not survive the migration.
+        config.setdefault("context",{}).pop("automatic_transition_token_increment",None)
+        control=config.setdefault("agent_control",{})
+        if control.get("child_system_tool_margin_tokens")==1000:
+            control["child_system_tool_margin_tokens"]=security_defaults["child_system_tool_margin_tokens"]
     if prior_migration<21:
         for mode in ("fast", "standard", "release"):
             config.setdefault("routing",{}).setdefault("modes",{}).setdefault(mode,{}).update({
@@ -1573,6 +1611,12 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
     if prior_migration<35:
         previous_budgets={"fast":6000,"standard":20000,"release":40000}
         current_budgets={"fast":12000,"standard":24000,"release":48000}
+        mode=str(task.get("mode","standard"))
+        if mode in previous_budgets and task.get("token_budget")==previous_budgets[mode]:
+            task["token_budget"]=current_budgets[mode]
+    if prior_migration<36:
+        previous_budgets={"fast":12000,"standard":24000,"release":48000}
+        current_budgets={"fast":16000,"standard":48000,"release":96000}
         mode=str(task.get("mode","standard"))
         if mode in previous_budgets and task.get("token_budget")==previous_budgets[mode]:
             task["token_budget"]=current_budgets[mode]
@@ -1702,7 +1746,7 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
         if task.get("status") not in {"idle",None}:
             raise RuntimeError("active task needs an explicit user-bound runtime baseline before workflow update")
         shutil.copy2(seed/"state/runtime.json",runtime_path)
-    if task.get("status")=="idle":
+    if task.get("status")=="idle" and (idle_reseed or prior_migration<MIGRATION_VERSION):
         shutil.copy2(seed/"state/CONTEXT.json",destination/"state/CONTEXT.json"); shutil.copy2(seed/"state/STAGE_INDEX.md",destination/"state/STAGE_INDEX.md")
         legacy=destination/"state/CONTEXT.md"
         if legacy.is_file(): legacy.unlink()
@@ -1817,6 +1861,16 @@ def execute(args,source_root,target):
         return 2
     wanted,plugin_wanted,wanted_entry,entry_digest=source_contract(source_root)
     installed=manifest(manifest_path,required=True)
+    if version_relation(installed.get("version"),VERSION)=="target_newer" or int(installed.get("migration_version",0))>MIGRATION_VERSION:
+        reason=(
+            f"installed workflow {installed.get('version')} (migration {installed.get('migration_version')}) "
+            f"is newer than template {VERSION} (migration {MIGRATION_VERSION})"
+        )
+        if args.check:
+            print(f"TARGET NEWER: {reason}; a newer template is required"); return 3
+        if not args.allow_downgrade:
+            print(f"UPDATE REFUSED: {reason}; a newer template is required (or pass --allow-downgrade to force a downgrade)"); return 2
+        print(f"WARNING: --allow-downgrade forces a downgrade: {reason}")
     writes,removes,conflicts=plan_agent_update(wanted,installed,destination)
     agents_write,agents_conflicts=plan_bootstrap(target/"AGENTS.md","AGENTS.md")
     claude_write,claude_conflicts=plan_bootstrap(target/"CLAUDE.md","CLAUDE.md")
@@ -1840,7 +1894,7 @@ def execute(args,source_root,target):
         copy_private_tree(destination,candidate)
         candidate_agents=stage_bootstrap(target,candidate_parent,"AGENTS.md")
         candidate_claude=stage_bootstrap(target,candidate_parent,"CLAUDE.md")
-        write_managed(source,candidate,writes,removes); migrate_private(source,candidate,args.agent_platform_snapshot,project_root=target,allow_current_chat_local_release=args.allow_current_chat_local_release)
+        write_managed(source,candidate,writes,removes); migrate_private(source,candidate,args.agent_platform_snapshot,project_root=target,allow_current_chat_local_release=args.allow_current_chat_local_release,idle_reseed=bool(writes or removes))
         atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,plugin_wanted,entry_digest,sha(candidate_agents),sha(candidate_claude)))
         validate_candidate(candidate,wanted,plugin_wanted,entry_digest,candidate_agents,candidate_claude)
         replacements=[(candidate,destination)]
@@ -1854,12 +1908,18 @@ def execute(args,source_root,target):
 
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument("target"); parser.add_argument("--project-name","--name",dest="project_name"); parser.add_argument("--project-type","--type",dest="project_type",default="software-project"); parser.add_argument("--agent-platform-snapshot"); parser.add_argument("--human-decision-adapter"); parser.add_argument("--provider-preflight-adapter"); parser.add_argument("--allow-current-chat-local-release",action="store_true"); parser.add_argument("--guardrails-file")
+    parser=argparse.ArgumentParser(); parser.add_argument("target"); parser.add_argument("--project-name","--name",dest="project_name"); parser.add_argument("--project-type","--type",dest="project_type",default="software-project"); parser.add_argument("--agent-platform-snapshot"); parser.add_argument("--human-decision-adapter"); parser.add_argument("--provider-preflight-adapter"); parser.add_argument("--allow-current-chat-local-release",action="store_true"); parser.add_argument("--allow-downgrade",action="store_true"); parser.add_argument("--guardrails-file")
     mode=parser.add_mutually_exclusive_group(); mode.add_argument("--check",action="store_true"); mode.add_argument("--update",action="store_true"); mode.add_argument("--adopt",action="store_true"); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
     if args.guardrails_file and (args.check or args.update or args.adopt):
         parser.error("--guardrails-file is valid only for a new install; installed projects use agentctl.py project-init")
+    if args.allow_downgrade and not args.update:
+        parser.error("--allow-downgrade is valid only with --update")
     source_root=Path(__file__).resolve().parent; target=Path(args.target).resolve()
-    target.parent.mkdir(parents=True,exist_ok=True)
+    if not args.check and not args.dry_run:
+        target.parent.mkdir(parents=True,exist_ok=True)
+    if not target.parent.is_dir():
+        # Read-only modes against a missing location hold no transaction to recover.
+        return execute(args,source_root,target)
     lock_descriptor=os.open(str(target.parent),os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
     try:
         fcntl.flock(lock_descriptor,fcntl.LOCK_EX)

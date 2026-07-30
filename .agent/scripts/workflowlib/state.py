@@ -20,11 +20,12 @@ RELEASE_RISKS = set(RISK_NAMES) - {"uncertain"}
 
 def required_mode(environment: str, files: int, risk_flags: Dict[str, object],
                   task_type: str, complexity: str) -> str:
+    risks = risk_flags if isinstance(risk_flags, dict) else {}
     if task_type == "release" or environment == "production" or any(
-        risk_flags.get(name) is True for name in RELEASE_RISKS
+        risks.get(name) is True for name in RELEASE_RISKS
     ):
         return "release"
-    if complexity == "complex" or environment == "test" or risk_flags.get("uncertain") is True or files > 2:
+    if complexity == "complex" or environment == "test" or risks.get("uncertain") is True or files > 2:
         return "standard"
     return "fast"
 
@@ -33,7 +34,8 @@ def monotonic_risks(current: Dict[str, object], additions: Iterable[str]) -> Dic
     unknown = sorted(set(additions) - set(RISK_NAMES))
     if unknown:
         raise ValueError(f"unknown risk flags: {unknown}")
-    result = {name: current.get(name) is True for name in RISK_NAMES}
+    base = current if isinstance(current, dict) else {}
+    result = {name: base.get(name) is True for name in RISK_NAMES}
     for name in additions:
         result[name] = True
     return result

@@ -18,7 +18,7 @@ Humans own direction, boundaries, trade-offs, release and knowledge promotion. A
 | Acceptance checklist | `workflows/QUALITY_GATES.md`, node artifacts and mode-specific evidence |
 | Human | requirement; standard/release solution and final acceptance; production and knowledge-promotion decisions with `user:` sources |
 | Installation boundary | immutable `.agent/assets/fresh-state/v1` defaults plus project-owned private state initialized transactionally |
-| Policy identity | context `policy_bundle_sha256` over config, index, workflows, template manifest and active Skill |
+| Policy identity | context `policy_bundle_sha256` (`policy-bundle/v2`) over config, index, template manifest, workflows, the primary Skill with its `scripts/**` and `references/**`, `.agent/scripts/**.py` and `policies/PROJECT_GUARDRAILS.md` (also bound by `project_initialization.guardrails_sha256`) |
 | Product identity | `testrun.py` candidate fingerprint over configured scope plus discovered product-owned manifests/source |
 
 ## Control-plane boundaries

@@ -28,7 +28,8 @@ from workflowlib import budget as unified_budget
 import humandecision
 import testrun as supervised_test
 STATE = AGENT / "state/agents.json"; CONFIG = AGENT / "config.json"; TASK = AGENT / "state/TASK.json"
-LOCK = AGENT / "state/.agents.lock"; ACTIVE = "active"; TERMINAL = {"completed", "interrupted", "errored", "expired"}
+LOCK = AGENT / "state/.agents.lock"; ACTIVE = "active"; TERMINAL = {"completed", "interrupted", "errored", "expired", "lost"}
+CHAIN_JOURNAL = AGENT / "state/agents-chain.jsonl"
 SHA = re.compile(r"[0-9a-f]{64}")
 SCHEMA = "agent-team/v9"
 TOKEN_ACCOUNTING_SCHEMA = "agent-child-token-accounting/v1"
@@ -53,6 +54,8 @@ RUN_ID = re.compile(r"[0-9a-f]{32}")
 TIMESTAMP_SKEW_SECONDS = 5
 WATCHDOG_MAX_DELAY_SECONDS = 60
 PREPARED_DISPATCH_TTL_SECONDS = 300
+LOST_OBSERVATION_THRESHOLD = 3
+LEDGER_FORCE_ARCHIVE_SCHEMA = "agent-ledger-force-archive/v1"
 CANONICAL_ROLE_TYPES = (
     "worker", "researcher", "documentation-worker", "implementer",
     "reviewer", "adversarial", "cross", "integrator",
@@ -104,17 +107,48 @@ def load(path: Path) -> Dict[str, object]:
     return value
 
 
+def ledger_bytes(value: Dict[str, object]) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def chain_upgrade(value: Dict[str, object], previous: Optional[bytes]) -> None:
+    """Advance the append hash chain; a legacy ledger restarts at genesis once."""
+    revision = value.get("revision")
+    if revision is None:
+        value["revision"] = 1
+        value["prev_sha256"] = None
+        return
+    if not isinstance(revision, int) or revision < 1:
+        raise SystemExit("agent ledger chain revision is invalid")
+    if previous is None:
+        raise SystemExit("agent ledger chain continuity is lost: state file is missing")
+    value["revision"] = revision + 1
+    value["prev_sha256"] = hashlib.sha256(previous).hexdigest()
+
+
+def chain_journal_append(value: Dict[str, object], data: bytes) -> None:
+    entry = {
+        "revision": value["revision"], "prev_sha256": value["prev_sha256"],
+        "file_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    with CHAIN_JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush(); os.fsync(handle.fileno())
+
+
 def save(value: Dict[str, object]) -> None:
+    chain_upgrade(value, STATE.read_bytes() if STATE.is_file() else None)
+    data = ledger_bytes(value)
     descriptor, raw = tempfile.mkstemp(prefix=".agents.", dir=str(STATE.parent))
     temporary = Path(raw)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data); handle.flush(); os.fsync(handle.fileno())
         os.replace(temporary, STATE)
     finally:
         if temporary.exists():
             temporary.unlink()
+    chain_journal_append(value, data)
 
 
 def commit_registered_ledger(state: Dict[str, object]) -> None:
@@ -135,12 +169,14 @@ def commit_registered_ledger(state: Dict[str, object]) -> None:
     try: after["budget_state"] = unified_budget.snapshot(after, load(CONFIG), state)["state"]
     except ValueError as error: raise SystemExit(str(error))
     after["updated"] = now().date().isoformat()
-    data = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode()
+    chain_upgrade(state, STATE.read_bytes() if STATE.is_file() else None)
+    data = ledger_bytes(state)
     contexttx.transition_task(
         before, after, mutator="agentledger", operation="register",
         reason="agent-registered", summary="automatically accounted a registered child Agent",
         side_effects=[(STATE, data)],
     )
+    chain_journal_append(state, data)
 
 
 def active(state: Dict[str, object]) -> List[Dict[str, object]]:
@@ -374,7 +410,7 @@ def require_payload_token_budget(state: Dict[str, object], estimated_tokens: int
     except ValueError as error:
         raise SystemExit(str(error))
     snapshot = token_budget_snapshot(state)
-    requested = estimated_tokens + fork_turns * integer(policy().get("inherited_turn_estimated_tokens"), 800) + integer(policy().get("child_system_tool_margin_tokens"), 1000) + integer(policy().get("child_output_margin_tokens"), 2000)
+    requested = estimated_tokens + fork_turns * integer(policy().get("inherited_turn_estimated_tokens"), 800) + integer(policy().get("child_system_tool_margin_tokens"), 4000) + integer(policy().get("child_output_margin_tokens"), 2000)
     if estimated_tokens < 1 or int(total["over_budget_tokens"]) > 0:
         raise SystemExit(
             "task payload exceeds the current mode remaining token budget: "
@@ -458,6 +494,31 @@ def token_charge_from_receipt(record: object) -> Optional[Dict[str, object]]:
     except (TypeError, ValueError):
         return None
     return value
+
+
+def release_token_reservation(state: Dict[str, object], item: Dict[str, object],
+                              closed_at: str) -> None:
+    """Release the prepare-time reservation of a lost child (mirrors cancel-prepare)."""
+    matches = [
+        preparation for preparation in state.get("prepared_dispatches", [])
+        if isinstance(preparation, dict) and preparation.get("id") == item.get("id")
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("token_reservation"), dict):
+        raise SystemExit("lost Agent lacks its unique token reservation")
+    reservation = matches[0]["token_reservation"]
+    if reservation.get("id") != item.get("token_reservation_id"):
+        raise SystemExit("member token reservation differs from preparation")
+    if reservation.get("status") == "released":
+        if reservation.get("closed_at") != closed_at or reservation.get("charge_receipt") is not None:
+            raise SystemExit("released child token reservation differs from the lost settlement")
+        return
+    if reservation.get("status") != "reserved":
+        raise SystemExit("only a reserved child token reservation can be released")
+    reservation.update({"status": "released", "closed_at": closed_at, "charge_receipt": None})
+
+
+def lost_decision_binding(state: Dict[str, object], agent_id: str) -> str:
+    return hashlib.sha256(f"agent-lost|{state.get('epoch')}|{agent_id}".encode()).hexdigest()
 
 
 def require_sha(value: str, label: str = "progress hash") -> None:
@@ -1894,6 +1955,103 @@ def read_terminal_marker(state: Dict[str, object], item: Dict[str, object]) -> O
     return value
 
 
+def orphan_terminal_marker_errors(state: Dict[str, object]) -> List[str]:
+    """Reverse marker check: every current-epoch marker needs its member record."""
+    directory = AGENT / "state/evidence/agent-terminal-markers" / str(state.get("epoch"))
+    if not directory.exists():
+        return []
+    if directory.is_symlink() or not directory.is_dir():
+        return ["terminal marker epoch path is not a real directory"]
+    member_ids = {
+        str(item.get("id")) for item in state.get("members", []) if isinstance(item, dict)
+    }
+    errors = []
+    for marker in sorted(directory.iterdir()):
+        if marker.is_symlink() or not marker.is_file() or marker.suffix != ".json":
+            errors.append(f"terminal marker entry is not a regular marker file: {marker.name}")
+            continue
+        identity = marker.stem
+        matched = [
+            agent_id for agent_id in member_ids
+            if hashlib.sha256(agent_id.encode()).hexdigest() == identity
+        ]
+        if SHA.fullmatch(identity) is None or len(matched) != 1:
+            errors.append(f"orphan terminal marker lacks its ledger member: {marker.name}")
+    return errors
+
+
+def ledger_chain_errors(state: Dict[str, object]) -> List[str]:
+    """Verify the append hash chain back to the current epoch genesis.
+
+    A legacy ledger without chain fields is accepted once; the next save
+    upgrades it to revision 1.  Once upgraded, any break fails closed.
+    """
+    revision = state.get("revision")
+    if revision is None:
+        return []
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        return ["agent ledger chain revision is invalid"]
+    previous = state.get("prev_sha256")
+    if revision == 1:
+        if previous is not None:
+            return ["agent ledger chain genesis must not reference a predecessor"]
+    elif not isinstance(previous, str) or SHA.fullmatch(previous) is None:
+        return ["agent ledger chain predecessor hash is invalid"]
+    try:
+        lines = CHAIN_JOURNAL.read_text(encoding="utf-8").splitlines() if CHAIN_JOURNAL.is_file() else []
+    except OSError:
+        lines = []
+    entries: List[object] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            return ["agent ledger chain journal is unreadable"]
+    if not entries:
+        return ["agent ledger chain journal is missing for an upgraded ledger"]
+    tip = entries[-1]
+    canonical = hashlib.sha256(ledger_bytes(state)).hexdigest()
+    if (
+        not isinstance(tip, dict)
+        or tip.get("revision") != revision
+        or tip.get("prev_sha256") != previous
+        or tip.get("file_sha256") != canonical
+    ):
+        return [
+            "agent ledger content differs from its append chain tip; "
+            "restore the ledger or re-initialize with init --archive-existing"
+        ]
+    index = len(entries) - 1
+    while True:
+        entry = entries[index]
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"revision", "prev_sha256", "file_sha256"}
+            or not isinstance(entry.get("revision"), int)
+            or entry["revision"] < 1
+            or (
+                SHA.fullmatch(str(entry.get("file_sha256") or "")) is None
+            )
+        ):
+            return ["agent ledger chain journal entry is invalid"]
+        if entry["revision"] == 1:
+            if entry.get("prev_sha256") is not None:
+                return ["agent ledger chain genesis must not reference a predecessor"]
+            return []
+        if index == 0:
+            return ["agent ledger chain does not reach the epoch genesis"]
+        prior = entries[index - 1]
+        if (
+            not isinstance(prior, dict)
+            or entry.get("prev_sha256") != prior.get("file_sha256")
+            or entry.get("revision") != (prior.get("revision") if isinstance(prior.get("revision"), int) else -1) + 1
+        ):
+            return ["agent ledger append hash chain is broken"]
+        index -= 1
+
+
 def command_init(args: argparse.Namespace) -> int:
     if not args.platform_snapshot:
         raise SystemExit("initialization requires a fresh platform snapshot")
@@ -1901,27 +2059,74 @@ def command_init(args: argparse.Namespace) -> int:
     if active_platform_ids(platform):
         raise SystemExit("cannot initialize while platform reports active child agents")
     migration_source = None
+    if args.force and not args.archive_existing:
+        raise SystemExit("--force only applies to init --archive-existing")
+    if not args.force and (args.force_reason or args.source or args.receipt):
+        raise SystemExit("--force-reason/--source/--receipt require --force")
     if STATE.is_file():
         existing = load(STATE)
-        if active(existing) and not args.archive_existing:
+        non_terminal = [
+            item for item in existing.get("members", [])
+            if isinstance(item, dict) and item.get("status") not in TERMINAL
+        ]
+        if non_terminal and not args.archive_existing:
             raise SystemExit("cannot initialize over active ledger members without an explicit audited migration")
+        if non_terminal and not args.force:
+            raise SystemExit(
+                "cannot archive-reset a ledger with non-terminal members; close every child first, "
+                "or pass --force --force-reason <why> --source user:<message> to bind a human decision "
+                "(gate ledger-force-reset)"
+            )
         if args.archive_existing:
             data = STATE.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
+            payload = data
+            if args.force:
+                if not args.force_reason or not args.force_reason.strip():
+                    raise SystemExit("forced ledger reset requires an explicit --force-reason")
+                if not args.source:
+                    raise SystemExit("forced ledger reset requires --source user:<message> or a provider receipt")
+                approval = humandecision.record_decision_approval(
+                    ROOT, load(CONFIG), load(TASK), gate="ledger-force-reset",
+                    artifact_sha256=digest, source=args.source, receipt=args.receipt,
+                )
+                envelope = {
+                    "schema": LEDGER_FORCE_ARCHIVE_SCHEMA, "archived_at": iso(now()),
+                    "force_reason": args.force_reason.strip(),
+                    "ledger_sha256": digest, "ledger_bytes": len(data),
+                    "decision": {
+                        "gate": "ledger-force-reset", "artifact_sha256": digest,
+                        "source": args.source, "approval": approval,
+                    },
+                    "ledger": json.loads(data.decode("utf-8")),
+                }
+                payload = (json.dumps(envelope, ensure_ascii=False, indent=2) + "\n").encode()
             archive = AGENT / "state" / "evidence" / f"agent-ledger-archive-{digest[:16]}.json"
             archive.parent.mkdir(parents=True, exist_ok=True)
-            if archive.exists() and archive.read_bytes() != data:
-                raise SystemExit("ledger migration archive path collision")
+            if archive.exists():
+                if not args.force and archive.read_bytes() != data:
+                    raise SystemExit("ledger migration archive path collision")
+                if args.force:
+                    try:
+                        prior = load(archive)
+                    except SystemExit:
+                        raise SystemExit("ledger migration archive path collision")
+                    if prior.get("schema") != LEDGER_FORCE_ARCHIVE_SCHEMA or prior.get("ledger_sha256") != digest:
+                        raise SystemExit("ledger migration archive path collision")
             if not archive.exists():
                 descriptor, raw = tempfile.mkstemp(prefix=".agent-ledger-archive.", dir=str(archive.parent))
                 temporary = Path(raw)
                 try:
                     with os.fdopen(descriptor, "wb") as handle:
-                        handle.write(data); handle.flush(); os.fsync(handle.fileno())
+                        handle.write(payload); handle.flush(); os.fsync(handle.fileno())
                     os.replace(temporary, archive)
                 finally:
                     if temporary.exists(): temporary.unlink()
-            migration_source = {"path": str(archive.relative_to(ROOT)), "sha256": digest, "bytes": len(data)}
+            final = archive.read_bytes()
+            migration_source = {
+                "path": str(archive.relative_to(ROOT)),
+                "sha256": hashlib.sha256(final).hexdigest(), "bytes": len(final),
+            }
     config = policy()
     if config.get("allowed_role_types") != list(CANONICAL_ROLE_TYPES):
         raise SystemExit("agent role policy must equal the canonical role types")
@@ -2941,13 +3146,46 @@ def command_heartbeat(args: argparse.Namespace) -> int:
     state["updated_at"] = iso(observed); save(state); print(f"EVIDENCE HEARTBEAT: {args.id}"); return 0
 
 
+def note_platform_presence(state: Dict[str, object], platform: Dict[str, Dict[str, object]],
+                           snapshot_record: Dict[str, object]) -> List[str]:
+    """Update per-member missing-observation counters from one fresh snapshot.
+
+    Presence with any platform status resets the counter; full absence counts
+    one consecutive missing observation per distinct snapshot.
+    """
+    snapshot_sha = str(snapshot_record.get("sha256"))
+    lost_candidates = []
+    for item in active(state):
+        agent_id = str(item["id"])
+        if agent_id in platform:
+            item["missing_observations"] = 0
+            item["missing_snapshot_sha256"] = None
+            continue
+        if item.get("missing_snapshot_sha256") != snapshot_sha:
+            item["missing_observations"] = integer(item.get("missing_observations"), 0) + 1
+            item["missing_snapshot_sha256"] = snapshot_sha
+        if integer(item.get("missing_observations"), 0) >= LOST_OBSERVATION_THRESHOLD:
+            lost_candidates.append(agent_id)
+    return sorted(lost_candidates)
+
+
 def command_check(args: argparse.Namespace) -> int:
     if not args.platform_snapshot:
         raise SystemExit("check requires a fresh platform snapshot")
     state = load(STATE); snapshot_value, snapshot_record, platform = platform_snapshot(args.platform_snapshot)
     registry = {str(item["id"]) for item in active(state)}; observed = active_platform_ids(platform)
+    lost_candidates = note_platform_presence(state, platform, snapshot_record)
     if observed != registry:
-        print(f"PLATFORM MISMATCH: registry={sorted(registry)} platform={sorted(observed)}"); return 4
+        state["last_platform_snapshot"] = snapshot_record
+        state["updated_at"] = iso(now()); save(state)
+        print(f"PLATFORM MISMATCH: registry={sorted(registry)} platform={sorted(observed)}")
+        for agent_id in lost_candidates:
+            print(
+                f"LOST EXIT AVAILABLE: {agent_id} "
+                f"(finish --id {agent_id} --status lost --lost --conclusion <bounded-loss-summary> "
+                "--platform-snapshot <fresh-agent-platform-snapshot-v3.json>)"
+            )
+        return 4
     observed_at = parse(snapshot_value["observed_at"]); current = now(); action = 0
     interval = int(state["status_interval_seconds"])
     maximum_gap = interval + int(state["monitor_grace_seconds"])
@@ -3018,6 +3256,8 @@ def command_check(args: argparse.Namespace) -> int:
 
 
 def command_finish(args: argparse.Namespace) -> int:
+    if not args.lost and (args.source or args.receipt):
+        raise SystemExit("--source/--receipt require finish --lost")
     state = load(STATE); item = member(state, args.id)
     if item.get("status") in TERMINAL:
         requested = sorted(
@@ -3040,6 +3280,67 @@ def command_finish(args: argparse.Namespace) -> int:
             print(f"AGENT ALREADY FINISHED: {args.id} {args.status}")
             return 0
         raise SystemExit("terminal Agent cannot be rewritten with a different finish contract")
+    if args.lost or args.status == "lost":
+        if not args.lost or args.status != "lost":
+            raise SystemExit("lost status requires finish --lost with --status lost")
+        if not args.platform_snapshot:
+            raise SystemExit("finish --lost requires a fresh platform snapshot proving absence")
+        if item["status"] != ACTIVE:
+            raise SystemExit("finish requires active agent")
+        snapshot_value, snapshot_record, platform = platform_snapshot(args.platform_snapshot)
+        if args.id in platform:
+            raise SystemExit("finish --lost requires the Agent to be absent from the fresh platform snapshot")
+        terminal_observed = parse(snapshot_value["observed_at"])
+        approval = None
+        if integer(item.get("missing_observations"), 0) < LOST_OBSERVATION_THRESHOLD:
+            if not args.source:
+                raise SystemExit(
+                    f"finish --lost requires {LOST_OBSERVATION_THRESHOLD} consecutive missing platform observations "
+                    "or --source user:<message> to bind a human decision (gate agent-lost)"
+                )
+            approval = humandecision.record_decision_approval(
+                ROOT, load(CONFIG), load(TASK), gate="agent-lost",
+                artifact_sha256=lost_decision_binding(state, args.id),
+                source=args.source, receipt=args.receipt,
+            )
+        conclusion = args.conclusion.strip()
+        if not conclusion or len(conclusion) > 4000:
+            raise SystemExit("finish conclusion must be non-empty and bounded")
+        records = sorted(
+            [immutable_result_evidence(raw) for raw in (args.evidence or [])],
+            key=lambda record: str(record["source_path"]),
+        )
+        if len({str(record["source_path"]) for record in records}) != len(records):
+            raise SystemExit("finish evidence paths must be unique")
+        allowed = set(item.get("allowed_evidence_paths", []))
+        if any(record.get("source_path") not in allowed for record in records):
+            raise SystemExit("finish evidence is outside the per-dispatch envelope allowlist")
+        prior_observed = parse(item["registration_observed_at"])
+        monitors = item.get("monitor_platform_evidence", [])
+        if isinstance(monitors, list) and monitors:
+            latest_monitor = receipt_observed_at(monitors[-1])
+            if latest_monitor is not None:
+                prior_observed = latest_monitor
+        maximum_gap = int(state["status_interval_seconds"]) + int(state["monitor_grace_seconds"])
+        if (terminal_observed - prior_observed).total_seconds() > maximum_gap:
+            item["monitoring_violation_at"] = item.get("monitoring_violation_at") or iso(terminal_observed)
+        finished_at = iso(terminal_observed)
+        if item.get("role_type") == "integrator":
+            abort_pending_replays_for_terminal(state, str(item["id"]), finished_at)
+        release_token_reservation(state, item, finished_at)
+        publish_terminal_marker(
+            state, item, "lost", snapshot_record, finished_at, finished_at,
+            conclusion, records, None, None,
+            int(item["platform_cursor"]), item.get("last_platform_message_sha256"),
+        )
+        item.update({"status": "lost", "finished_at": finished_at, "conclusion": conclusion,
+                     "progress_observed": False,
+                     "terminal_platform_evidence": snapshot_record,
+                     "terminal_observed_at": finished_at, "result_evidence": records,
+                     "review_verdict": None, "review_attestation": None,
+                     "lost_decision": approval})
+        state["last_platform_snapshot"] = snapshot_record; state["platform_empty_verified"] = False
+        state["updated_at"] = iso(now()); save(state); print(f"AGENT FINISHED: {args.id} lost"); return 0
     if not args.platform_snapshot:
         raise SystemExit("finish requires platform terminal evidence")
     if item["status"] != ACTIVE:
@@ -3461,6 +3762,7 @@ def command_validate(args: argparse.Namespace) -> int:
         errors.append(str(error))
     if state.get("schema") != SCHEMA: errors.append("invalid schema")
     if state.get("task_payload_schema") != TASK_PAYLOAD_SCHEMA: errors.append("invalid reusable task payload schema policy")
+    errors.extend(ledger_chain_errors(state))
     try:
         if state.get("task_payload_limits") != task_payload_limits():
             errors.append("ledger task payload limits differ from config")
@@ -3581,6 +3883,19 @@ def command_validate(args: argparse.Namespace) -> int:
             if timestamp is not None:
                 try: parse(timestamp)
                 except (TypeError, ValueError): errors.append(f"prepared dispatch {label} time is invalid: {preparation.get('id')}")
+        if consumed is None and cancelled is None:
+            try:
+                expiry = min(
+                    parse(preparation.get("deadline_at")),
+                    parse(preparation.get("prepared_at")) + dt.timedelta(seconds=PREPARED_DISPATCH_TTL_SECONDS),
+                )
+                if now() >= expiry:
+                    errors.append(
+                        f"prepared dispatch expired: {preparation.get('id')}; "
+                        f"release it before revalidation: agentledger.py cancel-prepare --id {preparation.get('id')}"
+                    )
+            except (TypeError, ValueError):
+                pass  # timestamp shape errors are already reported above
         reservation_required = {
             "id", "estimated_tokens", "status", "reserved_at", "closed_at", "charge_receipt",
         }
@@ -3604,8 +3919,15 @@ def command_validate(args: argparse.Namespace) -> int:
                 if reservation.get("closed_at") is not None or reservation.get("charge_receipt") is not None or cancelled is not None:
                     errors.append(f"open token reservation has terminal data: {preparation.get('id')}")
             elif reservation.get("status") == "released":
-                if reservation.get("closed_at") != cancelled or consumed is not None or reservation.get("charge_receipt") is not None:
-                    errors.append(f"released token reservation is not a cancelled preparation: {preparation.get('id')}")
+                lost_settlement = consumed is not None and any(
+                    isinstance(entry, dict) and entry.get("id") == preparation.get("id")
+                    and entry.get("status") == "lost"
+                    and entry.get("terminal_observed_at") == reservation.get("closed_at")
+                    for entry in state.get("members", [])
+                )
+                cancelled_release = consumed is None and reservation.get("closed_at") == cancelled
+                if reservation.get("charge_receipt") is not None or not (cancelled_release or lost_settlement):
+                    errors.append(f"released token reservation is not a cancel or lost settlement: {preparation.get('id')}")
             else:
                 charge = token_charge_from_receipt(reservation.get("charge_receipt"))
                 if (
@@ -3681,13 +4003,21 @@ def command_validate(args: argparse.Namespace) -> int:
             if item.get("status") == ACTIVE and reservation.get("status") != "reserved":
                 errors.append(f"active Agent token reservation is not open: {item.get('id')}")
             if item.get("status") in TERMINAL:
-                charge = token_charge_from_receipt(reservation.get("charge_receipt"))
-                if (
-                    reservation.get("status") != "settled" or charge is None
-                    or charge.get("terminal_status") != item.get("status")
-                    or charge.get("terminal_observed_at") != item.get("terminal_observed_at")
-                ):
-                    errors.append(f"terminal Agent token charge is not settled: {item.get('id')}")
+                if item.get("status") == "lost":
+                    if (
+                        reservation.get("status") != "released"
+                        or reservation.get("charge_receipt") is not None
+                        or reservation.get("closed_at") != item.get("terminal_observed_at")
+                    ):
+                        errors.append(f"lost Agent token reservation is not released: {item.get('id')}")
+                else:
+                    charge = token_charge_from_receipt(reservation.get("charge_receipt"))
+                    if (
+                        reservation.get("status") != "settled" or charge is None
+                        or charge.get("terminal_status") != item.get("status")
+                        or charge.get("terminal_observed_at") != item.get("terminal_observed_at")
+                    ):
+                        errors.append(f"terminal Agent token charge is not settled: {item.get('id')}")
         if item.get("model") != config.get("default_model"): errors.append(f"member model differs from configured default: {item.get('id')}")
         if integer(item.get("fork_turns"), -1) < 0 or integer(item.get("fork_turns"), -1) > integer(config.get("max_fork_turns"), -1): errors.append(f"member fork window is outside configured bounds: {item.get('id')}")
         if item.get("context_strategy") != config.get("context_strategy"): errors.append(f"member context strategy differs from config: {item.get('id')}")
@@ -3865,8 +4195,32 @@ def command_validate(args: argparse.Namespace) -> int:
             else:
                 try: parse(item.get("finished_at"))
                 except (ValueError, TypeError): errors.append(f"terminal finish timestamp is invalid: {item.get('id')}")
+        if item.get("status") == "lost":
+            decision = item.get("lost_decision")
+            if integer(item.get("missing_observations"), 0) < LOST_OBSERVATION_THRESHOLD:
+                try:
+                    decision_valid = isinstance(decision, dict) and humandecision.decision_approval_valid(
+                        ROOT, load(CONFIG), load(TASK), gate="agent-lost",
+                        artifact_sha256=lost_decision_binding(state, str(item.get("id"))),
+                        source=str(decision.get("source", "")), record=decision,
+                    )
+                except SystemExit:
+                    decision_valid = False
+                if not decision_valid:
+                    errors.append(f"lost Agent lacks its missing-observation proof or human decision: {item.get('id')}")
+            elif decision is not None and not isinstance(decision, dict):
+                errors.append(f"lost Agent decision record is invalid: {item.get('id')}")
         if item.get("status") in TERMINAL and not content_addressed_receipt(item.get("terminal_platform_evidence"), "platform-snapshots", ".json"):
             errors.append(f"terminal status lacks platform evidence: {item.get('id')}")
+        elif item.get("status") == "lost":
+            lost_snapshot = receipt_platform_snapshot(item.get("terminal_platform_evidence"))
+            if (
+                lost_snapshot is None
+                or receipt_platform_member(item.get("terminal_platform_evidence"), str(item.get("id"))) is not None
+            ):
+                errors.append(f"lost Agent terminal evidence does not prove platform absence: {item.get('id')}")
+            elif item.get("terminal_observed_at") != iso(parse(lost_snapshot.get("observed_at"))):
+                errors.append(f"terminal observation timestamp differs from receipt: {item.get('id')}")
         elif item.get("status") in TERMINAL:
             terminal_snapshot = receipt_platform_snapshot(item.get("terminal_platform_evidence"))
             terminal = receipt_platform_member(item.get("terminal_platform_evidence"), str(item.get("id")))
@@ -3896,6 +4250,7 @@ def command_validate(args: argparse.Namespace) -> int:
             errors.append(f"active Agent has terminal observation time: {item.get('id')}")
     errors.extend(formal_review_chain_errors(state))
     errors.extend(replay_run_registry_errors(state))
+    errors.extend(orphan_terminal_marker_errors(state))
     member_map = {str(item.get("id")): item for item in state.get("members", []) if isinstance(item, dict)}
     for item in member_map.values():
         try:
@@ -4065,6 +4420,18 @@ def command_watchdog_plan(args: argparse.Namespace) -> int:
     )
     for item in active_members:
         agent_id = str(item.get("id"))
+        missing = integer(item.get("missing_observations"), 0)
+        if missing >= LOST_OBSERVATION_THRESHOLD:
+            actions.append({
+                "action": "finish-lost", "id": agent_id,
+                "reason": "missing-platform-observations", "missing_observations": missing,
+                "command": (
+                    f"agentledger.py finish --id {agent_id} --status lost --lost "
+                    "--conclusion <bounded-loss-summary> "
+                    "--platform-snapshot <fresh-agent-platform-snapshot-v3.json>"
+                ),
+            })
+            continue
         try:
             latest_observed = parse(item.get("registration_observed_at"))
             monitors = item.get("monitor_platform_evidence", [])
@@ -4154,6 +4521,7 @@ def command_watchdog_plan(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(); sub = value.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--platform-snapshot"); init.add_argument("--archive-existing", action="store_true")
+    init.add_argument("--force", action="store_true"); init.add_argument("--force-reason"); init.add_argument("--source"); init.add_argument("--receipt")
     seal = sub.add_parser("seal-payload"); seal.add_argument("--draft", required=True); seal.add_argument("--output", required=True)
     prepare = sub.add_parser("prepare"); prepare.add_argument("--id", required=True); prepare.add_argument("--root-task-id"); prepare.add_argument("--role-type", choices=CANONICAL_ROLE_TYPES, required=True); prepare.add_argument("--model", required=True); prepare.add_argument("--fork-turns", type=int, required=True); prepare.add_argument("--redispatch-count", type=int, default=0); prepare.add_argument("--task-payload", required=True); prepare.add_argument("--handoff-envelope", required=True)
     cancel = sub.add_parser("cancel-prepare"); cancel.add_argument("--id", required=True)
@@ -4165,6 +4533,7 @@ def parser() -> argparse.ArgumentParser:
     replay_reconcile = sub.add_parser("replay-reconcile-terminal"); replay_reconcile.add_argument("--integrator-id", required=True)
     check = sub.add_parser("check"); check.add_argument("--platform-snapshot")
     finish = sub.add_parser("finish"); finish.add_argument("--id", required=True); finish.add_argument("--status", choices=tuple(sorted(TERMINAL)), required=True); finish.add_argument("--conclusion", required=True); finish.add_argument("--evidence", action="append"); finish.add_argument("--platform-snapshot")
+    finish.add_argument("--lost", action="store_true"); finish.add_argument("--source"); finish.add_argument("--receipt")
     redispatch = sub.add_parser("redispatch"); redispatch.add_argument("--from-id", required=True); redispatch.add_argument("--to-id", required=True); redispatch.add_argument("--handoff-envelope", required=True); redispatch.add_argument("--deadline-minutes", type=int, required=True); redispatch.add_argument("--platform-snapshot")
     validate = sub.add_parser("validate"); validate.add_argument("--require-empty", action="store_true"); validate.add_argument("--platform-snapshot")
     sub.add_parser("watchdog-plan")

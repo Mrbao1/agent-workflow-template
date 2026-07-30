@@ -39,8 +39,13 @@ LIST_FIELDS = ("confirmed_facts", "decisions", "open_questions", "changed_files"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 UNAPPROVED_CONTRACT_BINDING = "unapproved-draft"
 
-# This snapshot intentionally binds every field that can change scope, routing,
-# evidence, gates, rollback behavior, resource budgets or completion semantics.
+# This snapshot binds the enumerated canonical TASK fields: scope, routing,
+# evidence, gates, rollback behavior, resource budgets and completion
+# semantics.  "projection" is bound only when the field is present on TASK, so
+# capsules sealed before the field existed keep their historical digests.
+# Top-level fields outside this list are NOT integrity-bound: a canonical
+# transition commits them wholesale and records their changed field names in
+# the transition authorization receipt for audit (see authorization_receipt).
 TASK_INVARIANT_KEYS = (
     "schema",
     "title",
@@ -87,6 +92,7 @@ TASK_INVARIANT_KEYS = (
     "failure_archive",
     "mode_status",
     "decision_policy_version",
+    "projection",
     "task_archive",
     "metrics",
     "retrospective",
@@ -123,6 +129,7 @@ TRANSITION_PROFILES = {
     },
     ("agentctl", "escalate-mode"): {
         "mode", "risk_flags", "files", "token_budget", "decision_policy_version",
+        "projection", "requirement_source",
         "selected_templates", "selected_capabilities", "template_route",
         "rendered_artifacts", "current_node", "accepted_nodes", "node_artifacts",
         "gate_approvals", "pending_gate_artifacts", "status", "phase",
@@ -206,7 +213,10 @@ def governed_contract_binding(task: Dict[str, object]) -> str:
 
 
 def task_invariant(task: Dict[str, object]) -> Dict[str, object]:
-    return {key: copy.deepcopy(task.get(key)) for key in TASK_INVARIANT_KEYS}
+    snapshot = {key: copy.deepcopy(task.get(key)) for key in TASK_INVARIANT_KEYS if key != "projection"}
+    if "projection" in task:
+        snapshot["projection"] = copy.deepcopy(task.get("projection"))
+    return snapshot
 
 
 def object_sha256(value: object) -> str:
@@ -214,19 +224,42 @@ def object_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def policy_bundle_sha256(task: Dict[str, object]) -> str:
-    """Bind the active checkpoint to config, index, workflow and Skill rules."""
+POLICY_BUNDLE_VERSION = "policy-bundle/v2"
+LEGACY_POLICY_BUNDLE_VERSION = "policy-bundle/v1"
+
+
+def policy_bundle_sha256(task: Dict[str, object], version: str = POLICY_BUNDLE_VERSION) -> str:
+    """Bind the active checkpoint to config, index, workflow and Skill rules.
+
+    policy-bundle/v2 additionally binds the enforcement code
+    (`.agent/scripts/**.py`, the primary skill's `scripts/**` and
+    `references/**`) and `policies/PROJECT_GUARDRAILS.md`, so editing a script
+    or the guardrails is policy drift, not a silent change.  Missing or
+    symlinked bundle files fail closed in every version.
+    """
+    if version not in {POLICY_BUNDLE_VERSION, LEGACY_POLICY_BUNDLE_VERSION}:
+        raise SystemExit(f"unknown policy bundle version: {version}")
     paths = [CONFIG_PATH, AGENT_DIR / "INDEX.md", AGENT_DIR / "templates/manifest.json"]
     primary = str(task.get("primary_skill", ""))
     if primary:
         paths.append(AGENT_DIR / "skills" / primary / "SKILL.md")
     paths.extend(sorted((AGENT_DIR / "workflows").glob("*.md")))
+    if version == POLICY_BUNDLE_VERSION:
+        paths.append(AGENT_DIR / "policies" / "PROJECT_GUARDRAILS.md")
+        paths.extend(sorted((AGENT_DIR / "scripts").rglob("*.py")))
+        if primary:
+            for name in ("scripts", "references"):
+                base = AGENT_DIR / "skills" / primary / name
+                if base.is_dir():
+                    paths.extend(sorted(path for path in base.rglob("*") if not path.is_dir()))
     entries = []
     for path in paths:
         if not path.is_file() or path.is_symlink():
             raise SystemExit(f"policy bundle file is missing or unsafe: {path.relative_to(ROOT)}")
         entries.append({"path": str(path.relative_to(ROOT)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-    return object_sha256(entries)
+    if version == LEGACY_POLICY_BUNDLE_VERSION:
+        return object_sha256(entries)
+    return object_sha256({"version": version, "files": entries})
 
 
 def invariant_sha256(task: Dict[str, object]) -> str:
@@ -311,11 +344,18 @@ def authorization_receipt(
     allowed = TRANSITION_PROFILES.get(profile)
     if allowed is None or not set(actual).issubset(allowed):
         raise SystemExit(f"context transition fields exceed canonical mutator profile {profile}: {actual}")
+    # Non-invariant top-level changes are committed wholesale by the canonical
+    # mutator; record their field names for audit without blocking them.
+    non_invariant = sorted(
+        key for key in set(before) | set(after)
+        if key not in TASK_INVARIANT_KEYS and before.get(key) != after.get(key)
+    )
     return {
         "schema": value["schema"],
         "mutator": profile[0],
         "operation": profile[1],
         "changed_fields": actual,
+        "non_invariant_changed_fields": non_invariant,
         "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -380,24 +420,31 @@ def automatic_transition_source_tokens(
 
     A canonical transition adds control-plane work to the same active context;
     it is not evidence that the session was compacted.  Therefore its estimate
-    must advance from the prior checkpoint.  A provider-verified cumulative
-    measurement remains in TASK.tokens_used for the independent
-    cost gate; it is not an active-window measurement and must not undo a real
-    compaction. Only an explicit plain ``sync`` (the real compaction path) may
-    establish a lower active-context baseline.
+    must advance from the prior checkpoint.  The per-transition floor is the
+    estimated per-turn host overhead (``context.estimated_turn_overhead_tokens``
+    — system-prompt replay plus turn cost) plus the inherited host context
+    charged per root turn; the deprecated
+    ``context.automatic_transition_token_increment`` alias keeps its exact
+    legacy arithmetic.  When two provider-observed cumulative usage receipts
+    exist, their measured delta is preferred over the estimate.  A
+    provider-verified cumulative measurement remains in TASK.tokens_used for
+    the independent cost gate; it is not an active-window measurement and must
+    not undo a real compaction. Only an explicit plain ``sync`` (the real
+    compaction path) may establish a lower active-context baseline.
     """
-    policy = config.get("context", {}) if isinstance(config.get("context"), dict) else {}
-    configured = policy.get("automatic_transition_token_increment")
-    defaults = {"fast": 150, "standard": 300, "release": 500}
-    increments = configured if isinstance(configured, dict) else defaults
     mode = str(task.get("mode", ""))
-    increment = increments.get(mode)
-    if (
-        not isinstance(increment, int)
-        or isinstance(increment, bool)
-        or increment <= 0
-    ):
-        raise SystemExit(f"context automatic-transition token increment is invalid for mode {mode}")
+    measured = total_budget.measured_turn_delta(task)
+    if measured is not None:
+        increment = measured
+    else:
+        try:
+            increment = total_budget.transition_overhead_estimate(config, mode)
+        except ValueError as error:
+            raise SystemExit(
+                f"context turn-overhead estimate is unusable: {error} "
+                f"(configure context.estimated_turn_overhead_tokens; "
+                f"deprecated alias context.automatic_transition_token_increment)"
+            )
     freshness = previous.get("usage_freshness")
     prior = freshness.get("estimated_tokens") if isinstance(freshness, dict) else None
     if not isinstance(prior, int) or isinstance(prior, bool) or prior <= 0:
@@ -469,6 +516,7 @@ def build_capsule(
     previous_task_sha256 = str(previous.get("task_invariant_sha256", "none")) if previous else "none"
     capsule: Dict[str, object] = {
         "schema": "agent-context/v2",
+        "policy_bundle_version": POLICY_BUNDLE_VERSION,
         "policy_bundle_sha256": policy_bundle_sha256(task),
         "task_title": task.get("title"),
         "phase": task.get("phase"),
@@ -534,7 +582,7 @@ def build_capsule(
             "history": ["handoff_written", "awaiting_host_compaction", "resumed"],
             "receipt": getattr(args, "verified_host_compaction_receipt", None),
         }
-    elif isinstance(previous.get("host_compaction"), dict):
+    elif isinstance(previous.get("host_compaction"), dict) and not getattr(args, "reset", False):
         capsule["host_compaction"] = copy.deepcopy(previous["host_compaction"])
     estimated = normalized_token_estimate(capsule)
     if int(args.source_tokens) < estimated:
@@ -603,6 +651,23 @@ def internal_compaction_errors(context: Dict[str, object]) -> List[str]:
                 except (OSError, ValueError, TypeError, SystemExit, json.JSONDecodeError):
                     errors.append("stored host compaction receipt cannot be durably reverified")
     return errors
+
+
+def handoff_artifact_present(previous: Dict[str, object], task: Dict[str, object]) -> bool:
+    """The recorded handoff must be a real artifact, not a fabricated label.
+
+    Entering ``awaiting_host_compaction`` claims ``handoff_written``; that is
+    only honest when the verified previous capsule carries an
+    ``agent-context-resume/v1`` contract bound to the current TASK invariant.
+    """
+    if not CONTEXT_PATH.is_file() or CONTEXT_PATH.is_symlink():
+        return False
+    resume = previous.get("resume") if isinstance(previous, dict) else None
+    return (
+        isinstance(resume, dict)
+        and resume.get("schema") == "agent-context-resume/v1"
+        and resume.get("task_invariant_sha256") == invariant_sha256(task)
+    )
 
 
 def verify_host_compaction_receipt(raw: str, task: Dict[str, object],
@@ -703,12 +768,12 @@ def repair_approval_errors(
         return []
     if set(integrity) != repair or HEX64.fullmatch(str(integrity.get("repair_capsule_sha256", ""))) is None:
         return ["reviewed repair lacks an exact repair-capsule approval binding"]
-    if not humandecision.reverify(
+    if not humandecision.decision_approval_valid(
         ROOT, config, task, gate="context-repair",
         artifact_sha256=str(integrity["repair_capsule_sha256"]),
         source=str(integrity.get("source", "")), record=integrity.get("repair_approval"),
     ):
-        return ["reviewed repair lacks a valid provider-verified human decision receipt"]
+        return ["reviewed repair lacks a valid human decision approval"]
     return []
 
 
@@ -771,8 +836,14 @@ def legacy_usage_upgrade_allowed(context: Dict[str, object]) -> bool:
         return False
     compaction = context.get("compaction")
     snapshot = compaction.get("budget_snapshot") if isinstance(compaction, dict) else None
-    expected = budget_snapshot(load_json(CONFIG_PATH), task, 0)
-    expected.pop("current_checkpoint_estimated_tokens", None)
+    # Compare on the stored snapshot's own basis: recompute what the current
+    # code would record for this TASK/config with the stored checkpoint
+    # estimate, rather than against a zero-estimate snapshot that can never
+    # match a real legacy capsule.
+    estimate = snapshot.get("current_checkpoint_estimated_tokens") if isinstance(snapshot, dict) else None
+    if not isinstance(estimate, int) or isinstance(estimate, bool) or estimate < 0:
+        return False
+    expected = budget_snapshot(load_json(CONFIG_PATH), task, estimate)
     return bool(
         context.get("task_invariant_sha256") == invariant_sha256(task)
         and context.get("requirement_contract_sha256") == governed_contract_binding(task)
@@ -792,6 +863,9 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
             print(f"INVALID context capsule\n- {error}")
         return 1
     policy = config.get("context", {}) if isinstance(config.get("context"), dict) else {}
+    # A config whose budget arithmetic lets one permitted operation cross the
+    # hard watermark is invalid for every capsule under it.
+    errors.extend(total_budget.config_budget_errors(config))
     mode_policy = policy.get("max_capsule_tokens", {}) if isinstance(policy.get("max_capsule_tokens"), dict) else {}
     if context.get("schema") != "agent-context/v2":
         errors.append("schema must be agent-context/v2")
@@ -805,11 +879,24 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
         "open_questions": list_value(task.get("open_questions")),
         "next_action": task.get("next_action"),
         "resume": resume_contract(task, invariant_sha256(task)),
-        "policy_bundle_sha256": policy_bundle_sha256(task),
     }
     for key, expected in exact.items():
         if context.get(key) != expected:
             errors.append(f"{key} drifted from canonical task/contract state")
+    bundle_version = context.get("policy_bundle_version", LEGACY_POLICY_BUNDLE_VERSION)
+    if bundle_version == POLICY_BUNDLE_VERSION:
+        if context.get("policy_bundle_sha256") != policy_bundle_sha256(task):
+            errors.append("policy_bundle_sha256 drifted from canonical task/contract state")
+    elif (
+        bundle_version == LEGACY_POLICY_BUNDLE_VERSION
+        and context.get("policy_bundle_sha256") == policy_bundle_sha256(task, LEGACY_POLICY_BUNDLE_VERSION)
+    ):
+        # One-shot migration window: an otherwise exact policy-bundle/v1
+        # capsule stays valid and is upgraded to policy-bundle/v2 (which also
+        # binds enforcement code and guardrails) by the next sync.
+        pass
+    else:
+        errors.append("policy_bundle_sha256 drifted from canonical task/contract state")
     if task.get("requirements_clarified") is True and task.get("requirement_contract_sha256") != contract_sha256():
         errors.append("TASK requirement contract binding differs from the governed contract bytes")
     if not isinstance(context.get("phase_summary"), str) or not str(context.get("phase_summary")).strip():
@@ -886,6 +973,58 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
     return 0
 
 
+def abort_host_compaction(args: argparse.Namespace) -> int:
+    """Abandon a pending host-compaction wait under human decision authority.
+
+    The bounded inverse of ``sync --request-host-compaction``: valid only
+    while the capsule awaits a host receipt, it clears the awaiting state,
+    preserves every checkpoint value and records the aborted event together
+    with its approval in the capsule compaction block.  Approval routing
+    matches repair: policy-v2 local tasks use a bound local approval,
+    protected routes require a provider-signed receipt.
+    """
+    if not args.source.startswith("user:"):
+        raise SystemExit("abort approval source must start with user:")
+    context = load_json(CONTEXT_PATH)
+    host = context.get("host_compaction")
+    if not isinstance(host, dict) or host.get("state") != "awaiting_host_compaction":
+        raise SystemExit("abort-host-compaction is valid only while a host compaction is awaited")
+    task = load_json(TASK_PATH)
+    config = load_json(CONFIG_PATH)
+    capsule_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+    approval = humandecision.record_decision_approval(
+        ROOT, config, task, gate="context-abort-host-compaction",
+        artifact_sha256=capsule_sha256, source=args.source,
+        receipt=args.human_decision_receipt,
+    )
+    compaction = context.get("compaction")
+    integrity = context.get("integrity")
+    if not isinstance(compaction, dict) or not isinstance(integrity, dict) or integrity.get("status") != "verified":
+        raise SystemExit("awaiting capsule is not a verified compaction record; use repair --reset")
+    context.pop("host_compaction", None)
+    compaction["host_compaction_abort"] = {
+        "event": "aborted",
+        "aborted_at": now(),
+        "source": args.source,
+        "aborted_capsule_sha256": capsule_sha256,
+        "approval": approval,
+    }
+    estimated = normalized_token_estimate(context)
+    if int(compaction.get("source_estimated_tokens", 0)) < estimated:
+        raise SystemExit("aborted capsule exceeds its source estimate; use repair --reset")
+    compaction["capsule_estimated_tokens"] = estimated
+    compaction["tokens_removed"] = int(compaction["source_estimated_tokens"]) - estimated
+    compaction["compression_ratio"] = round(int(compaction["source_estimated_tokens"]) / max(estimated, 1), 2)
+    integrity["verified_at"] = now()
+    integrity["content_sha256"] = "0" * 64
+    integrity["content_sha256"] = content_sha256(context)
+    atomic_json(CONTEXT_PATH, context)
+    result = validate_context(ignore_checkpoint_age=True)
+    if result == 0:
+        print("HOST COMPACTION ABORTED: awaiting state cleared; renew the checkpoint with a plain sync before continuing")
+    return result
+
+
 def _main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -911,10 +1050,39 @@ def _main() -> int:
         command.add_argument("--request-host-compaction", action="store_true")
     approve = sub.add_parser("approve-repair")
     approve.add_argument("--source", required=True)
-    approve.add_argument("--human-decision-receipt", required=True)
+    approve.add_argument("--human-decision-receipt")
+    abort = sub.add_parser("abort-host-compaction")
+    abort.add_argument("--source", required=True)
+    abort.add_argument("--human-decision-receipt")
+    journal = sub.add_parser("journal")
+    journal.add_argument("--restore", action="store_true")
+    journal.add_argument("--discard", action="store_true")
     args = parser.parse_args()
     if args.command == "check":
         return validate_context(args.quiet)
+    if args.command == "journal":
+        import contexttx
+        if args.restore and args.discard:
+            raise SystemExit("journal --restore and --discard are distinct actions")
+        if args.restore:
+            status: Optional[Dict[str, object]] = contexttx.restore_transition_journal()
+        elif args.discard:
+            contexttx.discard_transition_journal()
+            status = None
+        else:
+            status = contexttx.transition_journal_status()
+        if status is None:
+            status = {
+                "schema": "agent-context-transition-journal-status/v1",
+                "state": "none",
+                "recovery": "no interrupted context transition",
+            }
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            return 0
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0 if status.get("state") == "restored" else 1
+    if args.command == "abort-host-compaction":
+        return abort_host_compaction(args)
     if args.command == "approve-repair":
         if not args.source.startswith("user:"):
             raise SystemExit("repair approval source must start with user:")
@@ -922,7 +1090,7 @@ def _main() -> int:
         if not isinstance(context.get("integrity"), dict) or context["integrity"].get("status") != "needs_review":
             raise SystemExit("no repaired context is waiting for review")
         repair_capsule_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
-        approval = humandecision.verify(
+        approval = humandecision.record_decision_approval(
             ROOT, load_json(CONFIG_PATH), load_json(TASK_PATH), gate="context-repair",
             artifact_sha256=repair_capsule_sha256, source=args.source,
             receipt=args.human_decision_receipt,
@@ -958,8 +1126,12 @@ def _main() -> int:
         isinstance(pending_host, dict)
         and pending_host.get("state") == "awaiting_host_compaction"
         and not args.host_compaction
+        and not (args.command == "repair" and args.reset)
     ):
-        raise SystemExit("context and TASK transitions are paused until the pending host compaction is resumed with a verified receipt")
+        raise SystemExit(
+            "context and TASK transitions are paused until the pending host compaction is resumed "
+            "with a verified receipt, abandoned with abort-host-compaction, or rebuilt with repair --reset"
+        )
     transition_authorization: Optional[Dict[str, object]] = None
     if args.command == "sync" and CONTEXT_PATH.is_file():
         if args.transition:
@@ -1006,6 +1178,23 @@ def _main() -> int:
                 raise SystemExit("request and resume host compaction are distinct transitions")
             if args.request_host_compaction and isinstance(previous.get("host_compaction"), dict) and previous["host_compaction"].get("state") == "awaiting_host_compaction":
                 raise SystemExit("host compaction is already awaiting a host receipt")
+            if args.request_host_compaction:
+                # Entering the awaiting state without a configured observer
+                # adapter is a one-way deadlock: the only resume path requires
+                # a receipt the host can never verify.
+                observer = load_json(CONFIG_PATH).get("context", {})
+                observer = observer.get("host_compaction_observer", {}) if isinstance(observer, dict) else {}
+                adapter_raw = observer.get("signed_adapter") if isinstance(observer, dict) else None
+                if not isinstance(adapter_raw, str) or not adapter_raw.strip():
+                    raise SystemExit(
+                        "host compaction is unsupported until context.host_compaction_observer.signed_adapter "
+                        "is configured; requesting the awaiting state without it would be unrecoverable"
+                    )
+                if not handoff_artifact_present(previous, load_json(TASK_PATH)):
+                    raise SystemExit(
+                        "host compaction request requires a written compact handoff: the verified capsule "
+                        "must carry an agent-context-resume/v1 contract bound to the current TASK"
+                    )
             if isinstance(prior_estimate, int) and args.source_tokens < prior_estimate:
                 if not args.host_compaction:
                     raise SystemExit(
@@ -1028,6 +1217,8 @@ def _main() -> int:
         raise SystemExit("initial context creation must use plain sync, not transition")
     elif args.command == "sync" and args.host_compaction:
         raise SystemExit("initial context creation cannot claim a host compaction")
+    elif args.command == "sync" and args.request_host_compaction:
+        raise SystemExit("initial context creation cannot request a host compaction; no handoff has been written")
 
     integrity_status = "needs_review" if args.command == "repair" else "verified"
     context = build_capsule(

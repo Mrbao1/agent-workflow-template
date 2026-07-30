@@ -1,9 +1,10 @@
 {
   "schema": "agent-runtime/v2",
   "baseline": {
-    "source": "template-uninitialized",
-    "captured_at": null,
-    "project_processes": []
+    "source": "user:final-reseal-verification",
+    "captured_at": "2026-07-30T10:14:57+00:00",
+    "project_processes": [],
+    "confirmed_existing_processes": 0
   },
   "processes": [],
   "docker_projects": [],

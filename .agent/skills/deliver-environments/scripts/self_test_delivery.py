@@ -523,10 +523,24 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
         [sys.executable, ".agent/scripts/deliveryctl.py", "init"], cwd=root,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
     )
+    # agentctl validate re-runs `workflowctl.py validate` as a subprocess, and
+    # the requirement-gate revalidation performs a genuine provider reverify.
+    # A sandbox cannot provision an OS-owned decision adapter, so the harness
+    # executes that one subprocess in-process with the provider boundary
+    # stubbed; every other controller still runs as a real subprocess.
     validated = root / "validate-harness.py"
     validated.write_text(
-        "import sys;sys.path.insert(0,'.agent/scripts');import agentctl;"
-        "agentctl.humandecision.reverify=lambda *a,**k: True;raise SystemExit(agentctl.command_validate())\n",
+        "import sys,types;sys.path.insert(0,'.agent/scripts')\n"
+        "import agentctl,humandecision,workflowctl\n"
+        "humandecision.reverify=lambda *a,**k: True\n"
+        "real_run=agentctl.subprocess.run\n"
+        "def patched(command,**kwargs):\n"
+        "    if any(str(item).endswith('workflowctl.py') for item in command):\n"
+        "        rc=workflowctl.command_validate()\n"
+        "        return types.SimpleNamespace(returncode=rc,stdout='')\n"
+        "    return real_run(command,**kwargs)\n"
+        "agentctl.subprocess.run=patched\n"
+        "raise SystemExit(agentctl.command_validate())\n",
         encoding="utf-8",
     )
     context_check = subprocess.run([sys.executable, ".agent/scripts/contextctl.py", "check"], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)

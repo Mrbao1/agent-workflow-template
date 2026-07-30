@@ -11,7 +11,7 @@
   "status": "idle",
   "phase": "idle",
   "requirements_clarified": false,
-  "token_budget": 24000,
+  "token_budget": 48000,
   "tokens_used": 0,
   "token_usage_source": "estimated",
   "usage_receipts": [],

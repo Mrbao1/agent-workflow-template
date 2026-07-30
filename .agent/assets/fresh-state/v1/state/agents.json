@@ -47,7 +47,7 @@
   "replay_runs": [],
   "token_accounting": {
     "schema": "agent-child-token-accounting/v1",
-    "token_budget": 24000,
+    "token_budget": 48000,
     "settled_tokens": 0
   },
   "task_payload_schema": "agent-task-payload/v2",

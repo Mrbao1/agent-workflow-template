@@ -47,12 +47,12 @@
   "replay_runs": [],
   "token_accounting": {
     "schema": "agent-child-token-accounting/v1",
-    "token_budget": 24000,
+    "token_budget": 48000,
     "settled_tokens": 0
   },
   "task_payload_schema": "agent-task-payload/v2",
   "last_platform_snapshot": null,
   "platform_empty_verified": false,
   "migration_source": null,
-  "updated_at": "2026-07-22T02:17:20+00:00"
+  "updated_at": "2026-07-30T10:14:04+00:00"
 }

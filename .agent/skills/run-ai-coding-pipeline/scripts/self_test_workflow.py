@@ -117,7 +117,7 @@ def run(root: Path, *args: str, expected: int = 0) -> str:
 
 
 def task(mode: str, node: int, accepted: list[int]) -> dict[str, object]:
-    token_budget = {"fast": 12000, "standard": 24000, "release": 48000}[mode]
+    token_budget = {"fast": 16000, "standard": 48000, "release": 96000}[mode]
     value = json.loads((SOURCE / "state/TASK.json").read_text(encoding="utf-8"))
     value.update({
         "schema": "agent-task/v2", "title": f"{mode} fixture", "mode": mode,
@@ -708,10 +708,15 @@ with tempfile.TemporaryDirectory(prefix="workflow-state-test-") as raw:
     (root / ".agent/scripts/contextctl.py").write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
     (root / ".agent/scripts/agentctl.py").write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
     (root / ".agent/scripts/contexttx.py").write_text(
-        "from pathlib import Path\nimport datetime,hashlib,json\nclass contextctl:\n @staticmethod\n def invariant_sha256(value): return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()\ndef transition_task(before,after,**kwargs):\n p=Path('.agent/state/TASK.json'); p.write_text(json.dumps(after,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n invariant=contextctl.invariant_sha256(after); observed=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(); sequence=1\n context={'schema':'agent-context/v2','task_invariant_sha256':invariant,'resume':{'schema':'agent-context-resume/v1','task_status':after.get('status'),'current_node':after.get('current_node'),'next_action':after.get('next_action'),'budget_state':after.get('budget_state'),'terminal':after.get('status')=='accepted','resume_action':'complete' if after.get('status')=='accepted' else 'continue','task_invariant_sha256':invariant},'checkpoint':{'sequence':sequence,'updated_at':observed,'transition_authorization':{'mutator':kwargs.get('mutator'),'operation':kwargs.get('operation')}},'usage_freshness':{'schema':'agent-context-usage/v1','checkpoint_sequence':sequence,'task_invariant_sha256':invariant,'coverage':'through-current-checkpoint','source':'explicit-estimate','estimated_tokens':1000,'observed_at':observed}}\n Path('.agent/state/CONTEXT.json').write_text(json.dumps(context,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n",
+        "from pathlib import Path\nimport datetime,hashlib,json\nclass contextctl:\n @staticmethod\n def invariant_sha256(value): return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()\ndef transition_journal_status():\n p=Path('.agent/state/.context-transition-journal.json')\n if not p.is_file(): return None\n try: value=json.loads(p.read_text(encoding='utf-8'))\n except Exception: return {'schema':'agent-context-transition-journal-status/v1','state':'malformed'}\n return {'schema':'agent-context-transition-journal-status/v1','state':value.get('state','interrupted'),'recovery':value.get('recovery','')}\ndef transition_task(before,after,**kwargs):\n task_path=Path('.agent/state/TASK.json'); context_path=Path('.agent/state/CONTEXT.json')\n effects=[(Path(path),data) for path,data in (kwargs.get('side_effects') or [])]\n backups={task_path:task_path.read_bytes() if task_path.is_file() else None,context_path:context_path.read_bytes() if context_path.is_file() else None}\n for path,_ in effects: backups[path]=path.read_bytes() if path.is_file() else None\n try:\n  for path,data in effects: path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(data)\n  task_path.write_text(json.dumps(after,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n except BaseException:\n  for path,data in backups.items():\n   if data is None: path.unlink(missing_ok=True)\n   else: path.write_bytes(data)\n  raise\n invariant=contextctl.invariant_sha256(after); observed=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(); sequence=1\n context={'schema':'agent-context/v2','task_invariant_sha256':invariant,'resume':{'schema':'agent-context-resume/v1','task_status':after.get('status'),'current_node':after.get('current_node'),'next_action':after.get('next_action'),'budget_state':after.get('budget_state'),'terminal':after.get('status')=='accepted','resume_action':'complete' if after.get('status')=='accepted' else 'continue','task_invariant_sha256':invariant},'checkpoint':{'sequence':sequence,'updated_at':observed,'transition_authorization':{'mutator':kwargs.get('mutator'),'operation':kwargs.get('operation')}},'usage_freshness':{'schema':'agent-context-usage/v1','checkpoint_sequence':sequence,'task_invariant_sha256':invariant,'coverage':'through-current-checkpoint','source':'explicit-estimate','estimated_tokens':1000,'observed_at':observed}}\n context_path.write_text(json.dumps(context,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n",
         encoding="utf-8",
     )
     config = json.loads((root / ".agent/config.json").read_text(encoding="utf-8"))
+    # The budget-calibration workstream is mid-migration: the installed
+    # agentctl validator still requires the pre-rename increment key and the
+    # pre-calibration margin, so pin both in the disposable fixture config.
+    config["context"]["automatic_transition_token_increment"] = {"fast": 150, "standard": 300, "release": 500}
+    config["agent_control"]["child_system_tool_margin_tokens"] = 1000
     platform_provider_dir = Path(tempfile.mkdtemp(prefix="workflow-platform-provider-"))
     platform_provider = platform_provider_dir / "verify-platform.py"
     platform_provider.write_text("""#!/usr/bin/env python3
@@ -855,6 +860,95 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
     early = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
     if early["current_node"] != 2 or list(early["failure_ledger"].values()) != [2]:
         raise AssertionError("stable second-failure or early-node rule failed")
+
+    # Three-strike escalation blocks progression until a bound human decision exists.
+    strikes = task("standard", 5, [0, 1, 2, 3, 4])
+    strikes["decision_policy_version"] = 2
+    install_task(root, strikes)
+    strikes = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    strikes["gate_approvals"]["requirement"] = {
+        "source": "user:fixture",
+        "artifact_sha256": strikes["requirement_contract_sha256"],
+        "assurance": "explicit-user-message;local-only;not-provider-verified",
+    }
+    write_json(root / ".agent/state/TASK.json", strikes)
+    stage(root, strikes)
+    for from_node, to_node in ((5, 4), (4, 3), (3, 2)):
+        run(root, "return-node", "--from-node", str(from_node), "--to", str(to_node),
+            "--issue-id", "ISSUE-STRIKE", "--cause-category", "implementation",
+            "--subtask", "x", "--root-cause", "same defect", "--change", "retry")
+    strikes = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if strikes["status"] != "waiting_human" or "human decision required" not in strikes["next_action"]:
+        raise AssertionError("third same-cause return did not escalate to a human decision")
+    blocked = run(root, "advance", "--node", "2", "--artifact", ".agent/state/REQUIREMENT_CONTRACT.md", expected=1)
+    if "resolve-failure" not in blocked:
+        raise AssertionError("three-strike advance was not blocked by the escalation gate")
+    run(root, "resolve-failure", "--source", "user:fixture")
+    resolved = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if "failure-escalation" not in resolved.get("gate_approvals", {}):
+        raise AssertionError("resolve-failure did not record the escalation decision")
+    structured_path = root / "structured-requirement.md"
+    structured_path.write_text("structured requirement", encoding="utf-8")
+    bind_node_template(root, "structured-requirement", structured_path.name)
+    run(root, "advance", "--node", "2", "--artifact", structured_path.name)
+    cleared = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if cleared["status"] != "in_progress" or "failure-escalation" in cleared.get("gate_approvals", {}):
+        raise AssertionError("successful advance did not consume the escalation decision")
+
+    # A failing stage side effect rolls the whole transition back instead of
+    # stranding a committed TASK with a stale stage index.
+    rollback_fixture = task("standard", 2, [0, 1])
+    install_task(root, rollback_fixture)
+    rollback_impl = implementation(root, "standard")
+    stage_path = root / ".agent/state/STAGE_INDEX.md"
+    stage_bytes = stage_path.read_bytes()
+    stage_path.unlink()
+    stage_path.mkdir()
+    before_rollback = (root / ".agent/state/TASK.json").read_bytes()
+    try:
+        run(root, "advance", "--node", "6", "--artifact", rollback_impl, expected=1)
+    finally:
+        stage_path.rmdir()
+        stage_path.write_bytes(stage_bytes)
+    if (root / ".agent/state/TASK.json").read_bytes() != before_rollback:
+        raise AssertionError("failed stage side effect stranded a committed transition")
+
+    # Rollback archives consolidate into a single bounded snapshot at the
+    # configured depth while staying fully verifiable.
+    depth_config_bytes = (root / ".agent/config.json").read_bytes()
+    depth_config = json.loads(depth_config_bytes)
+    depth_config["context"]["max_rollback_entries"] = 2
+    write_json(root / ".agent/config.json", depth_config)
+    archive_task = task("standard", 3, [0, 1, 2])
+    install_task(root, archive_task)
+    for cycle in range(4):
+        current = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        additions = 3 - len(current.get("rollback_ledger", []))
+        if additions < 1:
+            raise AssertionError("rollback depth fixture lost its hot ledger")
+        current["rollback_ledger"] = current.get("rollback_ledger", []) + [
+            {
+                "from": 3, "to": 2, "issue_id": f"ISSUE-DEPTH-{cycle}-{index}", "cause_category": "solution",
+                "subtask": "x", "root_cause": "depth fixture", "change": "retry",
+                "signature": hashlib.sha256(f"ISSUE-DEPTH-{cycle}-{index}|solution".encode()).hexdigest(), "count": 1,
+            }
+            for index in range(additions)
+        ]
+        write_json(root / ".agent/state/TASK.json", current)
+        run(root, "compact-state")
+    archived = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    archive_head = archived.get("rollback_archive", {})
+    archive_value = json.loads((root / archive_head["path"]).read_text(encoding="utf-8"))
+    if (
+        archive_head.get("depth") != 1
+        or archive_head.get("total_entries") != 4
+        or archive_value.get("previous") is not None
+        or len(archive_value.get("entries", [])) != 4
+        or len(archived.get("rollback_ledger", [])) != 2
+    ):
+        raise AssertionError("rollback archive did not consolidate into a bounded snapshot")
+    run(root, "validate")
+    (root / ".agent/config.json").write_bytes(depth_config_bytes)
 
     # Release node 4 fails closed when the selected adapter registry entry is unavailable.
     unavailable = task("release", 4, [0, 1, 2, 3])
@@ -1493,6 +1587,95 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     completed_route = json.loads(run(root, "route-resume"))
     if completed_route["terminal"] is not True or completed_route["action"] != "complete":
         raise AssertionError("legal complete-task checkpoint was not recognized as terminal")
+
+    # A terminal route binds the ledger and runtime: injecting an active member
+    # flips route-resume back to non-terminal.
+    ledger_bytes = (root / ".agent/state/agents.json").read_bytes()
+    dirty_ledger = json.loads(ledger_bytes)
+    dirty_ledger["members"].append({"id": "stray-active", "status": "active"})
+    write_json(root / ".agent/state/agents.json", dirty_ledger)
+    dirty_route = json.loads(run(root, "route-resume", expected=1))
+    if dirty_route["terminal"] is not False:
+        raise AssertionError(f"terminal route ignored an active ledger member: {dirty_route}")
+    (root / ".agent/state/agents.json").write_bytes(ledger_bytes)
+    restored_route = json.loads(run(root, "route-resume"))
+    if restored_route["terminal"] is not True:
+        raise AssertionError("restored ledger did not return the terminal route")
+
+    # A standard task on the lightweight projection completes without the
+    # node 4 solution gate, exactly mirroring the fast-mode shape.
+    light = task("standard", 2, [0, 1])
+    install_task(root, light)
+    light_impl = implementation(root, "standard")
+    # agentctl is pristine again at this point, so its fail-closed budget gate
+    # needs a context capsule bound to the current on-disk task (template
+    # binding above rewrote TASK.json).
+    light = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    light_sha = hashlib.sha256(
+        json.dumps(light, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    light_observed = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    write_json(root / ".agent/state/CONTEXT.json", {
+        "schema": "agent-context/v2", "task_invariant_sha256": light_sha,
+        "checkpoint": {"sequence": 1, "updated_at": light_observed, "transition_authorization": None},
+        "usage_freshness": {
+            "schema": "agent-context-usage/v1", "checkpoint_sequence": 1,
+            "task_invariant_sha256": light_sha, "coverage": "through-current-checkpoint",
+            "source": "explicit-estimate", "estimated_tokens": 1000, "observed_at": light_observed,
+        },
+    })
+    # The release-built ledger does not match a standard task; archive-reset it
+    # through the ledger's own audited init so completion revalidation passes.
+    ledger_init = subprocess.run(
+        [sys.executable, ".agent/skills/manage-agent-team/scripts/agentledger.py", "init",
+         "--archive-existing", "--platform-snapshot", completion_snapshot],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if ledger_init.returncode:
+        raise AssertionError(f"ledger re-init for the lightweight task failed\n{ledger_init.stdout}")
+    run(root, "advance", "--node", "6", "--artifact", light_impl)
+    light = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if light["accepted_nodes"] != list(range(7)) or light["current_node"] != 7:
+        raise AssertionError("standard lightweight projection did not land at acceptance")
+    run(root, "validate")
+    light_accept = acceptance(root, "standard", light)
+    light_digest = digest(root / light_accept)
+    run(root, "submit-gate", "--gate", "acceptance", "--artifact", light_accept)
+    run(root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture", "--artifact-sha256", light_digest)
+    run(root, "advance", "--node", "7", "--artifact", light_accept)
+    # The bound projection field is part of the invariant: tampering with it
+    # re-demands the full node set and fails route-resume closed.
+    tampered_bytes = (root / ".agent/state/TASK.json").read_bytes()
+    tampered = json.loads(tampered_bytes)
+    tampered["projection"] = "full"
+    write_json(root / ".agent/state/TASK.json", tampered)
+    stage(root, tampered)
+    tampered_route = json.loads(run(root, "route-resume", expected=1))
+    if tampered_route["terminal"] is not False:
+        raise AssertionError("projection field tampering did not fail closed")
+    (root / ".agent/state/TASK.json").write_bytes(tampered_bytes)
+    stage(root, json.loads(tampered_bytes))
+    run(
+        root, "complete-task", "--retrospective", retrospective,
+        "--platform-snapshot", completion_snapshot,
+    )
+    light_done = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if light_done["status"] != "accepted":
+        raise AssertionError("standard lightweight task did not complete")
+    light_route = json.loads(run(root, "route-resume"))
+    if light_route["terminal"] is not True or light_route["action"] != "complete":
+        raise AssertionError("completed standard lightweight task was not terminal")
+    # The standard terminal route reaches the ledger/runtime binding itself:
+    # a ledger mutation that agentledger validate rejects yields a cleanup
+    # cursor instead of a terminal receipt.
+    light_ledger_bytes = (root / ".agent/state/agents.json").read_bytes()
+    tainted_ledger = json.loads(light_ledger_bytes)
+    tainted_ledger["members"].append({"id": "stray-active", "status": "active"})
+    write_json(root / ".agent/state/agents.json", tainted_ledger)
+    tainted_route = json.loads(run(root, "route-resume", expected=1))
+    if tainted_route["terminal"] is not False or not tainted_route.get("cleanup"):
+        raise AssertionError(f"terminal route ignored a tainted ledger: {tainted_route}")
+    (root / ".agent/state/agents.json").write_bytes(light_ledger_bytes)
     shutil.rmtree(completion_provider_dir)
     shutil.rmtree(platform_provider_dir)
     template_tool.write_bytes(pristine_template_tool)
@@ -1528,7 +1711,7 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     context_path = root / ".agent/state/CONTEXT.json"
     context_before = context_path.read_bytes()
     combined_context = json.loads(context_before)
-    combined_context["usage_freshness"] = {"estimated_tokens": 13000}
+    combined_context["usage_freshness"] = {"estimated_tokens": 39000}
     write_json(context_path, combined_context)
     write_json(agents_path, {"prepared_dispatches": [{
         "fork_turns": 0,
@@ -1558,6 +1741,76 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     forged_route=json.loads(run(root,"route-resume",expected=1))
     if forged_route["terminal"] is not False or forged_route["action"]!="waiting_human":
         raise AssertionError("pseudo completion checkpoint made an incomplete accepted task terminal")
+
+    # Scheduler resume receipts are single-use and degrade to a structured
+    # receipt (never a bare failure) when no adapter is configured.
+    scheduler_task = task("standard", 4, [0, 1, 2, 3])
+    install_task(root, scheduler_task)
+    scheduler_sha = hashlib.sha256(
+        json.dumps(scheduler_task, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    write_json(root / ".agent/state/CONTEXT.json", {
+        "task_invariant_sha256": scheduler_sha,
+        "resume": {"schema": "agent-context-resume/v1", "task_status": "in_progress", "current_node": 4,
+                   "next_action": scheduler_task["next_action"], "budget_state": "ok", "terminal": False,
+                   "resume_action": "continue", "task_invariant_sha256": scheduler_sha},
+        "checkpoint": {"transition_authorization": None},
+    })
+    scheduler_cursor = canonical_digest({
+        "task": scheduler_sha, "checkpoint": None, "next_action": scheduler_task["next_action"],
+    })
+
+    def scheduler_receipt(nonce: str) -> str:
+        relative = f".agent/state/evidence/scheduler-resume-{nonce}.json"
+        write_json(root / relative, {
+            "schema": "host-scheduler-resume/v1", "resume_cursor": scheduler_cursor,
+            "task_invariant_sha256": scheduler_sha,
+            "observed_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+            "scheduler_id": "fixture-scheduler", "nonce": nonce,
+        })
+        return relative
+
+    no_adapter = json.loads(run(root, "route-resume", "--scheduler-receipt", scheduler_receipt("nonce-no-adapter")))
+    if no_adapter["scheduler_available"] is not False or not no_adapter.get("scheduler_error"):
+        raise AssertionError("missing scheduler adapter did not degrade to a structured receipt")
+    scheduler_dir = Path(tempfile.mkdtemp(prefix="workflow-scheduler-adapter-"))
+    scheduler_adapter = scheduler_dir / "verify-scheduler.py"
+    scheduler_adapter.write_text("""#!/usr/bin/env python3
+import hashlib, pathlib, sys
+receipt = pathlib.Path(sys.argv[sys.argv.index('--receipt') + 1])
+print('VERIFIED SCHEDULER RESUME sha256=' + hashlib.sha256(receipt.read_bytes()).hexdigest())
+""", encoding="utf-8")
+    scheduler_adapter.chmod(0o755)
+    os.environ["AGENT_TEST_PLATFORM_ADAPTER"] = str(scheduler_adapter.resolve())
+    scheduler_config = json.loads((root / ".agent/config.json").read_text(encoding="utf-8"))
+    scheduler_config["agent_control"]["scheduler"]["signed_adapter"] = str(scheduler_adapter.resolve())
+    write_json(root / ".agent/config.json", scheduler_config)
+    first_receipt = scheduler_receipt("nonce-first")
+    resumed = json.loads(run(root, "route-resume", "--scheduler-receipt", first_receipt))
+    if resumed["scheduler_available"] is not True or resumed["action"] != "continue":
+        raise AssertionError("verified scheduler receipt did not resume the workflow")
+    if not (root / ".agent/state/.scheduler-receipt-nonces.json").is_file():
+        raise AssertionError("verified scheduler receipt did not consume its nonce")
+    replayed = json.loads(run(root, "route-resume", "--scheduler-receipt", first_receipt))
+    if replayed["scheduler_available"] is not False or "nonce" not in str(replayed.get("scheduler_error")):
+        raise AssertionError("replayed scheduler receipt nonce was not rejected")
+    shutil.rmtree(scheduler_dir)
+
+    # A leftover transition journal surfaces a concrete recovery cursor and
+    # never lets the route report terminal.
+    journal_path = root / ".agent/state/.context-transition-journal.json"
+    write_json(journal_path, {"state": "interrupted"})
+    journal_route = json.loads(run(root, "route-resume", expected=1))
+    if (
+        journal_route["terminal"] is not False
+        or journal_route.get("recovery") != "python3 .agent/scripts/contextctl.py journal --restore"
+    ):
+        raise AssertionError("interrupted transition journal did not surface a restore cursor")
+    write_json(journal_path, {"state": "committed"})
+    committed_journal = json.loads(run(root, "route-resume", expected=1))
+    if committed_journal.get("recovery") != "python3 .agent/scripts/contextctl.py journal --discard":
+        raise AssertionError("committed transition journal did not surface a discard cursor")
+    journal_path.unlink()
 
     # Decision-policy v1 never accepts a caller label by itself. A missing
     # receipt is rejected even when the requirement receipt is provider

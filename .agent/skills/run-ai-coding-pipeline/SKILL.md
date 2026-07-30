@@ -7,7 +7,7 @@ description: Route clarified software work through an adaptive fast, standard, o
 
 1. Read `.agent/INDEX.md`, `config.json`, `state/TASK.json`, the bounded context capsule and project guards. Use the thought tree to choose exactly one `continue`, `return-node`, or `waiting_human` transition before doing stage work. Treat `STAGE_INDEX.md` only as a generated compatibility projection.
 2. If requirements are not clarified, stop and use `clarify-task`.
-3. Confirm or escalate `fast`, `standard`, or `release` from reversibility, files/systems touched, data/security risk and target environment.
+3. Confirm or escalate `fast`, `standard`, or `release` from reversibility, files/systems touched, data/security risk and target environment. `agentctl.py start` defaults (`--complexity tiny --files 1`) route fast. Escalation refuses when the existing requirement approval would fail under the new routing policy; re-approve it with `agentctl.py escalate-mode --reapprove --source user:<decision>`.
 4. Select only the templates and stack assets named by the requirement contract. Follow `.agent/workflows/TEMPLATE_ROUTING.md`.
 5. Write expected tests and cleanup before implementation. Check `budget_state`; a `must_compact` task needs a verified phase handoff before any new expansion.
 6. Execute the active mode:

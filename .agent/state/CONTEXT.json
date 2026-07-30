@@ -1,10 +1,11 @@
 {
   "schema": "agent-context/v2",
-  "policy_bundle_sha256": "6656f1d72a6ff86928818a95243d531a043e6a38177c0fc67b8a826f2c04b17a",
+  "policy_bundle_version": "policy-bundle/v2",
+  "policy_bundle_sha256": "36493b2c40b27e5d9c44579f0da6b1f63fe474a4d66b503d6e00305d0b046d6c",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00",
+  "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
   "requirement_contract_sha256": "unapproved-draft",
   "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
@@ -26,14 +27,14 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00"
+    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
   },
   "checkpoint": {
-    "sequence": 3,
+    "sequence": 8,
     "reason": "fresh-project-seed",
-    "updated_at": "2026-07-23T11:54:22+00:00",
-    "previous_sha256": "ad55895db9e879b4c9a0658d07f47be3819a03b49a29c7fe8e99c3f7e5639e45",
-    "previous_task_invariant_sha256": "93fbfa2bc059aa3c44808ffe5ee5800ebae6e90738beab2f85b413a064b494a5",
+    "updated_at": "2026-07-30T10:14:04+00:00",
+    "previous_sha256": "bc9137cf5137bd77fe90a95a688af6068f88184a43abfc2bf9d126197bcefb67",
+    "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "task_delta": [
       "canonical_task_state"
     ],
@@ -41,31 +42,31 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 3,
-    "task_invariant_sha256": "06bb66a5f17f883667b9dac71003b659c4d7264701a192c418c4fab99f41aa00",
+    "checkpoint_sequence": 8,
+    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
-    "observed_at": "2026-07-23T11:54:22+00:00"
+    "observed_at": "2026-07-30T10:14:04+00:00"
   },
   "compaction": {
     "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 590,
-    "tokens_removed": 210,
-    "compression_ratio": 1.36,
+    "capsule_estimated_tokens": 601,
+    "tokens_removed": 199,
+    "compression_ratio": 1.33,
     "method": "explicit-estimate/v1",
     "reason": "fresh-project-seed",
     "source": "project-init:bootstrap",
     "budget_snapshot": {
       "task_tokens_used": 0,
       "current_checkpoint_estimated_tokens": 800,
-      "task_token_budget": 24000,
+      "task_token_budget": 48000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
       "child_reserved_tokens": 0,
       "child_settled_tokens": 0,
-      "consumed_tokens": 800,
-      "budget_ratio": 0.0333,
+      "consumed_tokens": 7000,
+      "budget_ratio": 0.1458,
       "watermark": "normal",
       "assurance": {
         "level": "best-effort-estimate",
@@ -77,8 +78,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-23T11:54:22+00:00",
+    "verified_at": "2026-07-30T10:14:04+00:00",
     "source": "project-init:bootstrap",
-    "content_sha256": "b5be3ba3e7f72a34b5e947c4753dbf984a10efcd993facb9b3ef198b56df0f0d"
+    "content_sha256": "d3c85be5f991c59ecc6602c0eeb3e2e8cfc0d6c92d69258ad685db85d02fa0f9"
   }
 }

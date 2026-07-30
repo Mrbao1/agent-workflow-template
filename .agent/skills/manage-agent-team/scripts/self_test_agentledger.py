@@ -180,6 +180,14 @@ def age_checks(root: Path) -> None:
     for item in value["members"]:
         if item.get("status") == "active":
             item["last_check_at"] = old
+    rewrite_ledger_legacy(path, value)
+
+
+def rewrite_ledger_legacy(path: Path, value: dict[str, object]) -> None:
+    """Persist a fixture migration as a legacy ledger: validate accepts a
+    chain-less ledger once and the next save re-chains it from genesis."""
+    value.pop("revision", None)
+    value.pop("prev_sha256", None)
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
@@ -423,7 +431,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     (root / ".agent/config.json").write_text(json.dumps({
         "routing": {"modes": {
             "fast": {"max_child_agents": 0, "token_budget": 6000},
-            "standard": {"max_child_agents": 1, "token_budget": 20000},
+            "standard": {"max_child_agents": 1, "token_budget": 48000},
             "release": {
                 "max_child_agents": 3, "clean_reruns": 1,
                 "token_budget": 1000000,
@@ -553,7 +561,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         task_path.write_text(json.dumps(task_value), encoding="utf-8")
         mode_ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
         mode_ledger["token_accounting"]["token_budget"] = task_value["token_budget"]
-        (state / "agents.json").write_text(json.dumps(mode_ledger), encoding="utf-8")
+        rewrite_ledger_legacy(state / "agents.json", mode_ledger)
         output_path = root / f"{name}-sealed.json"
         evidence_before = sorted(
             (str(path.relative_to(root)), hashlib.sha256(path.read_bytes()).hexdigest())
@@ -587,7 +595,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     task_path.write_text(json.dumps(task_value), encoding="utf-8")
     release_ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     release_ledger["token_accounting"]["token_budget"] = 1000000
-    (state / "agents.json").write_text(json.dumps(release_ledger), encoding="utf-8")
+    rewrite_ledger_legacy(state / "agents.json", release_ledger)
 
     # A pre-migration fork=10 preparation remains valid and exact prepare is
     # idempotent. It may register/finish, but its replacement is a genuinely
@@ -635,7 +643,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         "handoff_envelope_sha256": historical_envelope_sha,
         "handoff_envelope_evidence": historical_record,
     })
-    (state / "agents.json").write_text(json.dumps(historical_ledger), encoding="utf-8")
+    rewrite_ledger_legacy(state / "agents.json", historical_ledger)
     run(root, "validate")
     historical_before_repeat = (state / "agents.json").read_bytes()
     prepare_dispatch(root, historical_id, role_type="worker", fork_turns=10)
@@ -751,6 +759,9 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         for action in expired_plan.get("actions", [])
     ):
         raise AssertionError("expired preparation lacks a bounded cancel action")
+    expired_validate = run(root, "validate", expected=1)
+    if "prepared dispatch expired: attester" not in expired_validate or "cancel-prepare --id attester" not in expired_validate:
+        raise AssertionError("expired prepared dispatch lacks an actionable cancel-prepare cursor")
     (state / "agents.json").write_bytes(prepared_watchdog_ledger)
     actions = (state / "budget-actions.log").read_text(encoding="utf-8").splitlines()
     if not actions or actions[-1] != "spawn-review-agent":
@@ -1331,7 +1342,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     config_path.write_text(json.dumps(stall_config), encoding="utf-8")
     stall_ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     stall_ledger["stall_timeout_seconds"] = 120
-    (state / "agents.json").write_text(json.dumps(stall_ledger), encoding="utf-8")
+    rewrite_ledger_legacy(state / "agents.json", stall_ledger)
 
     stall_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0) - dt.timedelta(seconds=121)
     stall_registration = snapshot(root, "register-stall-late", [platform_member("stall-late", "running")],
@@ -1395,7 +1406,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     config_path.write_text(json.dumps(stall_config), encoding="utf-8")
     stall_ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     stall_ledger["stall_timeout_seconds"] = 300
-    (state / "agents.json").write_text(json.dumps(stall_ledger), encoding="utf-8")
+    rewrite_ledger_legacy(state / "agents.json", stall_ledger)
 
     # Formal reviews are an immutable serial chain, not three independent labels.
     chain_id = "formal-chain-001"
@@ -1628,7 +1639,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     aborted_run = next(item for item in aborted_ledger["replay_runs"] if item["run_id"] == run_ids["a"])
     if aborted_run.get("status") != "aborted" or aborted_run.get("failure_reason") != "supervision-window-closed":
         raise AssertionError("overdue replay was not preserved as an auditable aborted authority")
-    (state / "agents.json").write_bytes(supervised_ledger)
+    rewrite_ledger_legacy(state / "agents.json", json.loads(supervised_ledger))
     if (root / "replay-a.json").exists():
         raise AssertionError("overdue integrator started a replay subprocess")
 
@@ -1876,6 +1887,66 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     (state / "agents.json").write_text(json.dumps(ledger), encoding="utf-8")
     run(root, "validate")
 
+    # P4-1: deleting a member from the editable ledger cannot erase its
+    # immutable epoch marker; the reverse marker enumeration fails closed.
+    pristine_chained_ledger = (state / "agents.json").read_bytes()
+    ledger = json.loads(pristine_chained_ledger)
+    ledger["members"] = [item for item in ledger["members"] if item.get("id") != "b"]
+    (state / "agents.json").write_text(json.dumps(ledger), encoding="utf-8")
+    deleted = run(root, "validate", expected=1)
+    if "orphan terminal marker" not in deleted:
+        raise AssertionError("member deletion escaped the reverse terminal-marker check")
+    run(root, "validate", "--require-empty", expected=1)
+    (state / "agents.json").write_bytes(pristine_chained_ledger)
+    run(root, "validate")
+
+    # A stray epoch marker without its member record is an orphan even when
+    # the editable ledger itself is untouched.
+    marker_dir = state / "evidence/agent-terminal-markers" / json.loads(pristine_chained_ledger)["epoch"]
+    orphan_marker = marker_dir / f"{hashlib.sha256(b'ghost-member').hexdigest()}.json"
+    orphan_marker.write_text(json.dumps({"schema": "agent-terminal-marker/v6"}), encoding="utf-8")
+    orphaned = run(root, "validate", expected=1)
+    if "orphan terminal marker" not in orphaned:
+        raise AssertionError("stray epoch marker escaped the reverse terminal-marker check")
+    orphan_marker.unlink()
+    run(root, "validate")
+
+    # P4-1: the append hash chain fails closed on content tampering and on
+    # active-chain journal truncation; a legacy chain-less ledger is accepted
+    # once and the next save re-chains it from genesis.
+    tampered = json.loads(pristine_chained_ledger)
+    tampered["updated_at"] = "2000-01-01T00:00:00+00:00"
+    (state / "agents.json").write_text(json.dumps(tampered), encoding="utf-8")
+    broken = run(root, "validate", expected=1)
+    if "append chain tip" not in broken:
+        raise AssertionError("ledger content tampering escaped the append hash chain")
+    (state / "agents.json").write_bytes(pristine_chained_ledger)
+    run(root, "validate")
+    chain_journal = state / "agents-chain.jsonl"
+    journal_bytes = chain_journal.read_bytes()
+    journal_lines = journal_bytes.decode(encoding="utf-8").splitlines()
+    active_genesis = max(
+        index for index, line in enumerate(journal_lines)
+        if json.loads(line).get("revision") == 1
+    )
+    chain_journal.write_text(
+        "\n".join(journal_lines[:active_genesis] + journal_lines[active_genesis + 1:]) + "\n",
+        encoding="utf-8",
+    )
+    truncated = run(root, "validate", expected=1)
+    if "chain" not in truncated:
+        raise AssertionError("active-chain journal truncation escaped the append hash chain")
+    chain_journal.write_bytes(journal_bytes)
+    run(root, "validate")
+    rewrite_ledger_legacy(state / "agents.json", json.loads(pristine_chained_ledger))
+    run(root, "validate")
+    legacy_poll = snapshot(root, "legacy-upgrade-poll", [])
+    run(root, "check", "--platform-snapshot", legacy_poll)
+    upgraded = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    if upgraded.get("revision") != 1 or upgraded.get("prev_sha256") is not None:
+        raise AssertionError("legacy ledger was not upgraded to a fresh chain genesis")
+    run(root, "validate")
+
     # Internal content-addressed evidence is fail-closed if tampered with.  The
     # bounded recovery is an explicit empty-platform reinitialization which
     # archives the damaged ledger instead of silently re-signing old facts.
@@ -1908,5 +1979,129 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     recovered = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     if not recovered.get("migration_source"):
         raise AssertionError("audited recovery did not retain the archived damaged ledger receipt")
+
+    # P4-2/P4-4 endgame: a fresh standard-mode epoch whose local decision
+    # boundary (policy v2) permits recorded human decisions.
+    task_value = json.loads(task_path.read_text(encoding="utf-8"))
+    task_value.update({
+        "mode": "standard", "token_budget": 48000,
+        "decision_policy_version": 2, "environment": "local",
+        "deployment_requested": False, "risk_flags": {},
+    })
+    task_path.write_text(json.dumps(task_value), encoding="utf-8")
+    endgame_empty = snapshot(root, "endgame-empty", [])
+    run(root, "init", "--platform-snapshot", endgame_empty)
+
+    def register_active(agent_id: str, started: dt.datetime) -> None:
+        registration = snapshot(root, f"register-{agent_id}", [platform_member(agent_id, "running")],
+                                observed_at=started)
+        prepare_dispatch(root, agent_id)
+        run(root, "register", "--id", agent_id, "--role-type", "reviewer", "--role", "reviewer",
+            "--task", agent_id, "--model", "gpt-5.6-sol", "--fork-turns", "0",
+            "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{agent_id}.json",
+            "--deadline-minutes", "5", "--progress-hash", seed,
+            "--platform-snapshot", registration)
+
+    counter_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0) - dt.timedelta(seconds=120)
+    register_active("lost-counter", counter_started)
+
+    # P4-2: archive-reset refuses while any member is non-terminal.
+    refused = run(root, "init", "--archive-existing", "--platform-snapshot", endgame_empty, expected=1)
+    if "--force" not in refused or "ledger-force-reset" not in refused:
+        raise AssertionError("archive-reset with an active member lacks the audited force cursor")
+    run(root, "init", "--archive-existing", "--force", "--force-reason", "abandon a wedged child",
+        "--platform-snapshot", endgame_empty, expected=1)
+    ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    if next(item for item in ledger["members"] if item["id"] == "lost-counter")["status"] != "active":
+        raise AssertionError("refused archive-reset mutated the ledger")
+
+    # P4-4: below the missing-observation threshold, finish --lost requires a
+    # human decision; three consecutive absent snapshots unlock it.
+    run(root, "finish", "--id", "lost-counter", "--status", "lost", "--conclusion", "vanished",
+        "--platform-snapshot", endgame_empty, expected=1)
+    run(root, "finish", "--id", "lost-counter", "--status", "lost", "--lost", "--conclusion", "vanished",
+        "--platform-snapshot", endgame_empty, expected=1)
+    lost_polls = []
+    for index in (1, 2, 3):
+        poll = snapshot(root, f"lost-poll-{index}", [],
+                        observed_at=counter_started + dt.timedelta(seconds=30 * index))
+        lost_polls.append(poll)
+        run(root, "check", "--platform-snapshot", poll, expected=4)
+    ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    if next(item for item in ledger["members"] if item["id"] == "lost-counter").get("missing_observations") != 3:
+        raise AssertionError("consecutive absent snapshots did not accumulate missing observations")
+    lost_plan = json.loads(run(root, "watchdog-plan"))
+    if not any(
+        action.get("action") == "finish-lost" and action.get("id") == "lost-counter"
+        for action in lost_plan.get("actions", [])
+    ):
+        raise AssertionError("watchdog plan does not recommend finish --lost for a missing child")
+    run(root, "finish", "--id", "lost-counter", "--status", "lost", "--lost",
+        "--conclusion", "child vanished from the platform",
+        "--platform-snapshot", lost_polls[-1])
+    ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    counter_member = next(item for item in ledger["members"] if item["id"] == "lost-counter")
+    counter_reservation = next(
+        item for item in ledger["prepared_dispatches"] if item["id"] == "lost-counter"
+    )["token_reservation"]
+    if (
+        counter_member["status"] != "lost"
+        or counter_reservation["status"] != "released"
+        or counter_reservation["closed_at"] != counter_member["terminal_observed_at"]
+    ):
+        raise AssertionError("finish --lost did not settle the reservation as released")
+    run(root, "validate")
+
+    # The same exit is reachable below the observation threshold through a
+    # recorded human decision bound to the member.
+    decision_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    register_active("lost-decision", decision_started)
+    decision_empty = snapshot(root, "decision-empty", [])
+    run(root, "finish", "--id", "lost-decision", "--status", "lost", "--lost",
+        "--conclusion", "human declared the child lost",
+        "--source", "user:the platform lost this child permanently",
+        "--platform-snapshot", decision_empty)
+    ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    decision_member = next(item for item in ledger["members"] if item["id"] == "lost-decision")
+    if decision_member["status"] != "lost" or not isinstance(decision_member.get("lost_decision"), dict):
+        raise AssertionError("human-decision finish --lost did not record its bound decision")
+    run(root, "validate")
+
+    # lost is terminal everywhere: require-empty passes with two lost members.
+    require_empty_snapshot = snapshot(root, "lost-require-empty", [])
+    run(root, "validate", "--require-empty", "--platform-snapshot", require_empty_snapshot)
+
+    # P4-2: the audited force path archives the wedged ledger with its bound
+    # decision and starts a new epoch; prior-epoch markers stay on disk but
+    # are scoped to their own epoch.
+    force_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    register_active("force-active", force_started)
+    run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
+    forced_empty = snapshot(root, "forced-empty", [])
+    run(root, "init", "--archive-existing", "--force", "--force-reason", "abandon a wedged child",
+        "--source", "user:reset the wedged ledger",
+        "--platform-snapshot", forced_empty)
+    recovered = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    archive_record = recovered.get("migration_source")
+    if not archive_record:
+        raise AssertionError("forced reset did not retain its archive receipt")
+    archive = json.loads((root / archive_record["path"]).read_text(encoding="utf-8"))
+    if (
+        archive.get("schema") != "agent-ledger-force-archive/v1"
+        or archive.get("force_reason") != "abandon a wedged child"
+        or archive.get("ledger_sha256") != archive.get("decision", {}).get("artifact_sha256")
+        or archive.get("decision", {}).get("gate") != "ledger-force-reset"
+        or not isinstance(archive.get("decision", {}).get("approval"), dict)
+        or not any(item.get("id") == "force-active" for item in archive.get("ledger", {}).get("members", []))
+    ):
+        raise AssertionError("forced reset archive lacks its reason, bound decision or prior ledger")
+    prior_marker_dirs = [
+        path for path in (state / "evidence/agent-terminal-markers").iterdir()
+        if path.is_dir() and path.name != recovered["epoch"] and any(path.iterdir())
+    ]
+    if not prior_marker_dirs:
+        raise AssertionError("forced reset erased the prior epoch terminal markers")
+    post_force_empty = snapshot(root, "post-force-empty", [])
+    run(root, "validate", "--require-empty", "--platform-snapshot", post_force_empty)
 
 print("AGENT LEDGER SELF-TEST PASSED: serial review chain, six-lens cross review, one preflighted clean replay and marker-bound results")

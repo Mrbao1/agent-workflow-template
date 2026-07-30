@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -31,6 +32,15 @@ import contexttx
 import humandecision
 from workflowlib import budget as total_budget
 from workflowlib import state as workflow_state
+
+try:
+    import deliveryctl
+except ImportError:  # adversarial test fixtures may ship a script subset
+    deliveryctl = None
+try:
+    import evidencectl
+except ImportError:
+    evidencectl = None
 
 
 def find_agent_dir() -> Path:
@@ -63,6 +73,14 @@ CONTEXT_PATH = AGENT_DIR / "state" / "CONTEXT.json"
 TEST_BUDGET_PATH = AGENT_DIR / "state" / "test-budget.json"
 RUNTIME_LOCK_PATH = AGENT_DIR / "state" / ".runtime.lock"
 TOOL_LEASES_LOCK_PATH = AGENT_DIR / "state" / ".tool-leases.lock"
+DELIVERY_PATH = AGENT_DIR / "state" / "delivery.json"
+KNOWLEDGE_PENDING_PATH = AGENT_DIR / "state" / "knowledge-pending.json"
+KNOWLEDGE_INDEX_PATH = AGENT_DIR / "knowledge" / "INDEX.md"
+CAPABILITIES_INDEX_PATH = AGENT_DIR / "capabilities" / "INDEX.md"
+CONTEXT_AUTH_DIR = AGENT_DIR / "state" / ".context-authorizations"
+CONTEXT_AUTHORIZATION_TTL_SECONDS = 60
+TASK_ARCHIVE_HEAD_FIELDS = {"schema", "path", "sha256", "bytes", "total_archives"}
+TASK_ARCHIVE_PAYLOAD_SCHEMAS = {"agent-task-archive/v1", "agent-task-archive/v2"}
 CONTRACT_FIELDS = (
     "Goal", "Users", "Success", "In scope", "Out of scope", "Constraints",
     "Data and permissions", "Target environment", "Acceptance", "Provenance",
@@ -808,7 +826,7 @@ def audited_tool_allowances() -> Tuple[set[str], set[int], List[str]]:
     return identities, groups, errors
 
 
-def capture_runtime_baseline(source: str) -> int:
+def capture_runtime_baseline(source: str, *, confirm_existing: bool = False) -> int:
     if not (source == "agentctl:start" or source.startswith("user:")):
         raise SystemExit("runtime baseline source must be agentctl:start or user:<decision>")
     observed = stable_project_processes()
@@ -817,6 +835,27 @@ def capture_runtime_baseline(source: str) -> int:
     with locked_runtime() as runtime:
         if any(runtime.get(key) for key in ("processes", "docker_projects", "ports")):
             raise SystemExit("cannot capture a runtime baseline while registered resources remain")
+        if observed and not confirm_existing:
+            # Absorbing pre-existing processes into a fresh baseline would make
+            # them invisible to every later assert-clean delta.  Recapturing
+            # the SAME identities a previous baseline already recorded is a
+            # no-op refresh and needs no new confirmation.
+            baseline = runtime.get("baseline")
+            previous = baseline.get("project_processes") if isinstance(baseline, dict) else None
+            known = {
+                process_identity(item) for item in previous if isinstance(item, dict)
+            } if isinstance(previous, list) else set()
+            new = [item for item in observed if process_identity(item) not in known]
+            if new:
+                listing = "; ".join(
+                    f"pid={item.get('pid')} command={item.get('command')}" for item in new[:5]
+                )
+                raise SystemExit(
+                    "unregistered project processes already exist and would be silently absorbed "
+                    f"into the runtime baseline: {listing}; stop or register them first, or rerun "
+                    "capture-runtime-baseline --source user:<decision> --confirm-existing-processes "
+                    "to bless them explicitly"
+                )
         runtime.clear()
         runtime.update({
             "schema": "agent-runtime/v2",
@@ -824,9 +863,12 @@ def capture_runtime_baseline(source: str) -> int:
                 "source": source,
                 "captured_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
                 "project_processes": observed,
+                "confirmed_existing_processes": len(observed),
             },
             "processes": [], "docker_projects": [], "ports": [],
         })
+    if observed:
+        print(f"RUNTIME BASELINE WARNING: {len(observed)} pre-existing project process(es) recorded in baseline")
     print(f"RUNTIME BASELINE CAPTURED: project_processes={len(observed)}")
     return 0
 
@@ -1027,6 +1069,7 @@ def docker_residual(project: str) -> Optional[Dict[str, int]]:
     commands = {
         "containers": ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}"],
         "networks": ["docker", "network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"],
+        "volumes": ["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"],
     }
     result = {}
     for name, command in commands.items():
@@ -1046,11 +1089,17 @@ def docker_identity_valid(item: Dict[str, object]) -> bool:
     files = item.get("files")
     if not isinstance(files, list) or not files or any(not isinstance(path, str) for path in files):
         return False
-    payload = json.dumps(
-        {"project": item["project"], "workdir": item["workdir"], "files": files},
-        sort_keys=True, separators=(",", ":"),
-    ).encode()
-    return item.get("identity_sha256") == hashlib.sha256(payload).hexdigest()
+    volumes = item.get("volumes")
+    if volumes is not None and (
+        not isinstance(volumes, list)
+        or any(not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", name) for name in volumes)
+    ):
+        return False
+    payload = {"project": item["project"], "workdir": item["workdir"], "files": files}
+    if volumes is not None:
+        payload["volumes"] = volumes
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return item.get("identity_sha256") == hashlib.sha256(data).hexdigest()
 
 
 def contract_values() -> Dict[str, str]:
@@ -1551,10 +1600,15 @@ def command_validate() -> int:
     except (OSError, ValueError, json.JSONDecodeError):
         errors.append("atomic candidate test budget registry is missing or invalid")
     context_policy = config.get("context", {})
-    transition_increments = (
-        context_policy.get("automatic_transition_token_increment")
-        if isinstance(context_policy, dict) else None
-    )
+    if isinstance(context_policy, dict):
+        transition_increments, _ = total_budget.turn_overhead_policy(config)
+        transition_configured = isinstance(
+            context_policy.get(total_budget.TURN_OVERHEAD_KEY), dict
+        ) or isinstance(
+            context_policy.get(total_budget.LEGACY_TURN_OVERHEAD_KEY), dict
+        )
+    else:
+        transition_increments, transition_configured = {}, False
     if (
         not isinstance(context_policy, dict)
         or not isinstance(context_policy.get("max_rollback_entries"), int)
@@ -1569,7 +1623,7 @@ def command_validate() -> int:
     ):
         errors.append("context rollback/failure hot-state or cold-chain limits are invalid")
     if (
-        not isinstance(transition_increments, dict)
+        not transition_configured
         or set(transition_increments) != {"fast", "standard", "release"}
         or any(
             not isinstance(value, int) or isinstance(value, bool) or value < 50
@@ -1580,13 +1634,13 @@ def command_validate() -> int:
             <= transition_increments.get("standard", 0)
             <= transition_increments.get("release", 0)
         )
-        or any(
-            transition_increments.get(mode, 0)
-            > int(configured_modes.get(mode, {}).get("token_budget", 0)) * 0.1
-            for mode in ("fast", "standard", "release")
-        )
     ):
-        errors.append("context automatic-transition token increments are missing or make a mode unusable")
+        errors.append(
+            "context estimated turn-overhead tokens are missing or invalid "
+            "(context.estimated_turn_overhead_tokens; deprecated alias "
+            "context.automatic_transition_token_increment)"
+        )
+    errors.extend(total_budget.config_budget_errors(config))
     retention = config.get("evidence_retention")
     if (
         not isinstance(retention, dict)
@@ -1695,9 +1749,15 @@ def command_validate() -> int:
         or not isinstance(agent_policy.get("default_fork_turns"), int)
         or isinstance(agent_policy.get("default_fork_turns"), bool)
         or int(agent_policy.get("default_fork_turns", -1)) != 0
-        or agent_policy.get("inherited_turn_estimated_tokens") != 800
-        or agent_policy.get("child_system_tool_margin_tokens") != 1000
-        or agent_policy.get("child_output_margin_tokens") != 2000
+        or not isinstance(agent_policy.get("inherited_turn_estimated_tokens"), int)
+        or isinstance(agent_policy.get("inherited_turn_estimated_tokens"), bool)
+        or agent_policy.get("inherited_turn_estimated_tokens", -1) < 0
+        or not isinstance(agent_policy.get("child_system_tool_margin_tokens"), int)
+        or isinstance(agent_policy.get("child_system_tool_margin_tokens"), bool)
+        or agent_policy.get("child_system_tool_margin_tokens", -1) < 0
+        or not isinstance(agent_policy.get("child_output_margin_tokens"), int)
+        or isinstance(agent_policy.get("child_output_margin_tokens"), bool)
+        or agent_policy.get("child_output_margin_tokens", -1) < 0
         or not isinstance(agent_policy.get("scheduler"), dict)
         or set(agent_policy.get("scheduler", {})) != {"source", "signed_adapter", "automatic_resume", "max_receipt_age_seconds"}
         or agent_policy.get("scheduler", {}).get("source") != "host-scheduler"
@@ -2222,6 +2282,21 @@ def command_bootstrap_check() -> int:
     if command_validate():
         return 1
     config = load_json(CONFIG_PATH)
+    adapters = config.get("acceptance_adapters")
+    if isinstance(adapters, dict):
+        # `implemented: true` is a self-declaration; probe the host facts it
+        # depends on and warn (never block) when they are absent.
+        for name, adapter in sorted(adapters.items()):
+            if not isinstance(adapter, dict) or adapter.get("implemented") is not True:
+                continue
+            runner = adapter.get("runner")
+            runner_path = (AGENT_DIR.parent / str(runner)).resolve() if isinstance(runner, str) else None
+            if runner_path is None or not runner_path.is_file():
+                print(f"BOOTSTRAP WARNING: acceptance adapter {name} declares implemented=true but its runner is missing: {runner}")
+            if "docker" in str(name) and shutil.which("docker") is None:
+                print(f"BOOTSTRAP WARNING: acceptance adapter {name} declares implemented=true but docker is not on PATH")
+            if "ios" in str(name) and shutil.which("xcodebuild") is None:
+                print(f"BOOTSTRAP WARNING: acceptance adapter {name} declares implemented=true but xcodebuild is not on PATH")
     if config.get("guardrails_ready") is not True:
         print("BOOTSTRAP NOT READY: project guardrails are uninitialized")
         print("NEXT: python3 .agent/scripts/agentctl.py project-init --guardrails-file <project-guardrails.md>")
@@ -2338,6 +2413,25 @@ def _content_addressed_json(directory: str, value: Dict[str, object]) -> Tuple[P
     }
 
 
+def stored_requirement_approval_valid(task: Dict[str, object], config: Dict[str, object]) -> bool:
+    """Re-validate the persisted requirement approval under the task's stored policy."""
+    approvals = task.get("gate_approvals")
+    requirement = approvals.get("requirement") if isinstance(approvals, dict) else None
+    artifact = str(task.get("requirement_contract_sha256") or "")
+    if requirement is None or re.fullmatch(r"[0-9a-f]{64}", artifact) is None:
+        return False
+    record = (
+        requirement.get("decision_receipt")
+        if task.get("decision_policy_version") == humandecision.PROVIDER_POLICY_VERSION
+        and isinstance(requirement, dict)
+        else requirement
+    )
+    return humandecision.decision_approval_valid(
+        AGENT_DIR.parent.resolve(), config, task, gate="requirement",
+        artifact_sha256=artifact, source=str(task.get("requirement_source", "")), record=record,
+    )
+
+
 def command_escalate_mode(args: argparse.Namespace) -> int:
     """Atomically add risk and/or move to a stricter mode; never downgrade."""
     task = load_json(TASK_PATH); config = load_json(CONFIG_PATH); before = copy.deepcopy(task)
@@ -2358,6 +2452,47 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
         raise SystemExit(str(error))
     if mode == task.get("mode") and risks == task.get("risk_flags") and requested_files == int(task.get("files", 0)):
         raise SystemExit("mode/risk update is a no-op")
+    if (args.source or args.human_decision_receipt) and not args.reapprove:
+        raise SystemExit("--source and --human-decision-receipt are valid only with --reapprove")
+    new_policy_version = humandecision.decision_policy_version(
+        config, mode=mode, environment=str(task.get("environment")),
+        deployment_requested=bool(task.get("deployment_requested")), risk_flags=risks,
+    )
+    approvals = task.get("gate_approvals")
+    requirement_approval = approvals.get("requirement") if isinstance(approvals, dict) else None
+    contract_hash = str(task.get("requirement_contract_sha256") or "")
+    reapproval: Optional[Dict[str, object]] = None
+    if task.get("requirements_clarified") is True and requirement_approval is not None:
+        # The stored approval was issued under the OLD policy and routing
+        # profile.  Never commit an escalation that leaves the task with an
+        # approval the NEW policy will reject on every later transition.
+        probe = {
+            **task, "mode": mode, "risk_flags": risks, "files": requested_files,
+            "decision_policy_version": new_policy_version,
+        }
+        if not CONTRACT_PATH.is_file() or hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest() != contract_hash:
+            raise SystemExit("approved requirement contract bytes are missing or drifted; repair before escalating")
+        if args.reapprove:
+            if not str(args.source or "").startswith("user:"):
+                raise SystemExit("escalate-mode --reapprove requires --source user:<decision>")
+            reapproval = humandecision.record_decision_approval(
+                AGENT_DIR.parent.resolve(), config, probe, gate="requirement",
+                artifact_sha256=contract_hash, source=str(args.source),
+                receipt=args.human_decision_receipt,
+            )
+        elif not stored_requirement_approval_valid(probe, config):
+            remedy = (
+                f"rerun with --reapprove --source user:<decision> --human-decision-receipt <path> "
+                f"to re-approve the requirement under the new provider-signed policy"
+                if new_policy_version == humandecision.PROVIDER_POLICY_VERSION
+                else "rerun with --reapprove --source user:<decision> to re-approve the requirement under the new routing profile"
+            )
+            raise SystemExit(
+                "mode/risk escalation would invalidate the current requirement approval under the "
+                f"new decision policy (v{new_policy_version}); refusing to commit a dead state — {remedy}"
+            )
+    elif args.reapprove:
+        raise SystemExit("--reapprove requires an approved requirement contract")
     ledger = load_json(AGENTS_PATH)
     preparations = ledger.get("prepared_dispatches", [])
     members = ledger.get("members", [])
@@ -2381,10 +2516,8 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
     task.update({
         "mode": mode, "risk_flags": risks, "files": requested_files,
         "token_budget": int(config["routing"]["modes"][mode]["token_budget"]),
-        "decision_policy_version": humandecision.decision_policy_version(
-            config, mode=mode, environment=str(task.get("environment")),
-            deployment_requested=bool(task.get("deployment_requested")), risk_flags=risks,
-        ),
+        "decision_policy_version": new_policy_version,
+        "projection": workflow_state.task_projection(str(task.get("task_type")), mode),
         "selected_templates": ["requirement-contract"], "selected_capabilities": ["core"],
         "template_route": None, "rendered_artifacts": [], "current_node": 2,
         "accepted_nodes": [0, 1],
@@ -2394,6 +2527,15 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
         "mode_status": "confirmed", "next_action": "reroute templates after mode/risk escalation",
         "route_archive": archive_record, "updated": time.strftime("%Y-%m-%d"),
     })
+    if reapproval is not None:
+        task["requirement_source"] = str(args.source)
+        task["gate_approvals"] = {
+            "requirement": (
+                {"source": str(args.source), "artifact_sha256": contract_hash, "decision_receipt": reapproval}
+                if new_policy_version == humandecision.PROVIDER_POLICY_VERSION
+                else reapproval
+            )
+        }
     ledger["token_accounting"]["token_budget"] = task["token_budget"]
     ledger_data = (json.dumps(ledger, ensure_ascii=False, indent=2) + "\n").encode()
     task["budget_state"] = budget_snapshot(task, config)["state"]
@@ -2452,6 +2594,66 @@ def command_reopen_clarification(args: argparse.Namespace) -> int:
     return 0
 
 
+def _task_archive_chain_checked(head: object) -> None:
+    """Fully verify the existing head chain before anchoring a new archive to it."""
+    if head is None:
+        return
+    if evidencectl is not None:
+        evidencectl.task_archive_chain(head)
+        return
+    # Mirror evidencectl.task_archive_chain when the controller is unavailable.
+    current = head
+    seen: set[str] = set()
+    while current is not None:
+        if (
+            not isinstance(current, dict) or set(current) != TASK_ARCHIVE_HEAD_FIELDS
+            or current.get("schema") != "agent-task-archive-head/v1"
+            or re.fullmatch(r"[0-9a-f]{64}", str(current.get("sha256", ""))) is None
+            or not isinstance(current.get("bytes"), int) or current["bytes"] < 1
+            or not isinstance(current.get("total_archives"), int) or current["total_archives"] < 1
+        ):
+            raise SystemExit("task archive head is invalid")
+        value_sha = str(current["sha256"])
+        path = (AGENT_DIR.parent / str(current.get("path", ""))).resolve()
+        expected = (TASK_ARCHIVE_DIR / f"{value_sha}.json").resolve()
+        if path != expected or value_sha in seen or not path.is_file() or path.is_symlink():
+            raise SystemExit("task archive head path is invalid or missing")
+        seen.add(value_sha)
+        data = path.read_bytes()
+        if len(data) != current["bytes"] or hashlib.sha256(data).hexdigest() != value_sha:
+            raise SystemExit("task archive bytes drifted")
+        try:
+            payload = json.loads(data)
+        except (ValueError, json.JSONDecodeError) as error:
+            raise SystemExit(f"task archive payload is unreadable: {error}")
+        if not isinstance(payload, dict) or payload.get("schema") not in TASK_ARCHIVE_PAYLOAD_SCHEMAS:
+            raise SystemExit("task archive payload schema is invalid")
+        current = payload.get("previous")
+
+
+def _current_delivery_bytes() -> Optional[bytes]:
+    if deliveryctl is not None:
+        return deliveryctl.current_delivery_bytes()
+    if not DELIVERY_PATH.is_file() or DELIVERY_PATH.is_symlink():
+        return None
+    return DELIVERY_PATH.read_bytes()
+
+
+def _referenced_evidence_digests(texts: Sequence[str]) -> List[str]:
+    """Digests of active evidence files whose literal paths appear in the archived texts."""
+    evidence_dir = AGENT_DIR / "state" / "evidence"
+    referenced: set[str] = set()
+    if not evidence_dir.is_dir():
+        return []
+    for path in sorted(evidence_dir.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = str(path.relative_to(AGENT_DIR.parent))
+        if any(relative in text for text in texts):
+            referenced.add(hashlib.sha256(path.read_bytes()).hexdigest())
+    return sorted(referenced)
+
+
 def build_task_archive(
     previous_task: Dict[str, object], *, source: str, reason: str,
     decision_receipt: Optional[Dict[str, object]], assurance: str,
@@ -2465,10 +2667,26 @@ def build_task_archive(
             "bytes": len(contract_bytes),
             "utf8": contract_bytes.decode("utf-8"),
         }
+    delivery_bytes = _current_delivery_bytes()
+    delivery_record = None
+    if delivery_bytes is not None:
+        delivery_record = {
+            "sha256": hashlib.sha256(delivery_bytes).hexdigest(),
+            "bytes": len(delivery_bytes),
+            "utf8": delivery_bytes.decode("utf-8"),
+        }
     previous = previous_task.get("task_archive")
+    _task_archive_chain_checked(previous)
     previous_total = previous.get("total_archives", 0) if isinstance(previous, dict) else 0
+    # v2 payloads are never textually scanned: every active evidence file the
+    # archived texts still reference must be digest-bound here to stay reachable.
+    texts = [task_bytes.decode("utf-8")]
+    if contract_record is not None:
+        texts.append(str(contract_record["utf8"]))
+    if delivery_record is not None:
+        texts.append(str(delivery_record["utf8"]))
     payload = {
-        "schema": "agent-task-archive/v1",
+        "schema": "agent-task-archive/v2",
         "archived_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         "source": source,
         "reason": reason,
@@ -2480,6 +2698,8 @@ def build_task_archive(
             "utf8": task_bytes.decode("utf-8"),
         },
         "requirement_contract": contract_record,
+        "delivery": delivery_record,
+        "referenced_evidence": _referenced_evidence_digests(texts),
         "previous": previous,
     }
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -2493,6 +2713,52 @@ def build_task_archive(
         "total_archives": previous_total + 1,
     }
     return head, AGENT_DIR.parent / relative, data
+
+
+def load_knowledge_pending() -> Dict[str, object]:
+    if not KNOWLEDGE_PENDING_PATH.is_file():
+        return {"schema": "agent-knowledge-pending/v1", "candidates": [], "promotions": []}
+    value = load_json(KNOWLEDGE_PENDING_PATH)
+    if (
+        value.get("schema") != "agent-knowledge-pending/v1"
+        or not isinstance(value.get("candidates"), list)
+        or not isinstance(value.get("promotions"), list)
+    ):
+        raise SystemExit("knowledge pending registry is malformed")
+    return value
+
+
+def knowledge_pending_side_effect(previous_task: Dict[str, object]) -> Optional[Tuple[Path, bytes]]:
+    """Carry retrospective candidates out of an archived TASK into the pending registry."""
+    candidates = previous_task.get("knowledge_candidates")
+    if not isinstance(candidates, list):
+        return None
+    texts = [item.strip() for item in candidates if isinstance(item, str) and item.strip()]
+    if not texts:
+        return None
+    pending = load_knowledge_pending()
+    recorded = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    for text in texts:
+        pending["candidates"].append({
+            "candidate": text,
+            "task_title": str(previous_task.get("title", "")),
+            "recorded_at": recorded,
+        })
+    data = (json.dumps(pending, ensure_ascii=False, indent=2) + "\n").encode()
+    return KNOWLEDGE_PENDING_PATH, data
+
+
+def knowledge_pending_notice() -> Optional[str]:
+    if not KNOWLEDGE_PENDING_PATH.is_file():
+        return None
+    try:
+        pending = load_knowledge_pending()
+    except SystemExit:
+        return "knowledge pending registry is malformed; inspect .agent/state/knowledge-pending.json"
+    count = len(pending["candidates"])
+    if not count:
+        return None
+    return f"{count} retrospective knowledge candidate(s) await `agentctl.py promote-knowledge`"
 
 
 def command_start(args: argparse.Namespace) -> int:
@@ -2560,6 +2826,17 @@ def command_start(args: argparse.Namespace) -> int:
         config, mode=mode, environment=args.environment,
         deployment_requested=bool(args.deploy), risk_flags=risk_flags,
     )
+    node0_errors: List[str] = []
+    if not args.title.strip():
+        node0_errors.append("title must be non-empty")
+    if args.task_type not in {"product", "release", "maintenance", "governance", "documentation"}:
+        node0_errors.append(f"task_type is invalid: {args.task_type}")
+    if mode not in {"fast", "standard", "release"}:
+        node0_errors.append(f"mode is invalid: {mode}")
+    if decision_policy_version not in {humandecision.PROVIDER_POLICY_VERSION, humandecision.LOCAL_POLICY_VERSION}:
+        node0_errors.append("routing decision receipt (decision_policy_version) is missing")
+    if node0_errors:
+        raise SystemExit("node 0 minimal contract failed; refusing start: " + "; ".join(node0_errors))
     # Starting a task grants no implementation or delivery authority. A
     # protected task must therefore be allowed to enter clarification even
     # when the provider-owned decision adapter is not configured yet. The
@@ -2601,6 +2878,9 @@ def command_start(args: argparse.Namespace) -> int:
             decision_receipt=None, assurance="completed-workflow-checkpoint",
         )
         archive_side_effect = (archive_path, archive_data)
+    knowledge_side_effect = (
+        knowledge_pending_side_effect(previous_task) if archive_side_effect is not None else None
+    )
     task = {
         "schema": "agent-task/v2", "title": args.title, "mode": mode,
         "task_type": args.task_type, "complexity": args.complexity, "files": args.files,
@@ -2613,6 +2893,7 @@ def command_start(args: argparse.Namespace) -> int:
         "loaded_references": [], "selected_templates": ["requirement-contract"], "selected_capabilities": ["core"], "template_route": None, "rendered_artifacts": [], "decisions": [], "open_questions": ["requirement contract approval"],
         "current_node": 1, "accepted_nodes": [0], "node_artifacts": {}, "gate_approvals": {}, "pending_gate_artifacts": {},
         "production_provider": None,
+        "projection": workflow_state.task_projection(args.task_type, mode),
         "rollback_ledger": [], "rollback_archive": None,
         "failure_ledger": {}, "failure_archive": None, "mode_status": "provisional",
         "decision_policy_version": decision_policy_version,
@@ -2643,12 +2924,16 @@ def command_start(args: argparse.Namespace) -> int:
             (CONTRACT_PATH, contract_data), (TEST_BUDGET_PATH, test_budget_data),
             (AGENTS_PATH, agents_data),
             *([archive_side_effect] if archive_side_effect is not None else []),
+            *([knowledge_side_effect] if knowledge_side_effect is not None else []),
         ],
     )
     delivery = subprocess.run([sys.executable, str(AGENT_DIR / "scripts" / "deliveryctl.py"), "init"], cwd=str(AGENT_DIR.parent))
     if delivery.returncode:
         raise SystemExit("failed to initialize delivery state")
     write_stage(task, 1, 0, "waiting_human", "clarify and approve the requirement contract")
+    notice = knowledge_pending_notice()
+    if notice is not None:
+        print(f"KNOWLEDGE PENDING: {notice}")
     print(f"STARTED {mode} task in clarification; implementation is blocked")
     return 0
 
@@ -2715,6 +3000,66 @@ def command_approve(args: argparse.Namespace) -> int:
     )
     write_stage(task, 2, 1, "in_progress", "select templates and write tests before implementation")
     print("REQUIREMENTS APPROVED")
+    return 0
+
+
+def command_promote_knowledge(args: argparse.Namespace) -> int:
+    """Promote one pending retrospective candidate into a durable index, with receipt."""
+    if not str(args.source).startswith("user:"):
+        raise SystemExit("knowledge promotion requires --source user:<decision>")
+    pending = load_knowledge_pending()
+    candidates = pending["candidates"]
+    if not 0 <= args.index < len(candidates):
+        raise SystemExit(f"knowledge candidate index out of range: {args.index} (pending={len(candidates)})")
+    entry = candidates[args.index]
+    if not isinstance(entry, dict) or not isinstance(entry.get("candidate"), str) or not entry["candidate"].strip():
+        raise SystemExit("knowledge candidate record is malformed")
+    candidate = entry["candidate"].strip()
+    promoted_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    if args.target == "knowledge":
+        index_path = KNOWLEDGE_INDEX_PATH
+        if not index_path.is_file():
+            raise SystemExit("knowledge index is missing")
+        lines = index_path.read_text(encoding="utf-8").splitlines()
+        try:
+            heading = lines.index("## Promoted rules")
+        except ValueError:
+            raise SystemExit("knowledge index lacks its '## Promoted rules' section")
+        bullet = f"- {candidate} (promoted from task '{entry.get('task_title', '')}' on {promoted_at[:10]}; source {args.source})"
+        insert_at = heading + 1
+        while insert_at < len(lines) and not lines[insert_at].strip():
+            insert_at += 1
+        lines.insert(insert_at, bullet)
+    else:
+        if not args.entry or not args.contract:
+            raise SystemExit("capability promotion requires --entry <path> and --contract <summary>")
+        index_path = CAPABILITIES_INDEX_PATH
+        if not index_path.is_file():
+            raise SystemExit("capability registry is missing")
+        lines = index_path.read_text(encoding="utf-8").splitlines()
+        separator = next(
+            (index for index, line in enumerate(lines) if re.fullmatch(r"\|[-\s|]+\|", line.strip())),
+            None,
+        )
+        if separator is None:
+            raise SystemExit("capability registry lacks its capability table")
+        lines.insert(separator + 1, f"| {candidate} | `{args.entry}` | {args.contract} |")
+    receipt = {
+        "candidate": candidate,
+        "task_title": entry.get("task_title"),
+        "target": args.target,
+        "source": args.source,
+        "promoted_at": promoted_at,
+        "index": str(index_path.relative_to(AGENT_DIR.parent)),
+    }
+    updated = {
+        **pending,
+        "candidates": [*candidates[: args.index], *candidates[args.index + 1:]],
+        "promotions": [*pending["promotions"], receipt],
+    }
+    atomic_write(index_path, "\n".join(lines) + "\n")
+    atomic_write(KNOWLEDGE_PENDING_PATH, json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
+    print(f"KNOWLEDGE PROMOTED: {args.target} index updated; {len(updated['candidates'])} candidate(s) remain pending")
     return 0
 
 
@@ -2869,6 +3214,17 @@ except OSError as error:
     child_env = os.environ.copy()
     child_env["AGENT_TOOL_GATE_FD"] = str(gate_read)
     child_env["AGENT_TOOL_COMMAND_JSON"] = json.dumps(command)
+    previous_handlers = {}
+
+    def handle_signal(signum, _frame):
+        raise ManagedRunSignal(signum)
+
+    # Install interruption handlers BEFORE the leased group exists so a signal
+    # landing between Popen and the wait loop still unwinds through the
+    # termination path instead of stranding the group (mirrors managed-run).
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_signal)
     process = subprocess.Popen(
         [sys.executable, "-c", launcher], cwd=str(AGENT_DIR.parent), start_new_session=True,
         pass_fds=(gate_read,), env=child_env,
@@ -2887,6 +3243,8 @@ except OSError as error:
         os.close(gate_write)
         signal_process_group(pgid, signal.SIGKILL)
         process.wait(timeout=2)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         raise SystemExit("tool-run could not establish exact isolated process identities")
     process_record = {key: snapshot[key] for key in ("pid", "pgid", "start_time", "command", "cwd")}
     process_record.update({"name": args.name, "kind": "foreground-tool", "scope": "isolated_process_group"})
@@ -2906,20 +3264,14 @@ except OSError as error:
             os.close(gate_write)
             signal_process_group(pgid, signal.SIGKILL)
             process.wait(timeout=2)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
             raise SystemExit("tool lease registry schema is invalid")
         state["leases"].append(lease)
     try:
         os.write(gate_write, b"1")
     finally:
         os.close(gate_write)
-    previous_handlers = {}
-
-    def handle_signal(signum, _frame):
-        raise ManagedRunSignal(signum)
-
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, handle_signal)
     outcome = 1
     try:
         try:
@@ -2981,14 +3333,19 @@ def command_register_docker(args: argparse.Namespace) -> int:
         raise SystemExit("Docker Compose files must be unique")
     if not workdir.is_dir() or any(not Path(path).is_file() for path in files):
         raise SystemExit("registered Docker workdir and compose files must exist")
-    identity_payload = json.dumps(
-        {"project": args.project, "workdir": str(workdir), "files": files},
-        sort_keys=True, separators=(",", ":"),
-    ).encode()
+    volumes = sorted(set(args.volume or []))
+    if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", name) for name in volumes):
+        raise SystemExit("declared Docker named volumes must be valid volume names")
+    identity = {"project": args.project, "workdir": str(workdir), "files": files}
+    if volumes:
+        identity["volumes"] = volumes
+    identity_payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     record = {
         "project": args.project, "workdir": str(workdir), "files": files,
         "identity_sha256": hashlib.sha256(identity_payload).hexdigest(),
     }
+    if volumes:
+        record["volumes"] = volumes
     with locked_runtime() as runtime:
         items = runtime.setdefault("docker_projects", [])
         existing = next(
@@ -3047,18 +3404,70 @@ def cleanup_tool_leases(timeout: int) -> List[str]:
             except (TypeError, ValueError):
                 deadline = now_utc - dt.timedelta(seconds=1)
             owner_active = active_review_agent_member(str(lease.get("owner_agent_id", ""))) is not None
+            supervisor = lease.get("supervisor")
+            supervisor_pid = supervisor.get("pid") if isinstance(supervisor, dict) else None
+            try:
+                supervisor_live = isinstance(supervisor, dict) and same_process(
+                    supervisor, process_snapshot(int(supervisor_pid))
+                )
+            except (TypeError, ValueError):
+                supervisor_live = False
             group_live = isinstance(process, dict) and process_group_alive(int(process.get("pgid", 0)))
-            if owner_active and deadline > now_utc and group_live:
+            if owner_active and deadline > now_utc and group_live and supervisor_live:
                 # A valid sibling review lease is supervised foreground work,
                 # not a product-runtime residual.  Preserve it; its wrapper or
                 # an owner/deadline failure owns exact group termination.
                 retained.append(lease)
                 continue
-            if isinstance(process, dict) and not terminate_isolated_group(process, timeout):
+            if not isinstance(process, dict):
+                # A lease without a dict process record cannot be terminated
+                # exactly; keep it visible instead of silently dropping it.
+                failures.append(f"tool-lease:{lease_id}:malformed-process-record")
+                retained.append(lease)
+                continue
+            if not terminate_isolated_group(process, timeout):
                 failures.append(f"tool-lease:{lease_id}:could-not-terminate-exact-group")
                 retained.append(lease)
         state["leases"] = retained
     return failures
+
+
+def sweep_context_authorizations() -> List[str]:
+    """Remove transition authorizations stranded past their 60s validity window.
+
+    contexttx deletes each authorization in a ``finally`` after the transition
+    commits, but a hard kill between issue and commit strands the file.  Any
+    record older than its validity window can never authorize anything again,
+    so sweeping it here loses no live state.
+    """
+    warnings: List[str] = []
+    if not CONTEXT_AUTH_DIR.is_dir():
+        return warnings
+    now = dt.datetime.now(dt.timezone.utc)
+    swept = 0
+    for entry in sorted(CONTEXT_AUTH_DIR.iterdir()):
+        if not entry.is_file() or entry.is_symlink():
+            continue
+        issued = None
+        try:
+            value = json.loads(entry.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                issued = dt.datetime.fromisoformat(str(value.get("issued_at", "")))
+        except (OSError, ValueError):
+            issued = None
+        if not isinstance(issued, dt.datetime) or issued.tzinfo is None:
+            issued = dt.datetime.fromtimestamp(entry.stat().st_mtime, dt.timezone.utc)
+        if (now - issued.astimezone(dt.timezone.utc)).total_seconds() <= CONTEXT_AUTHORIZATION_TTL_SECONDS:
+            continue
+        try:
+            entry.unlink()
+            swept += 1
+        except OSError:
+            warnings.append(f"could not sweep stranded context authorization: {entry.name}")
+    if swept:
+        _fsync_directory(CONTEXT_AUTH_DIR)
+        warnings.append(f"swept {swept} stranded context authorization(s) past their 60s validity window")
+    return warnings
 
 
 def command_cleanup() -> int:
@@ -3077,6 +3486,8 @@ def command_cleanup() -> int:
             for file in item["files"]:
                 command.extend(["-f", str(file)])
             command.extend(["-p", str(item["project"]), "down", "--remove-orphans"])
+            if item.get("volumes"):
+                command.append("-v")
             try:
                 down = subprocess.run(command, cwd=str(item["workdir"]), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
             except (OSError, subprocess.TimeoutExpired):
@@ -3092,6 +3503,23 @@ def command_cleanup() -> int:
             baseline = runtime.get("baseline")
             runtime.clear()
             runtime.update({"schema": "agent-runtime/v2", "baseline": baseline, "processes": [], "docker_projects": [], "ports": []})
+    warnings = sweep_context_authorizations()
+    if EVIDENCE_TOOL.is_file() and EVIDENCE_INDEX_PATH.is_file():
+        try:
+            evidence_check = subprocess.run(
+                [sys.executable, str(EVIDENCE_TOOL), "verify", "--deep", "--quiet"],
+                cwd=str(AGENT_DIR.parent), text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, timeout=120,
+            )
+            if evidence_check.returncode:
+                detail = evidence_check.stdout.strip().replace("\n", " | ")[:400]
+                warnings.append("evidence deep verification failed" + (f": {detail}" if detail else ""))
+        except subprocess.TimeoutExpired:
+            warnings.append("evidence deep verification timed out after 120s")
+    else:
+        warnings.append("evidence controller or index is missing; deep verification skipped")
+    for warning in warnings:
+        print(f"CLEANUP WARNING: {warning}")
     if failures:
         print("CLEANUP FAILED")
         for failure in failures:
@@ -3198,9 +3626,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--mode", choices=("auto", "fast", "standard", "release"), default="auto")
     start.add_argument("--environment", choices=("local", "test", "production"), default="local")
     start.add_argument("--task-type", choices=("product", "release", "maintenance", "governance", "documentation"), default="product")
-    start.add_argument("--complexity", choices=("tiny", "small", "bounded", "complex"), default="bounded")
+    # Minimal declaration by default: an undeclared task routes to fast and the
+    # node-6 scope gate corrects under-declaration after the fact.
+    start.add_argument("--complexity", choices=("tiny", "small", "bounded", "complex"), default="tiny")
     start.add_argument("--branch", default="auto")
-    start.add_argument("--files", type=nonnegative_int, default=3)
+    start.add_argument("--files", type=nonnegative_int, default=1)
     start.add_argument("--deploy", action="store_true")
     start.add_argument("--data-risk", action="store_true")
     start.add_argument("--cross-system", action="store_true")
@@ -3232,6 +3662,9 @@ def build_parser() -> argparse.ArgumentParser:
         escalation.add_argument("--new-mode", choices=("fast", "standard", "release"))
         escalation.add_argument("--new-risk", action="append", choices=workflow_state.RISK_NAMES)
         escalation.add_argument("--files", type=nonnegative_int)
+        escalation.add_argument("--reapprove", action="store_true")
+        escalation.add_argument("--source")
+        escalation.add_argument("--human-decision-receipt")
     reopen = sub.add_parser("reopen-clarification")
     reopen.add_argument("--source", required=True)
     reopen.add_argument("--reason", required=True)
@@ -3246,6 +3679,7 @@ def build_parser() -> argparse.ArgumentParser:
     docker.add_argument("--project", required=True)
     docker.add_argument("--workdir", default=".")
     docker.add_argument("--file", action="append")
+    docker.add_argument("--volume", action="append")
     port = sub.add_parser("register-port")
     port.add_argument("--port", type=int, required=True)
     port.add_argument("--pid", type=int, required=True)
@@ -3254,6 +3688,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("assert-clean")
     baseline = sub.add_parser("capture-runtime-baseline")
     baseline.add_argument("--source", required=True)
+    baseline.add_argument("--confirm-existing-processes", action="store_true")
+    promote = sub.add_parser("promote-knowledge")
+    promote.add_argument("index", type=int)
+    promote.add_argument("--target", choices=("knowledge", "capabilities"), required=True)
+    promote.add_argument("--source", required=True)
+    promote.add_argument("--entry")
+    promote.add_argument("--contract")
     return parser
 
 
@@ -3278,7 +3719,10 @@ def main() -> int:
         "register-process": lambda: command_register_process(args), "register-docker": lambda: command_register_docker(args),
         "register-port": lambda: command_register_port(args),
         "cleanup": lambda: command_cleanup(), "assert-clean": lambda: command_assert_clean(),
-        "capture-runtime-baseline": lambda: capture_runtime_baseline(args.source),
+        "capture-runtime-baseline": lambda: capture_runtime_baseline(
+            args.source, confirm_existing=bool(args.confirm_existing_processes)
+        ),
+        "promote-knowledge": lambda: command_promote_knowledge(args),
     }
     return commands[args.command]()
 

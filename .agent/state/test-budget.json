@@ -1,4 +1,86 @@
 {
   "schema": "agent-test-budget/v1",
-  "candidates": {}
+  "candidates": {
+    "971dd9aab4b83819546cf33dfdf51aa705cabc1750232bf392b9b4a0da95e39d": {
+      "mode": "standard",
+      "budget_seconds": 900,
+      "max_automatic_test_attempts": 1,
+      "consumed_seconds": 2,
+      "infrastructure_failures": 0,
+      "attempts": {
+        "a81c2d97c9a9486d86d95a68b6797078": {
+          "track": "code",
+          "receipt_path": ".agent/state/evidence/runtime-selftest/testrun-45178.json",
+          "started_at": "2026-07-30T03:37:52+00:00",
+          "cases": [
+            "timeout-cleanup"
+          ],
+          "finished_at": "2026-07-30T03:37:53+00:00",
+          "failure_class": "candidate"
+        }
+      },
+      "active_reservations": [],
+      "infrastructure_remediations": [],
+      "remediation_allowance": null,
+      "latest_receipt": {
+        "path": ".agent/state/evidence/test-budgets/26ce32482ee7fcbe92eb038a4933900f81341c44c0367365875365ed99eb22be.json",
+        "sha256": "26ce32482ee7fcbe92eb038a4933900f81341c44c0367365875365ed99eb22be",
+        "bytes": 556
+      }
+    },
+    "83bedb9db2182cc8de3bfe3b86c457a95e9f09cc31d2c2b35aca2ae51b32e32d": {
+      "mode": "standard",
+      "budget_seconds": 900,
+      "max_automatic_test_attempts": 1,
+      "consumed_seconds": 2,
+      "infrastructure_failures": 0,
+      "attempts": {
+        "a63dcd3eccb5470b8487b1a2aabc8004": {
+          "track": "code",
+          "receipt_path": ".agent/state/evidence/runtime-selftest/testrun-82310.json",
+          "started_at": "2026-07-30T04:35:48+00:00",
+          "cases": [
+            "timeout-cleanup"
+          ],
+          "finished_at": "2026-07-30T04:35:49+00:00",
+          "failure_class": "candidate"
+        }
+      },
+      "active_reservations": [],
+      "infrastructure_remediations": [],
+      "remediation_allowance": null,
+      "latest_receipt": {
+        "path": ".agent/state/evidence/test-budgets/16788e0ac799199f46a475ddd86b48ebb8acbab4b4357c423e5ef3a64b848290.json",
+        "sha256": "16788e0ac799199f46a475ddd86b48ebb8acbab4b4357c423e5ef3a64b848290",
+        "bytes": 556
+      }
+    },
+    "2cddf2a7f127bbb7e1acebb1f00fe312e596f6118d89daacc3e9c37e0b38af75": {
+      "mode": "standard",
+      "budget_seconds": 900,
+      "max_automatic_test_attempts": 1,
+      "consumed_seconds": 2,
+      "infrastructure_failures": 0,
+      "attempts": {
+        "d2701aaf868c484f90df25e2ebe842e2": {
+          "track": "code",
+          "receipt_path": ".agent/state/evidence/runtime-selftest/testrun-82593.json",
+          "started_at": "2026-07-30T04:36:26+00:00",
+          "cases": [
+            "timeout-cleanup"
+          ],
+          "finished_at": "2026-07-30T04:36:27+00:00",
+          "failure_class": "candidate"
+        }
+      },
+      "active_reservations": [],
+      "infrastructure_remediations": [],
+      "remediation_allowance": null,
+      "latest_receipt": {
+        "path": ".agent/state/evidence/test-budgets/238b2788b02c529fcb8aa1b7f2d9a0154759ba5604085b7226da3c83566404d1.json",
+        "sha256": "238b2788b02c529fcb8aa1b7f2d9a0154759ba5604085b7226da3c83566404d1",
+        "bytes": 556
+      }
+    }
+  }
 }
