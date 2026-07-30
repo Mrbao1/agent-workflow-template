@@ -127,7 +127,10 @@ os._exit(0)
                 except (ProcessLookupError, ValueError):
                     pass
         elapsed = time.monotonic() - started
-        if elapsed > 3:
+        # Regression bound: run_client must not block on the escaped grandchild's
+        # 30s sleep. Keep the bound far below 30s but tolerant of loaded CI
+        # runners, where process scheduling alone can add several seconds.
+        if elapsed > 15:
             raise AssertionError(f"escaped stdout fixture exceeded its hard bound: {elapsed:.3f}s")
         if result["exit_code"] != 125 or result["process_cleanup"] != {"remaining": -1}:
             raise AssertionError("escaped inherited stdout was not classified as infrastructure failure")

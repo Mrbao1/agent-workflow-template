@@ -2,7 +2,7 @@
   "schema": "agent-workflow-install/v4",
   "version": "3.1.43",
   "migration_version": 36,
-  "source_tree_sha256": "3483a0161bcf4fb0f157aa896a68f61fa848ffeebc1c7ea0972c243abe96ae4c",
+  "source_tree_sha256": "e8c64430ebb03761331a9a47e0fe71252e6dae7877d942088571bf18b904eea0",
   "agent_files": {
     "INDEX.md": "d05f0280c9e8c3df622363a06ee97840929e3962f0b1cae2f328df469f5f5bcc",
     "scripts/agentctl.py": "a377079d6dc78462697f79cc566b56efd88634eb16ea8acfd31507c96abd2654",
@@ -83,7 +83,7 @@
     "skills/run-full-chain-acceptance/scripts/run_acceptance_runtime.py": "57d5fbd87cab4a0f1d3f5c7b42679b0d1eb80b586e4fee232d2258f04e8cd289",
     "skills/run-full-chain-acceptance/scripts/run_live_release_gate.py": "63ce71e59c1b4d56b0eb4f6e4acc1af8db21039e1554b42d6bb3c30f28c6725e",
     "skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py": "57c09b4efdecfeab10df3ddc665a18b86c757f6fbc2c10eaaeabb4b4555bd02c",
-    "skills/run-full-chain-acceptance/scripts/self_test_acceptance_runtime.py": "1ad75cccf6eee5f8cc68de5c6f08b213cdf43b8515414d3f40330c64d08057b1",
+    "skills/run-full-chain-acceptance/scripts/self_test_acceptance_runtime.py": "816ecea9b30b85d63cda7cc7cbd73980c0c020116098994d89e097cce38f003a",
     "skills/run-full-chain-acceptance/scripts/self_test_gate.py": "e0db219d4f1a58154f522cc53ea555df52761f44e2736d7f6f73399af2bc5adb",
     "skills/run-full-chain-acceptance/scripts/self_test_product_fingerprint.py": "3b166052c23497b38ae725bd2f4cf8779594205941c6f67eddf9ecc1e5370369",
     "skills/run-full-chain-acceptance/scripts/self_test_workflow_release_gate.py": "10ba2a87a96a61e067b8be7cc1a91a3f9770a30cacaacfc59c3e1e01e038bacb",
