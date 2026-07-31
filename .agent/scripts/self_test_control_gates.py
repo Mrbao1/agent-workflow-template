@@ -60,6 +60,31 @@ with tempfile.TemporaryDirectory(prefix="agentctl-context-transport-") as raw:
     if "optional context transport policy is invalid" not in output:
         raise AssertionError(f"agentctl rejected the invalid plugin policy for the wrong reason:\n{output}")
 
+    # The child-charge margins keep a positive floor: a zero margin would
+    # silently weaken the child-charge invariant, so validate must reject it.
+    # Each case starts from the pristine seed config so failures stay
+    # attributable to the margin under test.
+    seed_config_bytes = (seed / "config.json").read_bytes()
+    for margin_key in (
+        "inherited_turn_estimated_tokens", "child_system_tool_margin_tokens", "child_output_margin_tokens",
+    ):
+        broken = json.loads(seed_config_bytes)
+        broken["agent_control"][margin_key] = 0
+        write(config_path, broken)
+        output = run(root, "agentctl", "validate", expected=1)
+        if "child-agent model/context/capacity policy is invalid" not in output:
+            raise AssertionError(f"zero {margin_key} did not fail the positive margin floor:\n{output}")
+    # A positive margin passes the floor: the edited config drifts the capsule,
+    # but the margin check itself must not fire.
+    restored = json.loads(seed_config_bytes)
+    restored["agent_control"]["child_output_margin_tokens"] = 1
+    write(config_path, restored)
+    output = run(root, "agentctl", "validate", expected=1)
+    if "child-agent model/context/capacity policy is invalid" in output:
+        raise AssertionError(f"a positive margin tripped the floor:\n{output}")
+    config_path.write_bytes(seed_config_bytes)
+    run(root, "agentctl", "validate")
+
 
 with tempfile.TemporaryDirectory(prefix="control-gates-") as raw:
     root = Path(raw)
@@ -252,6 +277,86 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     if (state / "TASK.json").read_bytes() != before_task or (state / "REQUIREMENT_CONTRACT.md").read_bytes() != before_contract:
         raise AssertionError("forged temporary adapter mutated or approved the v1 requirement gate")
     shutil.rmtree(forged_provider_dir)
+
+with tempfile.TemporaryDirectory(prefix="human-decision-v2-local-") as raw:
+    root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
+    scripts.mkdir(parents=True); state.mkdir(parents=True)
+    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "humandecision.py"):
+        shutil.copy2(SOURCE / "scripts" / name, scripts / name)
+    copy_policy_runtime(root, scripts)
+    shutil.copy2(SOURCE / "config.json", root / ".agent/config.json")
+    fixture_config = json.loads((root / ".agent/config.json").read_text(encoding="utf-8"))
+    fixture_config["guardrails_ready"] = True
+    write(root / ".agent/config.json", fixture_config)
+    contract = """# Requirement Contract
+
+- Goal: verify locally-bound human approval
+- Users: workflow maintainers
+- Success: approval binds the routing profile
+- In scope: requirement approval gate
+- Out of scope: implementation
+- Constraints: no external effects
+- Data and permissions: fixture data only
+- Target environment: local
+- Acceptance: local approval validates under its routing profile
+- Provenance: user fixture
+- Human decisions: pending
+- Clarified: false
+"""
+    (state / "REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
+    task = {
+        "schema": "agent-task/v2", "title": "human decision v2 fixture",
+        "task_type": "governance", "complexity": "bounded", "mode": "standard",
+        "files": 1, "environment": "local", "deployment_requested": False,
+        "branch": "unversioned", "status": "waiting_human", "phase": "clarification",
+        "requirements_clarified": False, "requirement_source": "pending",
+        "primary_skill": "clarify-task", "decision_policy_version": 2,
+        "risk_flags": {key: False for key in (
+            "deploy", "data_risk", "cross_system", "uncertain", "security",
+            "compliance", "migration", "irreversible", "external_impact",
+        )},
+        "token_budget": 48000, "tokens_used": 0, "token_usage_source": "estimated",
+        "usage_receipts": [], "budget_state": "ok", "child_agents_used": 0,
+        "peak_child_agents": 0, "loaded_references": [],
+        "selected_templates": ["requirement-contract"], "selected_capabilities": ["core"],
+        "template_route": None, "rendered_artifacts": [], "decisions": [],
+        "open_questions": ["requirement contract approval"],
+        "next_action": "approve requirement contract", "current_node": 1,
+        "accepted_nodes": [0], "node_artifacts": {}, "gate_approvals": {},
+        "pending_gate_artifacts": {}, "rollback_ledger": [], "rollback_archive": None,
+        "failure_ledger": {}, "failure_archive": None,
+        "mode_status": "provisional",
+        "metrics": {
+            "tokens": 0, "token_source": "estimated", "child_agents": 0,
+            "peak_children": 0, "tool_calls": 0, "test_runs": 0,
+            "test_failures": 0, "repair_rounds": 0, "user_corrections": 0,
+            "context_compactions": 0, "references_loaded": 0,
+        },
+        "updated": "2026-07-30",
+    }
+    write(state / "TASK.json", task)
+    run(
+        root, "contextctl", "sync", "--reason", "fixture",
+        "--summary", "local human decision fixture", "--source-tokens", "1200",
+    )
+    approved = run(root, "agentctl", "approve-requirements", "--source", "user:fixture")
+    if "REQUIREMENTS APPROVED" not in approved:
+        raise AssertionError(f"local v2 requirement approval did not run:\n{approved}")
+    # The recorded local approval must bind the task routing profile exactly
+    # like a provider receipt; a bare 3-key record would bypass the binding.
+    approval_check = subprocess.run(
+        [sys.executable, "-c", (
+            "import json,sys;sys.path.insert(0,'.agent/scripts');import humandecision;"
+            "t=json.load(open('.agent/state/TASK.json'));a=t['gate_approvals']['requirement'];"
+            "ok=(isinstance(a,dict)"
+            " and a.get('routing_profile_sha256')==humandecision.routing_profile_sha256(t)"
+            " and humandecision.local_approval_valid(t,a,source='user:fixture',"
+            "artifact_sha256=t['requirement_contract_sha256'],config=json.load(open('.agent/config.json'))));"
+            "raise SystemExit(0 if ok else 1)"
+        )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if approval_check.returncode:
+        raise AssertionError(f"approve-requirements recorded an unbound local approval:\n{approval_check.stdout}")
 
 with tempfile.TemporaryDirectory(prefix="workflow-hot-state-") as raw:
     root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
@@ -446,11 +551,26 @@ def escalation_task(contract_sha: str) -> dict:
 with tempfile.TemporaryDirectory(prefix="escalate-policy-flip-") as raw:
     root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
     scripts.mkdir(parents=True); state.mkdir(parents=True)
-    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "humandecision.py"):
+    # testrun.py is imported by agentledger, which the ledger-chain seeding uses.
+    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "humandecision.py", "testrun.py"):
         shutil.copy2(SOURCE / "scripts" / name, scripts / name)
     copy_policy_runtime(root, scripts)
     shutil.copy2(SOURCE / "config.json", root / ".agent/config.json")
     shutil.copy2(SOURCE / "assets/fresh-state/v1/state/agents.json", state / "agents.json")
+    shutil.copytree(SOURCE / "skills/manage-agent-team", root / ".agent/skills/manage-agent-team")
+    # Seed a chain-upgraded ledger through agentledger's own save: escalation
+    # must advance the same append hash chain, never strand its tip.
+    chain_seed = subprocess.run(
+        [sys.executable, "-c", (
+            "import sys;sys.path.insert(0,'.agent/scripts');"
+            "sys.path.insert(0,'.agent/skills/manage-agent-team/scripts');"
+            "import agentledger;"
+            "agentledger.save(agentledger.load(agentledger.STATE));"
+            "print('LEDGER CHAIN SEEDED')"
+        )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if chain_seed.returncode or "LEDGER CHAIN SEEDED" not in chain_seed.stdout:
+        raise AssertionError(f"could not seed a chain-upgraded ledger:\n{chain_seed.stdout}")
     contract = "# Requirement Contract\n\n- Human decisions: user:fixture\n- Clarified: true\n"
     (state / "REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
     contract_sha = hashlib.sha256(contract.encode()).hexdigest()
@@ -485,6 +605,30 @@ with tempfile.TemporaryDirectory(prefix="escalate-policy-flip-") as raw:
     escalated = json.loads((state / "TASK.json").read_text(encoding="utf-8"))
     if escalated.get("mode") != "standard" or escalated.get("decision_policy_version") != 2 or escalated.get("requirement_source") != "user:escalated":
         raise AssertionError(f"reapprove escalation committed a wrong task state: {escalated.get('mode')}")
+    # Escalation rewrote agents.json as a transition side effect; the append
+    # hash chain must have advanced exactly like agentledger.save would leave
+    # it, or every later `agentledger validate` fails closed on a stale tip.
+    ledger_after_escalation = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    if ledger_after_escalation.get("revision") != 2:
+        raise AssertionError(f"escalation did not advance the ledger chain revision: {ledger_after_escalation.get('revision')}")
+    ledger_chain_check = subprocess.run(
+        [sys.executable, "-c", (
+            "import sys;sys.path.insert(0,'.agent/scripts');"
+            "sys.path.insert(0,'.agent/skills/manage-agent-team/scripts');"
+            "import agentledger;"
+            "errors=agentledger.ledger_chain_errors(agentledger.load(agentledger.STATE));"
+            "assert not errors,errors;"
+            "print('LEDGER CHAIN OK')"
+        )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if ledger_chain_check.returncode or "LEDGER CHAIN OK" not in ledger_chain_check.stdout:
+        raise AssertionError(f"escalation stranded the agent ledger append chain:\n{ledger_chain_check.stdout}")
+    ledger_validate = subprocess.run(
+        [sys.executable, ".agent/skills/manage-agent-team/scripts/agentledger.py", "validate"],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if ledger_validate.returncode:
+        raise AssertionError(f"agentledger validate failed closed after escalation:\n{ledger_validate.stdout}")
     route_archive = escalated.get("route_archive", {})
     if not (root / str(route_archive.get("path", ""))).is_file():
         raise AssertionError("escalation did not publish its route archive evidence")
@@ -578,6 +722,88 @@ with tempfile.TemporaryDirectory(prefix="task-archive-v2-") as raw:
     )
     if archive_probe.returncode or "TASK ARCHIVE V2 PROBE OK" not in archive_probe.stdout:
         raise AssertionError(f"task-archive v2 writer contract violated:\n{archive_probe.stdout}")
+
+with tempfile.TemporaryDirectory(prefix="evidence-capsule-transition-") as raw:
+    root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
+    scripts.mkdir(parents=True); state.mkdir(parents=True)
+    for name in ("contextctl.py", "contexttx.py", "humandecision.py", "evidencectl.py"):
+        shutil.copy2(SOURCE / "scripts" / name, scripts / name)
+    copy_policy_runtime(root, scripts)
+    shutil.copy2(SOURCE / "config.json", root / ".agent/config.json")
+    shutil.copy2(SOURCE / "assets/fresh-state/v1/state/agents.json", state / "agents.json")
+    shutil.copy2(SOURCE / "assets/fresh-state/v1/state/EVIDENCE_INDEX.json", state / "EVIDENCE_INDEX.json")
+    (state / "evidence/task-archives").mkdir(parents=True)
+    contract = "# Requirement Contract\n\n- Human decisions: user:fixture\n- Clarified: true\n"
+    (state / "REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
+    contract_sha = hashlib.sha256(contract.encode()).hexdigest()
+
+    def write_chain_archive(payload: dict, total: int) -> dict:
+        data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        value_sha = hashlib.sha256(data).hexdigest()
+        path = state / "evidence/task-archives" / f"{value_sha}.json"
+        path.write_bytes(data)
+        return {
+            "schema": "agent-task-archive-head/v1", "path": str(path.relative_to(root)),
+            "sha256": value_sha, "bytes": len(data), "total_archives": total,
+        }
+
+    def legacy_payload(utf8: str, previous: object) -> dict:
+        return {
+            "schema": "agent-task-archive/v1", "archived_at": "2026-01-01T00:00:00+00:00",
+            "source": "workflow:accepted", "reason": "self-test", "assurance": "self-test",
+            "decision_receipt": None,
+            "task": {"sha256": "0" * 64, "bytes": len(utf8.encode()), "utf8": utf8},
+            "requirement_contract": None, "previous": previous,
+        }
+
+    head1 = write_chain_archive(legacy_payload("archived task one", None), 1)
+    head2 = write_chain_archive(legacy_payload("archived task two", head1), 2)
+    capsule_task = escalation_task(contract_sha)
+    capsule_task["task_archive"] = head2
+    write(state / "TASK.json", capsule_task)
+    run(root, "contextctl", "sync", "--reason", "fixture", "--summary", "capsule fixture", "--source-tokens", "1200")
+
+    # migrate-task-archives moves the capsule-bound TASK head through the
+    # canonical transition: the capsule must still verify afterwards.
+    migrated = run(root, "evidencectl", "migrate-task-archives")
+    if "TASK ARCHIVE MIGRATED" not in migrated:
+        raise AssertionError(f"migration did not run in the capsule fixture:\n{migrated}")
+    new_head = json.loads((state / "TASK.json").read_text(encoding="utf-8"))["task_archive"]
+    if not isinstance(new_head, dict) or new_head["sha256"] == head2["sha256"]:
+        raise AssertionError("migration did not re-anchor the TASK head to the rewritten chain")
+    run(root, "contextctl", "check")
+
+    # compact --include-task-history drops the dangling head through the same
+    # canonical transition; the capsule must still verify afterwards.
+    compacted = run(
+        root, "evidencectl", "compact", "--include-task-history",
+        "--source", "user:fixture-history", "--force", "--min-age-hours", "0",
+    )
+    if "EVIDENCE COMPACTED" not in compacted:
+        raise AssertionError(f"task-history compaction did not run in the capsule fixture:\n{compacted}")
+    if json.loads((state / "TASK.json").read_text(encoding="utf-8")).get("task_archive") is not None:
+        raise AssertionError("task-history compaction did not clear the dangling TASK head")
+    # The local task-history decision must bind the task routing profile just
+    # like provider receipts do; a bare 3-key record would bypass the binding.
+    decision_line = next(
+        (line for line in compacted.splitlines() if line.startswith("TASK HISTORY DECISION: ")), None,
+    )
+    if decision_line is None:
+        raise AssertionError(f"task-history compaction did not record a human decision:\n{compacted}")
+    decision = json.loads(decision_line.split(": ", 1)[1])
+    if set(decision) != {"source", "artifact_sha256", "assurance", "routing_profile_sha256"}:
+        raise AssertionError(f"local task-history decision is not routing-profile bound: {decision}")
+    decision_probe = subprocess.run(
+        [sys.executable, "-c", (
+            "import json,sys;sys.path.insert(0,'.agent/scripts');import humandecision;"
+            "t=json.load(open('.agent/state/TASK.json'));"
+            f"raise SystemExit(0 if '{decision['routing_profile_sha256']}'"
+            "==humandecision.routing_profile_sha256(t) else 1)"
+        )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if decision_probe.returncode:
+        raise AssertionError(f"task-history decision binds a stale routing profile:\n{decision_probe.stdout}")
+    run(root, "contextctl", "check")
 
 with tempfile.TemporaryDirectory(prefix="cleanup-leases-") as raw:
     root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
@@ -723,6 +949,11 @@ finally:
         root, "agentctl", "register-docker", "--project", "agent_fixture1",
         "--workdir", ".", "--file", "compose.yaml", "--volume", "datavol",
     )
+    # Single-character volume names are valid Docker names and must register.
+    run(
+        root, "agentctl", "register-docker", "--project", "agent_fixture9",
+        "--workdir", ".", "--file", "compose.yaml", "--volume", "a",
+    )
     original_path = os.environ["PATH"]
     os.environ["PATH"] = f"{fakebin}:{original_path}"
     try:
@@ -819,16 +1050,72 @@ with tempfile.TemporaryDirectory(prefix="knowledge-loop-") as raw:
     missing_entry = run(root, "agentctl", "promote-knowledge", "0", "--target", "capabilities", "--source", "user:promo", expected=1)
     if "--entry" not in missing_entry:
         raise AssertionError(f"capability promotion without entry failed for the wrong reason:\n{missing_entry}")
-    run(
+    # --entry/--contract are interpolated into the registry table row too:
+    # newlines and table pipes in them are rejected with the same clear error.
+    for hostile_args in (
+        ("--entry", "evil\npath.py", "--contract", "clean"),
+        ("--entry", ".agent/scripts/example.py", "--contract", "pipe | break"),
+    ):
+        hostile = run(
+            root, "agentctl", "promote-knowledge", "0", "--target", "capabilities",
+            "--source", "user:promo", *hostile_args, expected=1,
+        )
+        if "refusing verbatim index injection" not in hostile:
+            raise AssertionError(f"hostile --entry/--contract was not rejected:\n{hostile}")
+    promoted_capability = run(
         root, "agentctl", "promote-knowledge", "0", "--target", "capabilities",
         "--source", "user:promo", "--entry", ".agent/scripts/example.py", "--contract", "does example work",
     )
+    if "template-managed" not in promoted_capability:
+        raise AssertionError(f"capability promotion did not warn about the template-managed target:\n{promoted_capability}")
     capabilities_text = (root / ".agent/capabilities/INDEX.md").read_text(encoding="utf-8")
     if "| keep INDEX short | `.agent/scripts/example.py` | does example work |" not in capabilities_text:
         raise AssertionError(f"capability promotion did not write the registry table:\n{capabilities_text}")
     pending = json.loads((state / "knowledge-pending.json").read_text(encoding="utf-8"))
     if pending["candidates"] or len(pending["promotions"]) != 2:
         raise AssertionError(f"capability promotion did not drain the pending registry: {pending}")
+
+    # Agent-authored candidate text is never injected verbatim: newlines and
+    # table pipes are rejected with a clear error and stay pending.
+    write(state / "knowledge-pending.json", {
+        "schema": "agent-knowledge-pending/v1",
+        "candidates": [
+            {"candidate": "evil | pipe", "task_title": "t", "recorded_at": "2026-07-30T00:00:00+00:00"},
+            {"candidate": "line one\nline two", "task_title": "t", "recorded_at": "2026-07-30T00:00:00+00:00"},
+            {"candidate": "clean candidate", "task_title": "t", "recorded_at": "2026-07-30T00:00:00+00:00"},
+        ],
+        "promotions": [],
+    })
+    for reject_index in ("0", "1"):
+        injected = run(
+            root, "agentctl", "promote-knowledge", reject_index, "--target", "knowledge",
+            "--source", "user:promo", expected=1,
+        )
+        if "refusing verbatim index injection" not in injected:
+            raise AssertionError(f"hostile candidate text was not rejected:\n{injected}")
+    pending = json.loads((state / "knowledge-pending.json").read_text(encoding="utf-8"))
+    if len(pending["candidates"]) != 3:
+        raise AssertionError(f"a rejected injection mutated the pending registry: {pending}")
+
+    # The pending registry commits before the index: an index-write failure
+    # leaves the candidate out (reported) instead of re-promotable.
+    knowledge_dir = root / ".agent/knowledge"
+    knowledge_index_bytes = (knowledge_dir / "INDEX.md").read_bytes()
+    knowledge_dir.chmod(0o555)
+    try:
+        partial = run(
+            root, "agentctl", "promote-knowledge", "2", "--target", "knowledge",
+            "--source", "user:promo", expected=1,
+        )
+    finally:
+        knowledge_dir.chmod(0o755)
+    if "KNOWLEDGE PROMOTION PARTIAL" not in partial or "clean candidate" not in partial:
+        raise AssertionError(f"index-write failure was not tolerated and reported:\n{partial}")
+    pending = json.loads((state / "knowledge-pending.json").read_text(encoding="utf-8"))
+    if [c["candidate"] for c in pending["candidates"]] != ["evil | pipe", "line one\nline two"]:
+        raise AssertionError(f"partial promotion did not remove the candidate from pending first: {pending}")
+    if (knowledge_dir / "INDEX.md").read_bytes() != knowledge_index_bytes:
+        raise AssertionError("a failed index write still changed the knowledge index")
 
 with tempfile.TemporaryDirectory(prefix="bootstrap-adapters-") as raw:
     root = Path(raw)
@@ -876,6 +1163,37 @@ with tempfile.TemporaryDirectory(prefix="start-node0-") as raw:
     state = root / ".agent/state"
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "checkout", "-q", "-b", "fix/node0-fixture"], cwd=root, check=True)
+    # Seed a chain-upgraded ledger through agentledger's own save: every start
+    # rewrites agents.json and must advance the same append hash chain.
+    chain_seed = subprocess.run(
+        [sys.executable, "-c", (
+            "import sys;sys.path.insert(0,'.agent/scripts');"
+            "sys.path.insert(0,'.agent/skills/manage-agent-team/scripts');"
+            "import agentledger;"
+            "agentledger.save(agentledger.load(agentledger.STATE));"
+            "print('LEDGER CHAIN SEEDED')"
+        )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if chain_seed.returncode or "LEDGER CHAIN SEEDED" not in chain_seed.stdout:
+        raise AssertionError(f"could not seed a chain-upgraded ledger:\n{chain_seed.stdout}")
+
+    def assert_ledger_chain(expected_revision: int) -> None:
+        ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+        if ledger.get("revision") != expected_revision:
+            raise AssertionError(f"start did not advance the ledger chain to revision {expected_revision}: {ledger.get('revision')}")
+        probe = subprocess.run(
+            [sys.executable, "-c", (
+                "import sys;sys.path.insert(0,'.agent/scripts');"
+                "sys.path.insert(0,'.agent/skills/manage-agent-team/scripts');"
+                "import agentledger;"
+                "errors=agentledger.ledger_chain_errors(agentledger.load(agentledger.STATE));"
+                "assert not errors,errors;"
+                "print('LEDGER CHAIN OK')"
+            )], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if probe.returncode or "LEDGER CHAIN OK" not in probe.stdout:
+            raise AssertionError(f"start stranded the agent ledger append chain:\n{probe.stdout}")
+
     # Node 0's minimal contract refuses a task without a usable title.
     refusal = run(
         root, "agentctl", "start", "--title", "", "--mode", "fast", "--environment", "local",
@@ -906,6 +1224,7 @@ with tempfile.TemporaryDirectory(prefix="start-node0-") as raw:
     first = json.loads((state / "TASK.json").read_text(encoding="utf-8"))
     if first.get("projection") != "lightweight" or first.get("decision_policy_version") != 2:
         raise AssertionError(f"start did not persist the routing projection: {first.get('projection')}")
+    assert_ledger_chain(2)
     first_task_bytes = (state / "TASK.json").read_bytes()
     first_delivery_bytes = (state / "delivery.json").read_bytes()
 
@@ -952,6 +1271,7 @@ with tempfile.TemporaryDirectory(prefix="start-node0-") as raw:
         raise AssertionError(f"task archive lost the referenced evidence digest: {payload.get('referenced_evidence')}")
     if second.get("projection") != "lightweight":
         raise AssertionError(f"archiving start persisted a wrong projection: {second.get('projection')}")
+    assert_ledger_chain(3)
     chain_probe = subprocess.run(
         [sys.executable, "-c", (
             "import json,sys;sys.path.insert(0,'.agent/scripts');import evidencectl;"

@@ -124,13 +124,31 @@ def local_approval_valid(
         and HEX64.fullmatch(artifact_sha256) is not None
     ):
         return False
-    keys = set(approval)
-    if keys == {"source", "artifact_sha256", "assurance"}:
-        pass  # legacy record predating the routing-profile binding
-    elif keys == {"source", "artifact_sha256", "assurance", "routing_profile_sha256"}:
+    # Accepted key shapes (all built on the base triple):
+    # - base only: legacy record predating the routing-profile binding. Every
+    #   current local-approval producer passes the task and binds the profile,
+    #   so a 3-key record can only come from pre-binding code. Records carry
+    #   no timestamp or schema version, so no cheaper cutoff exists; the
+    #   window stays open only for those genuinely legacy records.
+    # - base + routing_profile_sha256: current bound record.
+    # - base + release pair: legacy release acceptance approval recorded by
+    #   workflowctl approve-gate before the routing-profile binding existed.
+    # - base + release pair + routing_profile_sha256: current release
+    #   acceptance approval under the local boundary. The release digests are
+    #   bound to the accepted artifact by workflowctl.release_acceptance_approval_valid;
+    #   here their shape is re-validated the same way as the base digest.
+    base = {"source", "artifact_sha256", "assurance"}
+    release_pair = {"platform_transcript_verified_sha256", "supervision_debt_waiver_sha256"}
+    extra = set(approval) - base
+    if extra - {"routing_profile_sha256"} - release_pair:
+        return False
+    release_keys = extra & release_pair
+    if release_keys not in (set(), release_pair):
+        return False  # transcript/debt commitments are recorded atomically, never partially
+    if "routing_profile_sha256" in extra:
         if approval.get("routing_profile_sha256") != routing_profile_sha256(task):
             return False
-    else:
+    if any(HEX64.fullmatch(str(approval.get(name, ""))) is None for name in release_keys):
         return False
     if task.get("mode") == "release" and config is not None:
         # Config tightening is retroactive: a release task that was approved

@@ -54,6 +54,10 @@ RUN_ID = re.compile(r"[0-9a-f]{32}")
 TIMESTAMP_SKEW_SECONDS = 5
 WATCHDOG_MAX_DELAY_SECONDS = 60
 PREPARED_DISPATCH_TTL_SECONDS = 300
+# Register/dispatch enforces PREPARED_DISPATCH_TTL_SECONDS; validate only
+# warns past that TTL so a slow-but-legitimate dispatch does not close every
+# validate caller, and fails hard only past this much larger bound.
+PREPARED_DISPATCH_VALIDATE_EXPIRY_SECONDS = 3600
 LOST_OBSERVATION_THRESHOLD = 3
 LEDGER_FORCE_ARCHIVE_SCHEMA = "agent-ledger-force-archive/v1"
 CANONICAL_ROLE_TYPES = (
@@ -2435,6 +2439,21 @@ def command_prepare(args: argparse.Namespace) -> int:
             raise SystemExit("canonical dispatch ID was already prepared with different bytes or controls")
         if prior.get("consumed_at") is None and prior.get("cancelled_at") is None and reservation.get("status") == "reserved":
             print(f"AGENT DISPATCH ALREADY PREPARED: {args.id}")
+            try:
+                prior_expiry = min(
+                    parse(prior.get("deadline_at")),
+                    parse(prior.get("prepared_at"))
+                    + dt.timedelta(seconds=PREPARED_DISPATCH_TTL_SECONDS),
+                )
+            except (TypeError, ValueError):
+                prior_expiry = None
+            if prior_expiry is None or now() >= prior_expiry:
+                # Register will hard-reject this preparation; surface the
+                # release cursor here so idempotent re-entry is not a dead end.
+                print(
+                    f"prepared dispatch is past the register TTL: {args.id}; "
+                    f"release it before re-registering: agentledger.py cancel-prepare --id {args.id}"
+                )
             return 0
         raise SystemExit("canonical dispatch ID is already closed")
     require_dispatch_context(args.fork_turns, estimated_tokens)
@@ -2554,6 +2573,21 @@ def register(state: Dict[str, object], args: argparse.Namespace, redispatch_coun
     if len(prepared) != 1:
         raise SystemExit("agent registration requires one unconsumed pre-spawn preparation")
     preparation = prepared[0]
+    try:
+        register_expiry = min(
+            parse(preparation.get("deadline_at")),
+            parse(preparation.get("prepared_at"))
+            + dt.timedelta(seconds=PREPARED_DISPATCH_TTL_SECONDS),
+        )
+    except (TypeError, ValueError):
+        # Shape errors are not expiry; still fail closed, but say what is
+        # actually wrong with the preparation.
+        raise SystemExit(f"prepared dispatch has invalid timestamps: {args.id}")
+    if now() >= register_expiry:
+        raise SystemExit(
+            f"prepared dispatch expired: {args.id}; "
+            f"release it before re-preparing: agentledger.py cancel-prepare --id {args.id}"
+        )
     reservation = preparation.get("token_reservation")
     if (
         preparation.get("root_task_id") != root_id
@@ -3755,7 +3789,7 @@ def replay_run_registry_errors(state: Dict[str, object]) -> List[str]:
 
 
 def command_validate(args: argparse.Namespace) -> int:
-    state = load(STATE); config = policy(); errors: List[str] = []
+    state = load(STATE); config = policy(); errors: List[str] = []; warnings: List[str] = []
     try:
         dispatch_context_policy()
     except SystemExit as error:
@@ -3885,11 +3919,25 @@ def command_validate(args: argparse.Namespace) -> int:
                 except (TypeError, ValueError): errors.append(f"prepared dispatch {label} time is invalid: {preparation.get('id')}")
         if consumed is None and cancelled is None:
             try:
+                prepared_at = parse(preparation.get("prepared_at"))
                 expiry = min(
                     parse(preparation.get("deadline_at")),
-                    parse(preparation.get("prepared_at")) + dt.timedelta(seconds=PREPARED_DISPATCH_TTL_SECONDS),
+                    prepared_at + dt.timedelta(seconds=PREPARED_DISPATCH_TTL_SECONDS),
                 )
                 if now() >= expiry:
+                    # The TTL is enforced at register/dispatch time.  Validate
+                    # only warns here so a slow-but-legitimate dispatch does
+                    # not close every validate caller; it fails hard only past
+                    # the much larger validate expiry bound.
+                    warnings.append(
+                        f"prepared dispatch pending past register TTL: {preparation.get('id')}; "
+                        f"register will reject it; release it with: agentledger.py cancel-prepare --id {preparation.get('id')}"
+                    )
+                hard_expiry = min(
+                    parse(preparation.get("deadline_at")),
+                    prepared_at + dt.timedelta(seconds=PREPARED_DISPATCH_VALIDATE_EXPIRY_SECONDS),
+                )
+                if now() >= hard_expiry:
                     errors.append(
                         f"prepared dispatch expired: {preparation.get('id')}; "
                         f"release it before revalidation: agentledger.py cancel-prepare --id {preparation.get('id')}"
@@ -4328,6 +4376,7 @@ def command_validate(args: argparse.Namespace) -> int:
             empty_verified = True; empty_receipt = pending_empty_snapshot
         if not empty_verified or not valid_receipt(empty_receipt):
             errors.append("empty ledger lacks a fresh platform empty-state proof")
+    for warning in warnings: print(f"WARNING: {warning}")
     if errors:
         print("INVALID AGENT LEDGER")
         for error in errors: print(f"- {error}")

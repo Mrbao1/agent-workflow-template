@@ -277,6 +277,22 @@ def restore_transition_journal() -> Dict[str, object]:
     TASK_LOCK.touch(exist_ok=True)
     with TASK_LOCK.open("r+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        # Restore is only safe for a genuinely interrupted transition: a stale
+        # "committed" or "rolled_back" journal (crash between commit and
+        # journal cleanup) would silently revert valid current state. Mirror
+        # the discard guard and refuse, naming the actual state and the safe
+        # command.
+        status = transition_journal_status()
+        if status is None:
+            raise SystemExit("no context transition journal to restore")
+        state = str(status.get("state", ""))
+        if state == "malformed":
+            raise SystemExit("context transition journal is malformed; restore manually or discard it")
+        if state != "interrupted":
+            raise SystemExit(
+                f"transition journal shows a {state} transition, not an interrupted one; "
+                "restore would revert valid state — run contextctl journal --discard instead"
+            )
         journal = _read_transition_journal()
         if journal is None:
             raise SystemExit("no context transition journal to restore")
@@ -414,7 +430,16 @@ def transition_task(
             ):
                 for value in values:
                     command.extend([flag, str(value)])
-            result = subprocess.run(command, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                result = subprocess.run(
+                    command, cwd=str(ROOT), text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "authorized context transition timed out after "
+                    f"{int(error.timeout or 120)}s"
+                ) from error
             if result.returncode:
                 raise RuntimeError(result.stdout.strip() or "authorized context transition failed")
         except BaseException as error:

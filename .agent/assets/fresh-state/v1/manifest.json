@@ -12,7 +12,7 @@
     "state/.template.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.test-budget.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.tool-leases.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "state/CONTEXT.json": "05979a0d4be0b2c7dffea2c38a4e731a6389943f8b5a9338134b904be5ac1561",
+    "state/CONTEXT.json": "f680b78f54fbf138e61832937d2155451174555c35508433b955302a22e21b4d",
     "state/EVIDENCE_INDEX.json": "07a69ede5e76baa6c76785bf4ce9af2867eb1196e3beadec7f188443c0eb71bc",
     "state/REQUIREMENT_CONTRACT.md": "6448c992b8fd13a4ea74ab8dc51dd8ace85eb2d77023ceb63246c2c61c39fe01",
     "state/STAGE_INDEX.md": "2989e930da2c51d925569d4b497ae80b70e38045e0f5d22aeb3ab90774a4bfda",
@@ -24,5 +24,5 @@
     "state/tool-leases.json": "30a8abc54262011d90f3019ee31ba8ed9fa59105f33236e11924534c031f304f"
   },
   "schema": "agent-workflow-fresh-state-seed/v1",
-  "seed_sha256": "8213b20854f2d37d19fa102b6331030b5b11d955bcfce78ce55854591b1c8af5"
+  "seed_sha256": "6ab28a916d51cddf0384baf60a7c073e214dcd7ba6864d875eb76963e74be826"
 }

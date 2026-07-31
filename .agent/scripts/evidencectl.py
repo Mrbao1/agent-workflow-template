@@ -37,7 +37,9 @@ Contract rules:
 - Head records keep schema `agent-task-archive-head/v1` with fields
   {"schema", "path", "sha256", "bytes", "total_archives"}; TASK.json
   `task_archive` stores the newest head and each payload's `previous`
-  embeds the head directly below it.
+  embeds the head directly below it.  `task_archive` is a capsule-bound
+  TASK invariant: every head move goes through the canonical context
+  transition (see commit_task_head) so the capsule is re-bound atomically.
 - Reachability traverses task-archives ONLY along `previous` heads and
   `referenced_evidence` digests. v2 payload text is ignored; legacy v1
   payloads stay textually scanned (fail-safe) until rewritten.
@@ -68,6 +70,7 @@ Operator escape hatches (both refuse to run implicitly):
 
 from pathlib import Path
 import argparse
+import copy
 import datetime as dt
 import fcntl
 import hashlib
@@ -80,6 +83,11 @@ import zipfile
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import humandecision
+
+try:
+    import contexttx
+except ImportError:  # reduced harnesses ship an evidence-only script subset
+    contexttx = None
 
 
 def find_agent_dir() -> Path:
@@ -143,6 +151,28 @@ def atomic_json(path: Path, value: Dict[str, object]) -> None:
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def commit_task_head(before: Dict[str, object], after: Dict[str, object], *, reason: str, summary: str) -> None:
+    """Move the TASK `task_archive` head through the canonical context transition.
+
+    `task_archive` is a TASK invariant key bound by the context capsule: a
+    raw rewrite leaves `contextctl check` drifted and route-resume fails
+    closed until manual repair.  The field-level TRANSITION_PROFILES
+    registry lives in contextctl.py (another workstream) and has no
+    evidencectl profile, so this transition rides the full-invariant
+    ("agentctl", "start") profile — the receipt's reason/summary record the
+    real evidence operation.  Reduced harnesses without the context
+    controller fall back to the plain atomic write, mirroring the
+    reduced-harness pattern in agentledger.commit_registered_ledger.
+    """
+    if contexttx is None or not (STATE / "CONTEXT.json").is_file():
+        atomic_json(TASK, after)
+        return
+    contexttx.transition_task(
+        before, after, mutator="agentctl", operation="start",
+        reason=reason, summary=summary,
+    )
 
 
 def canonical(value: object) -> bytes:
@@ -655,7 +685,10 @@ def task_history_decision(selected: List[str], source: Optional[str], receipt: O
         )
     if receipt:
         raise SystemExit("local task-history approval does not accept an unaudited provider receipt")
-    return humandecision.local_approval(str(source), packet_sha256)
+    # Bind the same routing profile the provider receipts bind: a local
+    # approval without `task` is a 3-key record that bypasses the routing
+    # profile check (see workflowctl command_approve).
+    return humandecision.local_approval(str(source), packet_sha256, task)
 
 
 def command_compact(args: argparse.Namespace) -> int:
@@ -745,10 +778,17 @@ def command_compact(args: argparse.Namespace) -> int:
         if history_selected and TASK.is_file():
             # The head chain now lives only inside the deep archive; drop the
             # dangling active head pointer so later archival starts fresh.
-            task = load_json(TASK)
-            if task.get("task_archive") is not None:
-                task["task_archive"] = None
-                atomic_json(TASK, task)
+            # The head is a capsule-bound TASK invariant: move it through the
+            # canonical transition so the capsule is re-bound atomically.
+            before_task = load_json(TASK)
+            if before_task.get("task_archive") is not None:
+                after_task = copy.deepcopy(before_task)
+                after_task["task_archive"] = None
+                commit_task_head(
+                    before_task, after_task,
+                    reason="evidence-task-history-compacted",
+                    summary="cleared the archived task-history head after human-approved compaction",
+                )
         print(
             f"EVIDENCE COMPACTED: files={removed} source_bytes={record['source_bytes']} "
             f"archive_bytes={record['bytes']} archive={record['sha256']}"
@@ -951,8 +991,15 @@ def command_migrate_task_archives(args: argparse.Namespace) -> int:
             write_task_archive(target, data)
         # Verify the rewritten chain end to end BEFORE the TASK head moves.
         task_archive_chain(new_head)
-        task["task_archive"] = new_head
-        atomic_json(TASK, task)
+        # The head is a capsule-bound TASK invariant: move it through the
+        # canonical transition so the capsule is re-bound atomically.
+        after_task = copy.deepcopy(task)
+        after_task["task_archive"] = new_head
+        commit_task_head(
+            task, after_task,
+            reason="evidence-task-archives-migrated",
+            summary="re-anchored the task-archive head to the rewritten v2 chain",
+        )
         print(
             f"TASK ARCHIVE MIGRATED: archives={len(chain)} rewritten={migrated_count} "
             f"head={new_head['sha256']}"

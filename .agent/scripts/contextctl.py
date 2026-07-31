@@ -650,6 +650,30 @@ def internal_compaction_errors(context: Dict[str, object]) -> List[str]:
                         errors.append("stored host compaction receipt or adapter provenance drifted")
                 except (OSError, ValueError, TypeError, SystemExit, json.JSONDecodeError):
                     errors.append("stored host compaction receipt cannot be durably reverified")
+    abort = compaction.get("host_compaction_abort")
+    if abort is not None:
+        # Revalidate the stored abort approval with the same discipline as
+        # repair_approval_errors: the event is only trustworthy while its
+        # human decision still verifies under the task's decision policy.
+        if (
+            not isinstance(abort, dict)
+            or abort.get("event") != "aborted"
+            or not str(abort.get("source", "")).startswith("user:")
+            or HEX64.fullmatch(str(abort.get("aborted_capsule_sha256", ""))) is None
+        ):
+            errors.append("stored host compaction abort record is invalid")
+        else:
+            try:
+                abort_approval_valid = humandecision.decision_approval_valid(
+                    ROOT, load_json(CONFIG_PATH), load_json(TASK_PATH),
+                    gate="context-abort-host-compaction",
+                    artifact_sha256=str(abort["aborted_capsule_sha256"]),
+                    source=str(abort["source"]), record=abort.get("approval"),
+                )
+            except (OSError, ValueError, TypeError, SystemExit, json.JSONDecodeError):
+                abort_approval_valid = False
+            if not abort_approval_valid:
+                errors.append("stored host compaction abort lacks a valid human decision approval")
     return errors
 
 

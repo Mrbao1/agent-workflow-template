@@ -1,7 +1,7 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "6996de270a89c1df2fbe4f520d29193670e8125a7158bd6e9e8cf54661d6eb90",
+  "policy_bundle_sha256": "44e311e31e3336f5d031446cb5778ce017b0aa1565403a0ce3fd4edae2c5f74a",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
@@ -30,10 +30,10 @@
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
   },
   "checkpoint": {
-    "sequence": 10,
-    "reason": "rebind live capsule after rollback-compat patch",
-    "updated_at": "2026-07-30T13:21:46+00:00",
-    "previous_sha256": "6ebc990f99fd18611c85cf471d95e10e977b3185d3c94bc3a5244a82cbf71b08",
+    "sequence": 12,
+    "reason": "rebind live capsule after review round 2",
+    "updated_at": "2026-07-31T00:31:23+00:00",
+    "previous_sha256": "45714dab23c476efcc1354a87a8951a90e69d8da8e5c84b104a969551370784e",
     "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "task_delta": [
       "canonical_task_state"
@@ -42,20 +42,20 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 10,
+    "checkpoint_sequence": 12,
     "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 1000,
-    "observed_at": "2026-07-30T13:21:46+00:00"
+    "observed_at": "2026-07-31T00:31:23+00:00"
   },
   "compaction": {
     "source_estimated_tokens": 1000,
-    "capsule_estimated_tokens": 714,
-    "tokens_removed": 286,
-    "compression_ratio": 1.4,
+    "capsule_estimated_tokens": 710,
+    "tokens_removed": 290,
+    "compression_ratio": 1.41,
     "method": "explicit-estimate/v1",
-    "reason": "rebind live capsule after rollback-compat patch",
+    "reason": "rebind live capsule after review round 2",
     "source": "agent:contextctl",
     "budget_snapshot": {
       "task_tokens_used": 0,
@@ -78,15 +78,15 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-30T13:21:46+00:00",
-    "source": "user:rollback compat patch",
-    "repair_capsule_sha256": "d02695bc9fa2322eb4519af0e365642547622936ab571c3ba30378ccad92b4e2",
+    "verified_at": "2026-07-31T00:31:23+00:00",
+    "source": "user:review fixes round 2",
+    "repair_capsule_sha256": "243a818b8661b51dd3c4662976d5e71c8d4a693b25c6b34d2dc4e06473eeaa41",
     "repair_approval": {
-      "source": "user:rollback compat patch",
-      "artifact_sha256": "d02695bc9fa2322eb4519af0e365642547622936ab571c3ba30378ccad92b4e2",
+      "source": "user:review fixes round 2",
+      "artifact_sha256": "243a818b8661b51dd3c4662976d5e71c8d4a693b25c6b34d2dc4e06473eeaa41",
       "assurance": "explicit-user-message;local-only;not-provider-verified",
       "routing_profile_sha256": "4eb1c0e34b0540966fd3469921adc5f4db1f579eb5c2d78a0ccfdc636cc81f72"
     },
-    "content_sha256": "bbdcaab4af67f699268b6f40e2c8850601889488bebfc3388aaff12fa78210bc"
+    "content_sha256": "8fa4ca43ca5bb995dbb9c00d0f611f5477dee7a5c8336c079500779b55732d11"
   }
 }

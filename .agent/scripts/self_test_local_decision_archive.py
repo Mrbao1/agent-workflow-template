@@ -116,6 +116,7 @@ with tempfile.TemporaryDirectory(prefix="local-decision-archive-") as raw:
 
     run(project, [
         sys.executable, ".agent/scripts/agentctl.py", "escalate-mode", "--files", "5",
+        "--reapprove", "--source", "user:local-fixture-escalation",
     ])
     escalated = json.loads(task_path.read_text(encoding="utf-8"))
     if escalated.get("files") != 5 or escalated.get("current_node") != 2 or not isinstance(escalated.get("route_archive"), dict):

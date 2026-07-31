@@ -396,14 +396,23 @@ def release_acceptance_approval_valid(task: Dict[str, object], approval: object,
     try: path.relative_to(ROOT)
     except ValueError: return False
     value=load(path) if path.is_file() and not path.is_symlink() else {}
-    expected_keys={
-        "source","artifact_sha256","platform_transcript_verified_sha256",
-        "supervision_debt_waiver_sha256",
-    }
-    if task.get("decision_policy_version")==1:
-        expected_keys.add("decision_receipt")
+    release_pair={"platform_transcript_verified_sha256","supervision_debt_waiver_sha256"}
+    base={"source","artifact_sha256",*release_pair}
+    version=task.get("decision_policy_version")
+    if version==humandecision.PROVIDER_POLICY_VERSION:
+        expected_shapes={frozenset(base|{"decision_receipt"})}
+    elif version==humandecision.LOCAL_POLICY_VERSION:
+        # command_approve mints base+assurance+pair+routing_profile under the
+        # local boundary; the profile-free shape is the pre-binding legacy
+        # record humandecision.local_approval_valid still grandfathered.
+        expected_shapes={
+            frozenset(base|{"assurance"}),
+            frozenset(base|{"assurance","routing_profile_sha256"}),
+        }
+    else:
+        expected_shapes={frozenset(base)}
     return (
-        set(approval)==expected_keys
+        frozenset(approval) in expected_shapes
         and human_gate_approval_valid(task,"acceptance",approval,record)
         and approval.get("platform_transcript_verified_sha256")==value.get("platform_observation_set_sha256")
         and approval.get("supervision_debt_waiver_sha256")==value.get("supervision_debt_sha256")
@@ -422,6 +431,11 @@ def human_gate_approval_valid(task: Dict[str, object], gate: str, approval: obje
         try:
             config = load(AGENT_DIR / "config.json")
         except SystemExit:
+            if task.get("mode") == "release":
+                # Fail closed: without the config the retroactive
+                # allow_current_chat_local_release withdrawal recheck cannot
+                # run, so a stored release approval is unverifiable.
+                return False
             config = None
         return humandecision.local_approval_valid(
             task, approval, source=source, artifact_sha256=digest, config=config,
@@ -838,7 +852,7 @@ def command_approve(args: argparse.Namespace) -> int:
     elif decision_policy_version == humandecision.LOCAL_POLICY_VERSION:
         if args.human_decision_receipt:
             raise SystemExit("local user-message approval does not accept an unaudited provider receipt")
-        approval = humandecision.local_approval(args.source, args.artifact_sha256)
+        approval = humandecision.local_approval(args.source, args.artifact_sha256, task)
     if args.gate=="acceptance" and task.get("mode")=="release":
         pending_path=(ROOT/str(pending.get("path",""))).resolve(); value=load(pending_path)
         observation_digest=value.get("platform_observation_set_sha256")
@@ -1034,17 +1048,15 @@ def command_complete(args: argparse.Namespace) -> int:
     if any(len(re.findall(rf"^- {re.escape(field)}:\s*(.+?)\s*$",retro_text,re.MULTILINE))!=1 for field in retro_fields) or "{{" in retro_text:
         raise SystemExit("retrospective is incomplete or contains unresolved placeholders")
     ledger_command=[sys.executable,str(AGENT_DIR/"skills/manage-agent-team/scripts/agentledger.py"),"validate","--require-empty","--platform-snapshot",args.platform_snapshot]
-    # Validate the ledger and runtime before any destructive cleanup so a
-    # failing check never has its evidence removed first; every call is bounded.
+    # Validate the workflow and ledger before the destructive cleanup so a
+    # failing check never has its evidence removed first. Cleanup then runs
+    # before the residual assertion, so a dirty-but-cleanable runtime is
+    # cleaned instead of blocking completion; every call is bounded.
     run_checked(
         [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"validate"],
         "task completion requires a fully valid workflow before consuming the final platform snapshot",
     )
     run_checked(ledger_command,"task completion requires an orchestrator-observed empty Agent ledger")
-    run_checked(
-        [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],
-        "task completion requires zero runtime residuals",
-    )
     run_checked([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"cleanup"],"runtime cleanup failed")
     run_checked(
         [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],
@@ -1456,6 +1468,7 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
 
 
 SCHEDULER_NONCE_PATH = AGENT_DIR / "state" / ".scheduler-receipt-nonces.json"
+SCHEDULER_NONCE_LOCK = AGENT_DIR / "state" / ".scheduler-receipt-nonces.lock"
 
 
 def consumed_scheduler_nonces() -> Dict[str, str]:
@@ -1495,6 +1508,23 @@ def record_scheduler_nonce(nonce: str, expiry: dt.datetime) -> None:
         if temporary.exists(): temporary.unlink()
 
 
+def consume_scheduler_nonce(nonce: str, expiry: dt.datetime) -> None:
+    """Consume a verified nonce under an exclusive lock, re-checking inside it.
+
+    The registry is replaced atomically on every write, so the lock lives on a
+    stable sibling inode; without the in-lock re-check two concurrent
+    route-resume processes could both observe an unconsumed nonce and both
+    consume the same receipt.
+    """
+    SCHEDULER_NONCE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULER_NONCE_LOCK.touch(exist_ok=True)
+    with SCHEDULER_NONCE_LOCK.open("r+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if nonce in consumed_scheduler_nonces():
+            raise SystemExit("scheduler receipt nonce was already consumed")
+        record_scheduler_nonce(nonce, expiry)
+
+
 def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, object], config: Dict[str, object]) -> bool:
     if not raw:
         return False
@@ -1527,7 +1557,7 @@ def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, o
     result = subprocess.run([str(adapter), "verify-scheduler-resume", "--receipt", str(path)], cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
     if result.returncode or result.stdout.strip() != f"VERIFIED SCHEDULER RESUME sha256={digest}":
         raise SystemExit("host scheduler adapter rejected the resume receipt")
-    record_scheduler_nonce(nonce, observed.astimezone(dt.timezone.utc) + dt.timedelta(seconds=maximum))
+    consume_scheduler_nonce(nonce, observed.astimezone(dt.timezone.utc) + dt.timedelta(seconds=maximum))
     return True
 
 

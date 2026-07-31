@@ -5,10 +5,14 @@ Default run: source-level checks plus the idle-source context only.
 Use --full for all three contexts (idle-source, polluted-source,
 installed-project).  Use --shard K/N for deterministic modulo sharding
 over the registered self-test list and --only NAME... for a named subset.
-Every test runs with a per-test subprocess timeout (default 120s); on
+Every test runs with a per-test subprocess timeout (default 300s); on
 timeout the whole process group is killed and the test is recorded as a
 failure with its elapsed time.  The process exits non-zero if any test,
 setup step, or cleanup control fails.
+
+Source-level checks run only on shard 1 (or unsharded runs), and sharded
+runs default to a per-shard report path (outputs/full-suite-shard-K-N.json)
+so parallel shards do not overwrite each other.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +59,7 @@ ALL_CONTEXTS = ("idle-source", "polluted-source", "installed-project")
 DEFAULT_CONTEXTS = ("idle-source",)
 
 SOURCE_CHECKS = (
+    ("freshness", ("tests/check_freshness.py",)),
     ("install-lifecycle", ("tests/test_install_lifecycle.py", "--template-root", ".")),
     ("pxpipe-self-test", ("plugins/pxpipe-context/scripts/self-test.mjs",)),
     ("pxpipe-provider-integration", ("plugins/pxpipe-context/scripts/provider-integration-self-test.mjs",)),
@@ -310,7 +315,11 @@ def print_summary(records, wall_seconds) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template-root", default=".")
-    parser.add_argument("--report", default="outputs/full-suite.json")
+    parser.add_argument(
+        "--report", default=None,
+        help="report path (default: outputs/full-suite.json, or "
+             "outputs/full-suite-shard-K-N.json for shard K/N)",
+    )
     parser.add_argument(
         "--shard", type=parse_shard, default=None, metavar="K/N",
         help="run shard K of N over the registered self-test list",
@@ -332,6 +341,11 @@ def main() -> int:
         help="parallel tests within a context (default: 4)",
     )
     args = parser.parse_args()
+    if args.report is None:
+        if args.shard:
+            args.report = f"outputs/full-suite-shard-{args.shard[0]}-{args.shard[1]}.json"
+        else:
+            args.report = "outputs/full-suite.json"
     started = time.monotonic()
     source = Path(args.template_root).resolve()
     report = (source / args.report).resolve()
@@ -401,21 +415,24 @@ def main() -> int:
                 row.setdefault("context", name)
             print_failures(context_records)
             records.extend(context_records)
-        print(f"== context source: {len(SOURCE_CHECKS)} source-level checks ==")
-        source_records = run_batch(
-            "source",
-            [source_check_command(entry) for entry in SOURCE_CHECKS],
-            source, timeout=args.test_timeout, jobs=args.jobs,
-        )
-        for control, command in (
-            ("cleanup", [sys.executable, ".agent/scripts/agentctl.py", "cleanup"]),
-            ("assert-clean", [sys.executable, ".agent/scripts/agentctl.py", "assert-clean"]),
-        ):
-            row = execute(control, command, source, timeout=60)
-            row["context"] = "source"
-            source_records.append(row)
-        print_failures(source_records)
-        records.extend(source_records)
+        if args.shard is None or args.shard[0] == 1:
+            # Source-level checks do not depend on the shard selection; running
+            # them on every shard would duplicate them across the CI matrix.
+            print(f"== context source: {len(SOURCE_CHECKS)} source-level checks ==")
+            source_records = run_batch(
+                "source",
+                [source_check_command(entry) for entry in SOURCE_CHECKS],
+                source, timeout=args.test_timeout, jobs=args.jobs,
+            )
+            for control, command in (
+                ("cleanup", [sys.executable, ".agent/scripts/agentctl.py", "cleanup"]),
+                ("assert-clean", [sys.executable, ".agent/scripts/agentctl.py", "assert-clean"]),
+            ):
+                row = execute(control, command, source, timeout=60)
+                row["context"] = "source"
+                source_records.append(row)
+            print_failures(source_records)
+            records.extend(source_records)
     wall_seconds = time.monotonic() - started
     failures = print_summary(records, wall_seconds)
     report.parent.mkdir(parents=True, exist_ok=True)

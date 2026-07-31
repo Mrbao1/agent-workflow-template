@@ -58,6 +58,7 @@ TASK_PATH = AGENT_DIR / "state" / "TASK.json"
 RUNTIME_PATH = AGENT_DIR / "state" / "runtime.json"
 TOOL_LEASES_PATH = AGENT_DIR / "state" / "tool-leases.json"
 AGENTS_PATH = AGENT_DIR / "state" / "agents.json"
+AGENTS_CHAIN_JOURNAL_PATH = AGENT_DIR / "state" / "agents-chain.jsonl"
 STAGE_PATH = AGENT_DIR / "state" / "STAGE_INDEX.md"
 CONTRACT_PATH = AGENT_DIR / "state" / "REQUIREMENT_CONTRACT.md"
 PROJECT_INIT_LOCK_PATH = AGENT_DIR / "state" / ".project-init.lock"
@@ -143,6 +144,49 @@ def _fsync_directory(path: Path) -> None:
     descriptor = os.open(str(path), os.O_RDONLY)
     try: os.fsync(descriptor)
     finally: os.close(descriptor)
+
+
+def agents_chain_advance(ledger: Dict[str, object]) -> bytes:
+    """Advance the agent ledger append hash chain; return the exact bytes to commit.
+
+    Mirrors `chain_upgrade`/`save` in
+    `.agent/skills/manage-agent-team/scripts/agentledger.py` — the source of
+    truth, owned by another workstream and not importable from every reduced
+    agentctl harness (it pulls the full skill script set).  Every agents.json
+    rewrite that bypasses `agentledger.py save` must advance the chain
+    identically, or the next `agentledger.py validate` fails closed on a
+    stale append-chain tip.
+    """
+    previous = AGENTS_PATH.read_bytes() if AGENTS_PATH.is_file() else None
+    revision = ledger.get("revision")
+    if revision is None:
+        ledger["revision"] = 1
+        ledger["prev_sha256"] = None
+    else:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise SystemExit("agent ledger chain revision is invalid")
+        if previous is None:
+            raise SystemExit("agent ledger chain continuity is lost: state file is missing")
+        ledger["revision"] = revision + 1
+        ledger["prev_sha256"] = hashlib.sha256(previous).hexdigest()
+    return (json.dumps(ledger, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def agents_chain_journal_append(ledger: Dict[str, object], data: bytes) -> None:
+    """Append the chain tip exactly like agentledger.chain_journal_append.
+
+    Call only AFTER the transaction committing `data` to agents.json has
+    finished, so a rolled-back transition never leaves a dangling tip.
+    """
+    entry = {
+        "revision": ledger["revision"], "prev_sha256": ledger["prev_sha256"],
+        "file_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    AGENTS_CHAIN_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AGENTS_CHAIN_JOURNAL_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 @contextmanager
@@ -1092,7 +1136,7 @@ def docker_identity_valid(item: Dict[str, object]) -> bool:
     volumes = item.get("volumes")
     if volumes is not None and (
         not isinstance(volumes, list)
-        or any(not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", name) for name in volumes)
+        or any(not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) for name in volumes)
     ):
         return False
     payload = {"project": item["project"], "workdir": item["workdir"], "files": files}
@@ -1751,13 +1795,13 @@ def command_validate() -> int:
         or int(agent_policy.get("default_fork_turns", -1)) != 0
         or not isinstance(agent_policy.get("inherited_turn_estimated_tokens"), int)
         or isinstance(agent_policy.get("inherited_turn_estimated_tokens"), bool)
-        or agent_policy.get("inherited_turn_estimated_tokens", -1) < 0
+        or agent_policy.get("inherited_turn_estimated_tokens", -1) < 1
         or not isinstance(agent_policy.get("child_system_tool_margin_tokens"), int)
         or isinstance(agent_policy.get("child_system_tool_margin_tokens"), bool)
-        or agent_policy.get("child_system_tool_margin_tokens", -1) < 0
+        or agent_policy.get("child_system_tool_margin_tokens", -1) < 1
         or not isinstance(agent_policy.get("child_output_margin_tokens"), int)
         or isinstance(agent_policy.get("child_output_margin_tokens"), bool)
-        or agent_policy.get("child_output_margin_tokens", -1) < 0
+        or agent_policy.get("child_output_margin_tokens", -1) < 1
         or not isinstance(agent_policy.get("scheduler"), dict)
         or set(agent_policy.get("scheduler", {})) != {"source", "signed_adapter", "automatic_resume", "max_receipt_age_seconds"}
         or agent_policy.get("scheduler", {}).get("source") != "host-scheduler"
@@ -2537,7 +2581,9 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
             )
         }
     ledger["token_accounting"]["token_budget"] = task["token_budget"]
-    ledger_data = (json.dumps(ledger, ensure_ascii=False, indent=2) + "\n").encode()
+    # Advance the append hash chain exactly like agentledger.save would;
+    # the journal tip is appended only after the transition commits.
+    ledger_data = agents_chain_advance(ledger)
     task["budget_state"] = budget_snapshot(task, config)["state"]
     contexttx.transition_task(
         before, task, mutator="agentctl", operation="escalate-mode",
@@ -2545,6 +2591,7 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
         side_effects=[(archive_path, archive_data), (AGENTS_PATH, ledger_data)],
         evidence=[archive_record["path"]],
     )
+    agents_chain_journal_append(ledger, ledger_data)
     write_stage(task)
     print(f"MODE/RISK ESCALATED: mode={mode} risks={[name for name, value in risks.items() if value]}")
     return 0
@@ -2916,7 +2963,9 @@ def command_start(args: argparse.Namespace) -> int:
     agents_for_task["last_platform_snapshot"] = None
     agents_for_task["platform_empty_verified"] = False
     agents_for_task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00",time.gmtime())
-    agents_data = (json.dumps(agents_for_task, ensure_ascii=False, indent=2) + "\n").encode()
+    # Advance the append hash chain exactly like agentledger.save would;
+    # the journal tip is appended only after the transition commits.
+    agents_data = agents_chain_advance(agents_for_task)
     sync_context(
         "new-task", before_task=previous_task, after_task=task, operation="start",
         summary="started a new task in clarification",
@@ -2927,6 +2976,7 @@ def command_start(args: argparse.Namespace) -> int:
             *([knowledge_side_effect] if knowledge_side_effect is not None else []),
         ],
     )
+    agents_chain_journal_append(agents_for_task, agents_data)
     delivery = subprocess.run([sys.executable, str(AGENT_DIR / "scripts" / "deliveryctl.py"), "init"], cwd=str(AGENT_DIR.parent))
     if delivery.returncode:
         raise SystemExit("failed to initialize delivery state")
@@ -2971,7 +3021,9 @@ def command_approve(args: argparse.Namespace) -> int:
     elif decision_policy_version == humandecision.LOCAL_POLICY_VERSION:
         if args.human_decision_receipt:
             raise SystemExit("local user-message approval does not accept an unaudited provider receipt")
-        decision_receipt = humandecision.local_approval(args.source, contract_hash)
+        # Pass `task` so the local approval binds the routing profile like
+        # provider receipts do (mirrors workflowctl command_approve).
+        decision_receipt = humandecision.local_approval(args.source, contract_hash, task)
     else:
         decision_receipt = args.source
     task.update({
@@ -3015,6 +3067,8 @@ def command_promote_knowledge(args: argparse.Namespace) -> int:
     if not isinstance(entry, dict) or not isinstance(entry.get("candidate"), str) or not entry["candidate"].strip():
         raise SystemExit("knowledge candidate record is malformed")
     candidate = entry["candidate"].strip()
+    if any(mark in candidate for mark in ("\n", "\r", "|")):
+        raise SystemExit("knowledge candidate contains a newline or '|'; refusing verbatim index injection")
     promoted_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
     if args.target == "knowledge":
         index_path = KNOWLEDGE_INDEX_PATH
@@ -3033,6 +3087,8 @@ def command_promote_knowledge(args: argparse.Namespace) -> int:
     else:
         if not args.entry or not args.contract:
             raise SystemExit("capability promotion requires --entry <path> and --contract <summary>")
+        if any(mark in args.entry or mark in args.contract for mark in ("\n", "\r", "|")):
+            raise SystemExit("capability --entry/--contract contains a newline or '|'; refusing verbatim index injection")
         index_path = CAPABILITIES_INDEX_PATH
         if not index_path.is_file():
             raise SystemExit("capability registry is missing")
@@ -3043,6 +3099,11 @@ def command_promote_knowledge(args: argparse.Namespace) -> int:
         )
         if separator is None:
             raise SystemExit("capability registry lacks its capability table")
+        print(
+            "WARNING: capability promotions live in the template-managed "
+            ".agent/capabilities/INDEX.md and must be re-applied after every "
+            "template update (only knowledge/INDEX.md is preserved)"
+        )
         lines.insert(separator + 1, f"| {candidate} | `{args.entry}` | {args.contract} |")
     receipt = {
         "candidate": candidate,
@@ -3057,8 +3118,18 @@ def command_promote_knowledge(args: argparse.Namespace) -> int:
         "candidates": [*candidates[: args.index], *candidates[args.index + 1:]],
         "promotions": [*pending["promotions"], receipt],
     }
-    atomic_write(index_path, "\n".join(lines) + "\n")
+    # Remove the candidate from the pending registry BEFORE touching the
+    # index: an index-write failure then leaves the candidate out (reported
+    # below) instead of re-promotable, which previously risked duplicates.
     atomic_write(KNOWLEDGE_PENDING_PATH, json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
+    try:
+        atomic_write(index_path, "\n".join(lines) + "\n")
+    except OSError as error:
+        print(
+            f"KNOWLEDGE PROMOTION PARTIAL: candidate removed from pending but the {args.target} "
+            f"index write failed ({error}); re-apply it manually: {candidate}"
+        )
+        return 1
     print(f"KNOWLEDGE PROMOTED: {args.target} index updated; {len(updated['candidates'])} candidate(s) remain pending")
     return 0
 
@@ -3334,7 +3405,7 @@ def command_register_docker(args: argparse.Namespace) -> int:
     if not workdir.is_dir() or any(not Path(path).is_file() for path in files):
         raise SystemExit("registered Docker workdir and compose files must exist")
     volumes = sorted(set(args.volume or []))
-    if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", name) for name in volumes):
+    if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name) for name in volumes):
         raise SystemExit("declared Docker named volumes must be valid volume names")
     identity = {"project": args.project, "workdir": str(workdir), "files": files}
     if volumes:

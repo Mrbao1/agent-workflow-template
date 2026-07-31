@@ -748,9 +748,13 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     next(
         item for item in expired_preparation["prepared_dispatches"] if item["id"] == "attester"
     )["prepared_at"] = (
-        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=301)
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=360)
     ).replace(microsecond=0).isoformat()
-    (state / "agents.json").write_text(json.dumps(expired_preparation), encoding="utf-8")
+    # A six-minute-old preparation is past the 300-second register TTL but
+    # well inside the one-hour validate bound: it is a slow-but-legitimate
+    # dispatch.  The watchdog keeps its advisory cancel action, validate
+    # passes with a non-fatal warning, and only register rejects it.
+    rewrite_ledger_legacy(state / "agents.json", expired_preparation)
     expired_plan = json.loads(run(root, "watchdog-plan"))
     if not any(
         action.get("action") == "cancel-prepare"
@@ -759,9 +763,77 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         for action in expired_plan.get("actions", [])
     ):
         raise AssertionError("expired preparation lacks a bounded cancel action")
+    stale_validate = run(root, "validate")
+    if (
+        "WARNING: prepared dispatch pending past register TTL: attester" not in stale_validate
+        or "cancel-prepare --id attester" not in stale_validate
+    ):
+        raise AssertionError("stale prepared dispatch lacks a non-fatal validate warning")
+    stale_envelope_sha = hashlib.sha256((root / "envelope-attester.json").read_bytes()).hexdigest()
+    stale_member = platform_member(
+        "attester", "running", role_type="implementer", envelope_sha=stale_envelope_sha,
+    )
+    stale_member["started_at"] = attester_envelope["started_at"]
+    stale_member["deadline_at"] = attester_envelope["deadline_at"]
+    stale_registration = snapshot(
+        root, "register-attester-stale", [stale_member], observed_at=attester_started,
+    )
+    stale_register = run(
+        root, "register", "--id", "attester", "--role-type", "implementer",
+        "--role", "attester", "--task", "verify Node6", "--model", "gpt-5.6-sol",
+        "--fork-turns", "0", "--task-payload", "payload.txt",
+        "--handoff-envelope", "envelope-attester.json", "--deadline-minutes", "5",
+        "--progress-hash", hashlib.sha256(b"stale").hexdigest(),
+        "--platform-snapshot", stale_registration, expected=1,
+    )
+    if (
+        "prepared dispatch expired: attester" not in stale_register
+        or "cancel-prepare --id attester" not in stale_register
+    ):
+        raise AssertionError("stale prepared dispatch was not rejected at register with a cancel-prepare cursor")
+    # Re-preparing the TTL-expired preparation stays idempotent (exit 0, no
+    # state change) but must surface the cancel-prepare cursor instead of
+    # sending the operator into a register that hard-rejects.
+    stale_reprepare_before = (state / "agents.json").read_bytes()
+    stale_reprepare = prepare_dispatch(root, "attester", role_type="implementer")
+    if (
+        "AGENT DISPATCH ALREADY PREPARED: attester" not in stale_reprepare
+        or "cancel-prepare --id attester" not in stale_reprepare
+    ):
+        raise AssertionError("re-preparing a TTL-expired preparation hides the cancel-prepare cursor")
+    if (state / "agents.json").read_bytes() != stale_reprepare_before:
+        raise AssertionError("re-preparing a TTL-expired preparation changed ledger state")
+    # Past the much larger validate bound the same preparation fails closed.
+    hard_expired = json.loads(prepared_watchdog_ledger)
+    next(
+        item for item in hard_expired["prepared_dispatches"] if item["id"] == "attester"
+    )["prepared_at"] = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3601)
+    ).replace(microsecond=0).isoformat()
+    rewrite_ledger_legacy(state / "agents.json", hard_expired)
     expired_validate = run(root, "validate", expected=1)
     if "prepared dispatch expired: attester" not in expired_validate or "cancel-prepare --id attester" not in expired_validate:
         raise AssertionError("expired prepared dispatch lacks an actionable cancel-prepare cursor")
+    # Shape errors are not expiry: unparseable prepared_at gets its own
+    # fail-closed register message instead of "prepared dispatch expired".
+    invalid_timestamps = json.loads(prepared_watchdog_ledger)
+    next(
+        item for item in invalid_timestamps["prepared_dispatches"] if item["id"] == "attester"
+    )["prepared_at"] = "not-a-timestamp"
+    rewrite_ledger_legacy(state / "agents.json", invalid_timestamps)
+    invalid_register = run(
+        root, "register", "--id", "attester", "--role-type", "implementer",
+        "--role", "attester", "--task", "verify Node6", "--model", "gpt-5.6-sol",
+        "--fork-turns", "0", "--task-payload", "payload.txt",
+        "--handoff-envelope", "envelope-attester.json", "--deadline-minutes", "5",
+        "--progress-hash", hashlib.sha256(b"invalid").hexdigest(),
+        "--platform-snapshot", stale_registration, expected=1,
+    )
+    if (
+        "prepared dispatch has invalid timestamps: attester" not in invalid_register
+        or "prepared dispatch expired" in invalid_register
+    ):
+        raise AssertionError("unparseable preparation timestamps were misreported as expiry")
     (state / "agents.json").write_bytes(prepared_watchdog_ledger)
     actions = (state / "budget-actions.log").read_text(encoding="utf-8").splitlines()
     if not actions or actions[-1] != "spawn-review-agent":

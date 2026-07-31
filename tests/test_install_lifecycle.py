@@ -307,6 +307,57 @@ def main() -> int:
             raise SystemExit("--allow-downgrade did not print a loud downgrade warning")
         run(sys.executable, str(installer), str(newer), "--check", cwd=polluted)
 
+        # A malformed migration_version fails closed with a clean message and
+        # never leaks an uncaught ValueError traceback or mutates the target.
+        malformed_version = workspace / "malformed-migration-version"
+        run(
+            sys.executable, str(installer), str(malformed_version),
+            "--project-name", "malformed-version-fixture", cwd=polluted,
+        )
+        malformed_manifest_path = malformed_version / ".agent/.workflow-manifest.json"
+        for bad_value in ("abc", True):
+            malformed_manifest = json.loads(malformed_manifest_path.read_text(encoding="utf-8"))
+            malformed_manifest["migration_version"] = bad_value
+            malformed_manifest_path.write_text(json.dumps(malformed_manifest, indent=2) + "\n", encoding="utf-8")
+            version_before = tree(malformed_version)
+            for mode_args in (("--check",), ("--update",)):
+                refused = run(
+                    sys.executable, str(installer), str(malformed_version), *mode_args,
+                    cwd=polluted, expected=(1, 2, 3),
+                )
+                if "Traceback" in refused.stdout or "migration version" not in refused.stdout:
+                    raise SystemExit(
+                        f"malformed migration_version {bad_value!r} did not fail closed cleanly:\n{refused.stdout}"
+                    )
+            if tree(malformed_version) != version_before:
+                raise SystemExit(f"malformed migration_version {bad_value!r} changed project bytes")
+
+        # Migration 36 retires the transition-increment alias honestly: a mode
+        # is carried only when its legacy value differs from that mode's
+        # legacy seed constant (150/300/500), and each carried value is
+        # reduced by the inherited-turn surcharge (800) so the tuned TOTAL per
+        # transition is preserved (floored at the new key's minimum of 50).
+        carry = workspace / "migration-36-carry"
+        run(
+            sys.executable, str(installer), str(carry),
+            "--project-name", "migration-carry-fixture", cwd=polluted,
+        )
+        carry_config_path = carry / ".agent/config.json"
+        carry_config = json.loads(carry_config_path.read_text(encoding="utf-8"))
+        carry_config["context"]["automatic_transition_token_increment"] = {"fast": 150, "standard": 300, "release": 900}
+        carry_config_path.write_text(json.dumps(carry_config, indent=2) + "\n", encoding="utf-8")
+        carry_manifest_path = carry / ".agent/.workflow-manifest.json"
+        carry_manifest = json.loads(carry_manifest_path.read_text(encoding="utf-8"))
+        carry_manifest["migration_version"] = 35
+        carry_manifest_path.write_text(json.dumps(carry_manifest, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(carry), "--update", cwd=polluted)
+        migrated_context = json.loads(carry_config_path.read_text(encoding="utf-8"))["context"]
+        if "automatic_transition_token_increment" in migrated_context:
+            raise SystemExit("migration 36 left the deprecated transition-increment alias behind")
+        carried = migrated_context.get("estimated_turn_overhead_tokens")
+        if carried != {"fast": 2000, "standard": 3000, "release": 3000}:
+            raise SystemExit(f"migration 36 did not carry per-mode honestly: {carried}")
+
         # Read-only modes never create directories for missing targets.
         ghost = workspace / "ghost-parent" / "ghost-project"
         run(sys.executable, str(installer), str(ghost), "--check", cwd=polluted, expected=(1,))

@@ -851,6 +851,42 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
     run(root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture", "--artifact-sha256", standard_acceptance_digest)
     run(root, "advance", "--node", "7", "--artifact", standard_acceptance)
 
+    # Policy-v2 local gate approvals bind the task routing profile at approval
+    # time, and node acceptance re-checks that binding before advancing.
+    local = task("standard", 6, list(range(6)))
+    local["decision_policy_version"] = 2
+    install_task(root, local)
+    local = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    local["gate_approvals"]["requirement"] = {
+        "source": "user:fixture",
+        "artifact_sha256": local["requirement_contract_sha256"],
+        "assurance": "explicit-user-message;local-only;not-provider-verified",
+    }
+    write_json(root / ".agent/state/TASK.json", local)
+    stage(root, local)
+    local_impl = implementation(root, "standard")
+    run(root, "advance", "--node", "6", "--artifact", local_impl)
+    local = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    local_accept = acceptance(root, "standard", local)
+    local_accept_digest = digest(root / local_accept)
+    run(root, "submit-gate", "--gate", "acceptance", "--artifact", local_accept)
+    run(root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture", "--artifact-sha256", local_accept_digest)
+    local = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    local_approval = local["gate_approvals"]["acceptance"]
+    local_profile = canonical_digest({
+        key: local.get(key)
+        for key in (
+            "task_type", "complexity", "mode", "files", "environment",
+            "deployment_requested", "branch", "risk_flags",
+        )
+    })
+    if (
+        set(local_approval) != {"source", "artifact_sha256", "assurance", "routing_profile_sha256"}
+        or local_approval["routing_profile_sha256"] != local_profile
+    ):
+        raise AssertionError("local gate approval did not bind the task routing profile")
+    run(root, "advance", "--node", "7", "--artifact", local_accept)
+
     # Stable issue identity ignores mutable prose; a second early failure never jumps forward to node 4.
     early = task("standard", 3, [0, 1, 2])
     early["failure_ledger"] = {hashlib.sha256(b"ISSUE-1|solution").hexdigest(): 1}
@@ -1381,6 +1417,91 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
             + "candidate record drift:\n" + json.dumps(drift, indent=2, sort_keys=True)
         )
     report_digest = digest(root / report)
+    # End-to-end under the local decision boundary (policy v2): a release task
+    # approved through command_approve must advance node 7 with the locally
+    # minted 6-key release approval. The release evidence chain binds the
+    # governed candidate fingerprint (which covers config.json and the
+    # non-volatile TASK fields), so the chain — ledger, preflight, live
+    # receipt, report — is rebuilt under the v2 candidate and every mutated
+    # byte is restored afterwards for the pre-policy flow below.
+    v2_snapshots = {
+        relative: (root / relative).read_bytes()
+        for relative in (
+            ".agent/config.json", ".agent/state/TASK.json", ".agent/state/CONTEXT.json",
+            ".agent/state/STAGE_INDEX.md", ".agent/state/agents.json",
+            preflight_path, live_path, report,
+        )
+    }
+    v2_marker_root = root / ".agent/state/evidence/agent-terminal-markers"
+    v2_markers = {path.relative_to(v2_marker_root): path.read_bytes() for path in v2_marker_root.rglob("*.json")}
+    v2_config = json.loads(v2_snapshots[".agent/config.json"])
+    v2_config["agent_control"]["human_decision_observer"]["allow_current_chat_local_release"] = True
+    write_json(root / ".agent/config.json", v2_config)
+    v2_task = json.loads(v2_snapshots[".agent/state/TASK.json"])
+    v2_task["decision_policy_version"] = 2
+    # Policy v2 revalidates the requirement gate as a bound local approval;
+    # replace the pre-policy string marker with the real minted shape.
+    hd_spec = importlib.util.spec_from_file_location(
+        "humandecision_fixture", SOURCE / "scripts" / "humandecision.py",
+    )
+    if hd_spec is None or hd_spec.loader is None:
+        raise AssertionError("cannot load humandecision approval fixture")
+    hd_module = importlib.util.module_from_spec(hd_spec)
+    hd_spec.loader.exec_module(hd_module)
+    v2_task["gate_approvals"]["requirement"] = hd_module.local_approval(
+        "user:fixture", v2_task["requirement_contract_sha256"], v2_task,
+    )
+    write_json(root / ".agent/state/TASK.json", v2_task)
+    stage(root, v2_task)
+    completed_ledger(root, node6_path=impl)
+    v2_ledger = json.loads((root / ".agent/state/agents.json").read_text(encoding="utf-8"))
+    v2_integrator = next(item for item in v2_ledger["members"] if item["role_type"] == "integrator")
+    v2_replay = [
+        item for item in v2_integrator["result_evidence"]
+        if item["source_path"] != v2_integrator["result_report_path"]
+    ]
+    v2_fingerprint = workflow_candidate_fingerprint(root, v2_config)
+    v2_preflight = subprocess.run([
+        sys.executable, ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+        "preflight", "--runner", runner_path, "--receipt", preflight_path,
+        "--environment", "local", "--authority", "default", "--candidate-sha256", v2_fingerprint,
+    ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if v2_preflight.returncode:
+        raise AssertionError("v2 release preflight failed\n" + v2_preflight.stdout)
+    v2_gate = subprocess.run([
+        sys.executable, ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+        "run", "--runner", runner_path, "--receipt", live_path,
+        "--integrator-receipt", v2_replay[0]["path"], "--preflight-receipt", preflight_path,
+    ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if v2_gate.returncode:
+        raise AssertionError("v2 release gate run failed\n" + v2_gate.stdout)
+    v2_report_path = acceptance(root, "release", v2_task, receipt(root, live_path))
+    v2_report_digest = digest(root / v2_report_path)
+    run(root, "submit-gate", "--gate", "acceptance", "--artifact", v2_report_path)
+    v2_report = json.loads((root / v2_report_path).read_text(encoding="utf-8"))
+    run(
+        root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture",
+        "--artifact-sha256", v2_report_digest,
+        "--platform-transcript-verified-sha256", v2_report["platform_observation_set_sha256"],
+        "--supervision-debt-waiver-sha256", v2_report["supervision_debt_sha256"],
+    )
+    run(root, "advance", "--node", "7", "--artifact", v2_report_path)
+    v2_advanced = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if v2_advanced["current_node"] != 8:
+        raise AssertionError("local policy v2 release approval did not advance node 7")
+    v2_approval = v2_advanced["gate_approvals"]["acceptance"]
+    if set(v2_approval) != {
+        "source", "artifact_sha256", "assurance", "routing_profile_sha256",
+        "platform_transcript_verified_sha256", "supervision_debt_waiver_sha256",
+    }:
+        raise AssertionError(f"local release approval lost its bound shape: {sorted(v2_approval)}")
+    for relative, data in v2_snapshots.items():
+        (root / relative).write_bytes(data)
+    for relative, data in v2_markers.items():
+        target = v2_marker_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o644)
+        target.write_bytes(data)
     run(root, "submit-gate", "--gate", "acceptance", "--artifact", report)
     run(root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture", "--artifact-sha256", report_digest, expected=1)
     approved_report=json.loads((root/report).read_text(encoding="utf-8"))
@@ -1616,6 +1737,97 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
     if completed_route["terminal"] is not True or completed_route["action"] != "complete":
         raise AssertionError("legal complete-task checkpoint was not recognized as terminal")
 
+    # Stored local release approvals validate in their current 6-key and
+    # legacy 5-key/3-key shapes, reject forgeries and partial commitments,
+    # and fail closed for release tasks when the config cannot be loaded.
+    # Both gate layers are probed: human_gate_approval_valid and the node-7
+    # release_acceptance_approval_valid that command_advance actually calls.
+    approval_probe = subprocess.run(
+        [sys.executable, "-c", """
+import json, sys
+sys.path.insert(0, '.agent/scripts')
+import humandecision, workflowctl
+
+task = {
+    'decision_policy_version': 2, 'environment': 'local', 'mode': 'release',
+    'deployment_requested': False,
+    'risk_flags': {name: False for name in ('deploy', 'irreversible', 'external_impact')},
+    'task_type': 'governance', 'complexity': 'small', 'files': 1, 'branch': 'unversioned',
+}
+artifact = 'a' * 64
+record = {'path': 'x.json', 'sha256': artifact, 'bytes': 1}
+approval = humandecision.local_approval('user:fixture', artifact, task)
+approval.update({
+    'platform_transcript_verified_sha256': 'b' * 64,
+    'supervision_debt_waiver_sha256': 'c' * 64,
+})
+with open('x.json', 'w', encoding='utf-8') as handle:
+    json.dump({
+        'platform_observation_set_sha256': 'b' * 64,
+        'supervision_debt_sha256': 'c' * 64,
+    }, handle)
+config_path = '.agent/config.json'
+config_bytes = open(config_path, 'rb').read()
+config = json.loads(config_bytes)
+config['agent_control']['human_decision_observer']['allow_current_chat_local_release'] = True
+try:
+    with open(config_path, 'w', encoding='utf-8') as handle:
+        json.dump(config, handle)
+    def check(value, observed=None):
+        return workflowctl.human_gate_approval_valid(observed or task, 'acceptance', value, record)
+    def rcheck(value, observed=None):
+        return workflowctl.release_acceptance_approval_valid(observed or task, value, record)
+    assert check(approval), 'current 6-key release approval rejected'
+    legacy5 = {key: approval[key] for key in (
+        'source', 'artifact_sha256', 'assurance',
+        'platform_transcript_verified_sha256', 'supervision_debt_waiver_sha256')}
+    assert check(legacy5), 'legacy 5-key release approval rejected'
+    legacy3 = {key: approval[key] for key in ('source', 'artifact_sha256', 'assurance')}
+    assert check(legacy3), 'legacy 3-key approval rejected'
+    assert not check(dict(approval, routing_profile_sha256='0' * 64)), 'forged routing profile accepted'
+    partial = {key: approval[key] for key in (
+        'source', 'artifact_sha256', 'assurance', 'platform_transcript_verified_sha256')}
+    assert not check(partial), 'partial release commitments accepted'
+    assert not check(dict(approval, supervision_debt_waiver_sha256='not-a-digest')), 'malformed release digest accepted'
+    assert not check(dict(approval, unexpected='x')), 'unknown approval key accepted'
+    # The node-7 layer must accept exactly the legitimately minted shapes and
+    # keep rejecting everything else, with both release digests bound to the
+    # accepted artifact.
+    assert rcheck(approval), 'node 7 rejected the current 6-key local release approval'
+    assert rcheck(legacy5), 'node 7 rejected the legacy 5-key local release approval'
+    assert not rcheck(legacy3), 'node 7 accepted an approval without release commitments'
+    assert not rcheck(partial), 'node 7 accepted partial release commitments'
+    assert not rcheck(dict(approval, unexpected='x')), 'node 7 accepted an unknown approval key'
+    assert not rcheck(dict(approval, platform_transcript_verified_sha256='d' * 64)), \\
+        'node 7 accepted a mismatched transcript digest'
+    assert not rcheck(dict(approval, supervision_debt_waiver_sha256='not-a-digest')), \\
+        'node 7 accepted a malformed debt digest'
+    assert not rcheck(dict(legacy5, routing_profile_sha256='0' * 64)), \\
+        'node 7 accepted a forged routing profile'
+    provider_task = dict(task, decision_policy_version=1)
+    assert not rcheck(approval, provider_task), 'node 7 accepted a local shape under provider policy'
+    legacy4 = {key: approval[key] for key in (
+        'source', 'artifact_sha256',
+        'platform_transcript_verified_sha256', 'supervision_debt_waiver_sha256')}
+    pre_policy = dict(task, decision_policy_version=0)
+    assert rcheck(legacy4, pre_policy), 'node 7 rejected the strict 4-key pre-policy shape'
+    assert not rcheck(legacy5, pre_policy), 'node 7 accepted an assurance key outside the local policy'
+    with open(config_path, 'w', encoding='utf-8') as handle:
+        json.dump([1, 2, 3], handle)
+    assert not check(approval), 'release approval stayed valid when the config could not be loaded'
+    assert not rcheck(approval), 'node 7 release approval stayed valid when the config could not be loaded'
+    standard = dict(task, mode='standard')
+    standard_approval = humandecision.local_approval('user:fixture', artifact, standard)
+    assert check(standard_approval, standard), 'non-release approval must tolerate an unloadable config'
+finally:
+    open(config_path, 'wb').write(config_bytes)
+print('local approval shape probes OK')
+"""],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if approval_probe.returncode:
+        raise AssertionError(f"local approval shape probes failed:\n{approval_probe.stdout}")
+
     # A terminal route binds the ledger and runtime: injecting an active member
     # flips route-resume back to non-terminal.
     ledger_bytes = (root / ".agent/state/agents.json").read_bytes()
@@ -1683,10 +1895,34 @@ print('VERIFIED HUMAN DECISION sha256=' + hashlib.sha256(receipt.read_bytes()).h
         raise AssertionError("projection field tampering did not fail closed")
     (root / ".agent/state/TASK.json").write_bytes(tampered_bytes)
     stage(root, json.loads(tampered_bytes))
-    run(
-        root, "complete-task", "--retrospective", retrospective,
-        "--platform-snapshot", completion_snapshot,
+    # complete-task validates first, then cleans, then asserts zero residuals.
+    # An order-recording agentctl stub proves cleanup precedes the decisive
+    # assert-clean; the previous order ran assert-clean first, which made the
+    # embedded cleanup unreachable for a dirty-but-cleanable runtime. (Node 6
+    # semantic validation independently asserts a clean live runtime during
+    # full-chain validation, so the stub only records the direct call order.)
+    order_log = root / ".agent/state/agentctl-call-order.log"
+    order_log.write_text("", encoding="utf-8")
+    agentctl_path = root / ".agent/scripts/agentctl.py"
+    pristine_agentctl_bytes = agentctl_path.read_bytes()
+    agentctl_path.write_text(
+        "from pathlib import Path\nimport sys\n"
+        "cmd=sys.argv[1] if len(sys.argv)>1 else ''\n"
+        "with Path('.agent/state/agentctl-call-order.log').open('a',encoding='utf-8') as handle: handle.write(cmd+'\\n')\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
     )
+    try:
+        run(
+            root, "complete-task", "--retrospective", retrospective,
+            "--platform-snapshot", completion_snapshot,
+        )
+    finally:
+        agentctl_path.write_bytes(pristine_agentctl_bytes)
+    agentctl_calls = order_log.read_text(encoding="utf-8").splitlines()
+    terminal_calls = agentctl_calls[agentctl_calls.index("validate"):]
+    if terminal_calls != ["validate", "cleanup", "assert-clean"]:
+        raise AssertionError(f"complete-task did not clean before asserting clean: {agentctl_calls}")
     light_done = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
     if light_done["status"] != "accepted":
         raise AssertionError("standard lightweight task did not complete")
@@ -1822,6 +2058,25 @@ print('VERIFIED SCHEDULER RESUME sha256=' + hashlib.sha256(receipt.read_bytes())
     replayed = json.loads(run(root, "route-resume", "--scheduler-receipt", first_receipt))
     if replayed["scheduler_available"] is not False or "nonce" not in str(replayed.get("scheduler_error")):
         raise AssertionError("replayed scheduler receipt nonce was not rejected")
+    # Two concurrent route-resume processes race on the same receipt: the
+    # locked nonce registry lets exactly one consume it.
+    race_receipt = scheduler_receipt("nonce-race")
+    racers = [
+        subprocess.Popen(
+            [sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+             "--scheduler-receipt", race_receipt],
+            cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        for _ in range(2)
+    ]
+    race_results = [json.loads(process.communicate()[0]) for process in racers]
+    race_winners = [item for item in race_results if item.get("scheduler_available") is True]
+    race_losers = [item for item in race_results if item.get("scheduler_available") is not True]
+    if (
+        len(race_winners) != 1 or len(race_losers) != 1
+        or "nonce" not in str(race_losers[0].get("scheduler_error"))
+    ):
+        raise AssertionError(f"concurrent scheduler resumes did not consume the nonce exactly once: {race_results}")
     shutil.rmtree(scheduler_dir)
 
     # A leftover transition journal surfaces a concrete recovery cursor and

@@ -471,6 +471,19 @@ def delivery_state_empty(value: object) -> bool:
     )
 
 
+def delivery_head_wellformed(head: object) -> bool:
+    """Shape check for a chain head: exact fields, 64-hex sha, int bytes >= 1."""
+    return (
+        isinstance(head, dict)
+        and set(head) == {"path", "sha256", "bytes"}
+        and isinstance(head.get("sha256"), str)
+        and HEX64.fullmatch(head["sha256"]) is not None
+        and isinstance(head.get("bytes"), int)
+        and not isinstance(head.get("bytes"), bool)
+        and head["bytes"] >= 1
+    )
+
+
 def archive_delivery_state(raw: bytes) -> Dict[str, object]:
     """Content-address the exact prior delivery.json bytes into evidence."""
     value_sha = hashlib.sha256(raw).hexdigest()
@@ -498,7 +511,10 @@ def delivery_chain_errors(state: Dict[str, object]) -> List[str]:
     Every reset of a non-empty state archives the exact prior bytes under
     evidence/delivery-archives/ and links the fresh state to that receipt.
     Legacy states (neither epoch nor previous_head) predate the chain and
-    are accepted as chain-terminal.
+    are accepted as chain-terminal.  A corrupt or foreign prior state is
+    archived UNLINKED instead: the fresh state restarts at epoch 1 with
+    previous_head=None (see command_init), so the rejected bytes never
+    poison the chain.
     """
     epoch = state.get("epoch")
     head = state.get("previous_head")
@@ -563,20 +579,53 @@ def command_init(_: argparse.Namespace) -> int:
             current = json.loads(raw)
         except (ValueError, json.JSONDecodeError):
             current = None
-        old_epoch = current.get("epoch") if isinstance(current, dict) else None
-        if not isinstance(old_epoch, int) or isinstance(old_epoch, bool) or old_epoch < 1:
-            old_epoch = 1
-        if delivery_state_empty(current):
-            # Empty/fresh states carry no receipts worth archiving; keep the
-            # established chain so a later archival still links across resets.
-            epoch = old_epoch
-            head = current.get("previous_head") if isinstance(current, dict) else None
-            previous_head = head if isinstance(head, dict) else None
+        corrupt_reason = None
+        if not isinstance(current, dict) or current.get("schema") not in {"agent-delivery/v2", "agent-delivery/v3"}:
+            corrupt_reason = (
+                "unparseable JSON" if not isinstance(current, dict)
+                else f"foreign schema {current.get('schema')!r}"
+            )
         else:
-            # A non-empty delivery state is audit evidence: archive its exact
-            # bytes BEFORE resetting, and refuse to reset when archival fails.
-            previous_head = archive_delivery_state(raw)
-            epoch = old_epoch + 1
+            # Schema-valid is not enough: a state whose chain fields are
+            # corrupt would wedge every later validate — a bad epoch breaks
+            # chain continuity once archived, and a malformed previous_head
+            # kept by an empty state fails the archive-head check forever.
+            prior_epoch = current.get("epoch")
+            prior_head = current.get("previous_head")
+            legacy_predating_chain = prior_epoch is None and prior_head is None
+            if not legacy_predating_chain and (
+                not isinstance(prior_epoch, int) or isinstance(prior_epoch, bool) or prior_epoch < 1
+            ):
+                corrupt_reason = f"invalid epoch {prior_epoch!r}"
+            elif prior_head is not None and not delivery_head_wellformed(prior_head):
+                corrupt_reason = "malformed previous_head"
+        if corrupt_reason is not None:
+            # A corrupt or foreign prior state can never re-enter the epoch
+            # chain: delivery_chain_errors would reject the archived bytes
+            # forever, and because route-resume validates delivery state the
+            # whole workflow would wedge with no in-band recovery.  Archive
+            # the exact bytes UNLINKED as evidence and restart the chain at a
+            # fresh epoch 1 with previous_head=None.
+            receipt = archive_delivery_state(raw)
+            print(
+                f"DELIVERY CHAIN BREAK: prior delivery state is corrupt ({corrupt_reason}); "
+                f"archived unlinked at {receipt['path']} sha256={receipt['sha256']}"
+            )
+        else:
+            old_epoch = current.get("epoch")
+            if not isinstance(old_epoch, int) or isinstance(old_epoch, bool) or old_epoch < 1:
+                old_epoch = 1
+            if delivery_state_empty(current):
+                # Empty/fresh states carry no receipts worth archiving; keep the
+                # established chain so a later archival still links across resets.
+                epoch = old_epoch
+                head = current.get("previous_head")
+                previous_head = head if isinstance(head, dict) else None
+            else:
+                # A non-empty delivery state is audit evidence: archive its exact
+                # bytes BEFORE resetting, and refuse to reset when archival fails.
+                previous_head = archive_delivery_state(raw)
+                epoch = old_epoch + 1
     save({
         "schema": "agent-delivery/v3",
         "environment": task.get("environment"),

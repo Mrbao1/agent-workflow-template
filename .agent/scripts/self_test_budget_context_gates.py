@@ -413,6 +413,64 @@ def main() -> int:
         if json.loads(task_path.read_text()).get("scratch_note") != "audit me":
             raise AssertionError("canonical transition did not commit the non-invariant field")
 
+        # The authorized transition subprocess is bounded: the 120s timeout is
+        # passed through, and a hang rolls the whole transaction back instead
+        # of stranding a committed TASK.
+        run(root, sys.executable, "-c", textwrap.dedent("""
+            import copy, json, subprocess, sys
+            from pathlib import Path
+            sys.path.insert(0, '.agent/scripts')
+            import contexttx
+
+            task_path = Path('.agent/state/TASK.json')
+            journal = Path('.agent/state/.context-transition-journal.json')
+            before_bytes = task_path.read_bytes()
+            before = json.loads(before_bytes)
+
+            observed = {}
+            class Failed:
+                returncode = 1
+                stdout = 'forced transition failure'
+
+            def recording_run(command, **kwargs):
+                observed['timeout'] = kwargs.get('timeout')
+                return Failed()
+
+            subprocess.run = recording_run
+            after = copy.deepcopy(before)
+            after['next_action'] = 'timeout kwarg probe'
+            try:
+                contexttx.transition_task(before, after, mutator='workflowctl', operation='advance',
+                                          reason='timeout-probe', summary='forced failure probe')
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError('forced transition failure was not rejected')
+            assert observed['timeout'] == 120, observed
+            assert task_path.read_bytes() == before_bytes
+            assert not journal.exists()
+
+            def hanging_run(command, **kwargs):
+                raise subprocess.TimeoutExpired(command, kwargs.get('timeout'))
+
+            subprocess.run = hanging_run
+            after = copy.deepcopy(before)
+            after['next_action'] = 'hang probe'
+            try:
+                contexttx.transition_task(before, after, mutator='workflowctl', operation='advance',
+                                          reason='hang-probe', summary='simulated hang probe')
+            except SystemExit as error:
+                assert str(error).startswith(
+                    'TASK/context transaction rolled back: '
+                    'authorized context transition timed out after 120s'
+                ), error
+            else:
+                raise AssertionError('hanging transition subprocess was not rejected')
+            assert task_path.read_bytes() == before_bytes
+            assert not journal.exists()
+            print('transition timeout probes OK')
+        """))
+
         # A stuck awaiting_host_compaction capsule pauses sync and plain
         # repair, but repair --reset rebuilds without resurrecting the wait.
         awaiting_body = (
@@ -453,6 +511,20 @@ def main() -> int:
             or capsule["checkpoint"] != stuck["checkpoint"]
         ):
             raise AssertionError("abort did not preserve the checkpoint or record the aborted event")
+        # The stored abort approval is revalidated on every check with the
+        # same discipline as repair approvals: a forged or drifted approval
+        # invalidates the capsule until it is restored.
+        original_abort = capsule["compaction"]["host_compaction_abort"]
+        forged_abort = {
+            **original_abort,
+            "approval": {**original_abort["approval"], "routing_profile_sha256": "0" * 64},
+        }
+        rewrite_context(root, f"v['compaction']['host_compaction_abort']={json.dumps(forged_abort)};")
+        denied = run(root, sys.executable, contextctl, "check", expected=1)
+        if "host compaction abort" not in denied.stdout:
+            raise AssertionError(f"forged abort approval was not revalidated:\n{denied.stdout}")
+        rewrite_context(root, f"v['compaction']['host_compaction_abort']={json.dumps(original_abort)};")
+        run(root, sys.executable, contextctl, "check", "--quiet")
         run(root, sys.executable, contextctl, "abort-host-compaction",
             "--source", "user:double-abort", expected=1)
         run(root, sys.executable, contextctl, "sync",
@@ -500,6 +572,33 @@ def main() -> int:
         if status.get("state") != "none":
             raise AssertionError("restored transition journal was not cleaned up")
 
+        # A rolled-back journal is stale too: restore must refuse it, name the
+        # actual state and the safe discard command, and leave files untouched.
+        write(journal_path, {
+            "schema": "agent-context-transition-journal/v1",
+            "mutator": "workflowctl", "operation": "advance", "reason": "crash-after-rollback",
+            "issued_at": "2026-07-30T00:00:00+00:00",
+            "backups": {
+                ".agent/state/TASK.json": journal_entry(task_path.read_bytes()),
+                ".agent/state/CONTEXT.json": journal_entry(context_path.read_bytes()),
+            },
+            "absent_before": [],
+            "after_sha256": {
+                ".agent/state/TASK.json": "0" * 64,
+                ".agent/state/CONTEXT.json": None,
+            },
+        })
+        status = json.loads(run(root, sys.executable, contextctl, "journal", expected=1).stdout)
+        if status.get("state") != "rolled_back":
+            raise AssertionError("rolled-back transition journal was not classified as stale")
+        current_task_bytes = task_path.read_bytes()
+        denied = run(root, sys.executable, contextctl, "journal", "--restore", expected=1)
+        if "rolled_back" not in denied.stdout or "--discard" not in denied.stdout:
+            raise AssertionError(f"restore did not refuse a rolled-back journal:\n{denied.stdout}")
+        if task_path.read_bytes() != current_task_bytes:
+            raise AssertionError("a refused restore still mutated TASK")
+        run(root, sys.executable, contextctl, "journal", "--discard")
+
         write(journal_path, {
             "schema": "agent-context-transition-journal/v1",
             "mutator": "workflowctl", "operation": "advance", "reason": "crash-after-commit",
@@ -518,6 +617,13 @@ def main() -> int:
         status = json.loads(run(root, sys.executable, contextctl, "journal", expected=1).stdout)
         if status.get("state") != "committed" or "--discard" not in status.get("recovery", ""):
             raise AssertionError("committed transition journal was not classified for discard")
+        # Restoring a stale committed journal would silently revert the valid
+        # committed state, so restore refuses it and names the discard path.
+        denied = run(root, sys.executable, contextctl, "journal", "--restore", expected=1)
+        if "committed" not in denied.stdout or "--discard" not in denied.stdout:
+            raise AssertionError(f"restore did not refuse a committed journal:\n{denied.stdout}")
+        if task_path.read_bytes() != task_bytes or context_path.read_bytes() != context_bytes + b" \n":
+            raise AssertionError("restore on a committed journal reverted valid committed state")
         run(root, sys.executable, contextctl, "journal", "--discard")
         context_path.write_bytes(context_bytes)
         run(root, sys.executable, contextctl, "check", "--quiet")
@@ -570,6 +676,33 @@ def main() -> int:
             forged = dict(approval, routing_profile_sha256='b' * 64)
             assert not humandecision.local_approval_valid(
                 release_task, forged, source='user:fixture', artifact_sha256=artifact, config=permissive)
+
+            # Release acceptance approvals under the local boundary carry the
+            # transcript/debt commitment pair: the current 6-key shape (bound
+            # routing profile) and the legacy 5-key shape both validate, the
+            # digests are shape-checked, and partial or unknown keys fail.
+            release_pair = {
+                'platform_transcript_verified_sha256': 'c' * 64,
+                'supervision_debt_waiver_sha256': 'd' * 64,
+            }
+            current_release = {**approval, **release_pair}
+            assert humandecision.local_approval_valid(
+                release_task, current_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            legacy_release = {key: current_release[key] for key in (
+                'source', 'artifact_sha256', 'assurance',
+                'platform_transcript_verified_sha256', 'supervision_debt_waiver_sha256')}
+            assert humandecision.local_approval_valid(
+                release_task, legacy_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            partial_release = {key: current_release[key] for key in (
+                'source', 'artifact_sha256', 'assurance', 'platform_transcript_verified_sha256')}
+            assert not humandecision.local_approval_valid(
+                release_task, partial_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            bad_release_digest = dict(current_release, supervision_debt_waiver_sha256='not-a-digest')
+            assert not humandecision.local_approval_valid(
+                release_task, bad_release_digest, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            unknown_key = dict(current_release, unexpected='x')
+            assert not humandecision.local_approval_valid(
+                release_task, unknown_key, source='user:fixture', artifact_sha256=artifact, config=permissive)
 
             assert humandecision.try_adapter_path(None, None) is None
             assert humandecision.try_adapter_path(None, '  ') is None
@@ -659,7 +792,7 @@ def main() -> int:
             raise AssertionError(f"capsule validation did not fail closed on the budget invariant:\n{denied.stdout}")
         write(config_path, fixture_config)
         run(root, sys.executable, contextctl, "check", "--quiet")
-    print("PASS: atomic and sealed test budget, bounded pipe cleanup, provider-gated infrastructure remediation, context freshness, bundle migration, host-compaction and journal gates, token-ledger calibration")
+    print("PASS: atomic and sealed test budget, bounded pipe cleanup, provider-gated infrastructure remediation, context freshness, bundle migration, host-compaction abort revalidation and journal restore guards, bounded transition timeout, token-ledger calibration")
     return 0
 
 

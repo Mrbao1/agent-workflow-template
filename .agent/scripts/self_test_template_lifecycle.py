@@ -576,6 +576,64 @@ def main() -> int:
         if custom35_migrated["routing"]["modes"]["fast"]["token_budget"] != 11000:
             raise SystemExit("migrations 35/36 overwrote a project-owned custom fast token budget")
 
+        # Migration 36 carries CUSTOMIZED legacy transition-increment values
+        # into the honest overhead key instead of silently discarding them;
+        # only the legacy seed constants are recalibrated away (covered by
+        # the migration-22 fixture above).  The carry is reinterpreted: the
+        # alias was charged as the bare value per transition while the new
+        # key adds the inherited-turn surcharge (800), so each carried value
+        # is reduced by that surcharge to preserve the tuned TOTAL, floored
+        # at the new key's minimum of 50 (250 -> 50, 1200 -> 400, 1500 -> 700).
+        tuned36 = workspace / "migration36-tuned-increment"
+        run(sys.executable, str(installer), str(tuned36), "--project-name", "fixture-migration36-tuned")
+        tuned36_config_path = tuned36 / ".agent/config.json"
+        tuned36_config = json.loads(tuned36_config_path.read_text(encoding="utf-8"))
+        tuned36_config["context"].pop("estimated_turn_overhead_tokens", None)
+        tuned36_config["context"]["automatic_transition_token_increment"] = {
+            "fast": 250, "standard": 1200, "release": 1500,
+        }
+        tuned36_config_path.write_text(json.dumps(tuned36_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tuned36_manifest_path = tuned36 / ".agent/.workflow-manifest.json"
+        tuned36_manifest = json.loads(tuned36_manifest_path.read_text(encoding="utf-8"))
+        tuned36_manifest["version"] = "3.1.41"
+        tuned36_manifest["migration_version"] = 34
+        tuned36_manifest_path.write_text(json.dumps(tuned36_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(tuned36), "--update")
+        tuned36_migrated = json.loads(tuned36_config_path.read_text(encoding="utf-8"))
+        if (
+            tuned36_migrated["context"].get("estimated_turn_overhead_tokens")
+            != {"fast": 50, "standard": 400, "release": 700}
+            or "automatic_transition_token_increment" in tuned36_migrated["context"]
+        ):
+            raise SystemExit("migration 36 discarded a project's customized legacy turn-increment values")
+
+        # A project that already tuned the NEW overhead key keeps it; the
+        # legacy alias is still retired without carrying anything.
+        kept36 = workspace / "migration36-tuned-overhead"
+        run(sys.executable, str(installer), str(kept36), "--project-name", "fixture-migration36-kept")
+        kept36_config_path = kept36 / ".agent/config.json"
+        kept36_config = json.loads(kept36_config_path.read_text(encoding="utf-8"))
+        kept36_config["context"]["estimated_turn_overhead_tokens"] = {
+            "fast": 2100, "standard": 3100, "release": 4100,
+        }
+        kept36_config["context"]["automatic_transition_token_increment"] = {
+            "fast": 250, "standard": 350, "release": 600,
+        }
+        kept36_config_path.write_text(json.dumps(kept36_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        kept36_manifest_path = kept36 / ".agent/.workflow-manifest.json"
+        kept36_manifest = json.loads(kept36_manifest_path.read_text(encoding="utf-8"))
+        kept36_manifest["version"] = "3.1.41"
+        kept36_manifest["migration_version"] = 34
+        kept36_manifest_path.write_text(json.dumps(kept36_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(kept36), "--update")
+        kept36_migrated = json.loads(kept36_config_path.read_text(encoding="utf-8"))
+        if (
+            kept36_migrated["context"].get("estimated_turn_overhead_tokens")
+            != {"fast": 2100, "standard": 3100, "release": 4100}
+            or "automatic_transition_token_increment" in kept36_migrated["context"]
+        ):
+            raise SystemExit("migration 36 overwrote a project-owned estimated_turn_overhead_tokens policy")
+
         # An install from before the budget recalibration that has NOT been
         # migrated still validates: the deprecated transition-increment alias
         # keeps its exact legacy arithmetic (no bootstrap floor, no

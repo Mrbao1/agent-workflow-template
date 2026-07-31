@@ -288,7 +288,20 @@ def manifest(path,required=False):
         expected=canonical_sha256(payload)
         if value.get("source_tree_sha256")!=expected: raise SystemExit("workflow install manifest source tree hash is invalid")
     else: raise SystemExit("invalid workflow install manifest")
-    if not isinstance(value.get("migration_version"),int): raise SystemExit("workflow install manifest migration version is missing")
+    if not isinstance(value.get("migration_version"),int): raise SystemExit("workflow install manifest migration version is missing or malformed")
+    return value
+
+
+def installed_migration_version(installed):
+    """Defensive guard for every int(migration_version) use site.
+
+    manifest() already rejects non-integer values, but a malformed manifest
+    must never surface as an uncaught ValueError traceback downstream.
+    """
+    value=installed.get("migration_version",0)
+    if isinstance(value,bool) or not isinstance(value,int):
+        try: return int(str(value).strip())
+        except (TypeError,ValueError): raise SystemExit(f"workflow install manifest migration version is malformed: {value!r}")
     return value
 
 
@@ -1459,7 +1472,7 @@ def fresh_empty_platform_snapshot(raw):
 
 def migrate_private(source,destination,agent_platform_snapshot=None,project_root=None,allow_current_chat_local_release=False,idle_reseed=True):
     prior_install=manifest(destination/".workflow-manifest.json",required=True)
-    prior_migration=int(prior_install.get("migration_version",0))
+    prior_migration=installed_migration_version(prior_install)
     seed=fresh_state_seed(source)
     config_path=destination/"config.json"; task_path=destination/"state/TASK.json"
     config=json.loads(config_path.read_text(encoding="utf-8")); defaults=json.loads((seed/"config.json").read_text(encoding="utf-8"))
@@ -1535,8 +1548,53 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
                 entry["token_budget"]=new_budget
         # Retire the deprecated transition-increment alias: deep_fill has
         # already supplied the honest per-turn overhead and bootstrap floor
-        # from the seed, so the alias must not survive the migration.
-        config.setdefault("context",{}).pop("automatic_transition_token_increment",None)
+        # from the seed, so the alias must not survive the migration.  A
+        # project's CUSTOMIZED legacy values are not discarded, though: when
+        # the new key is still at the seed default, carry each mode whose
+        # legacy value differs from that mode's legacy seed constant
+        # (150/300/500) before popping the alias.  Modes left at the legacy
+        # seed constant are dropped on purpose — the recalibrated honest
+        # overhead replaces them, and carrying them would write the fiction
+        # back over it.
+        context=config.setdefault("context",{})
+        legacy_increment=context.get("automatic_transition_token_increment")
+        legacy_seed_increment={"fast":150,"standard":300,"release":500}
+        if (
+            isinstance(legacy_increment,dict)
+            and context.get("estimated_turn_overhead_tokens")==defaults["context"]["estimated_turn_overhead_tokens"]
+        ):
+            overhead=context.get("estimated_turn_overhead_tokens")
+            if isinstance(overhead,dict):
+                # The legacy alias was charged as the bare value per
+                # transition; the new key is charged as value PLUS
+                # agent_control.inherited_turn_estimated_tokens.  Subtract
+                # the inherited surcharge so the carried value preserves the
+                # tuned TOTAL per transition, floored at the new key's
+                # minimum of 50.
+                inherited=config.get("agent_control",{}).get("inherited_turn_estimated_tokens")
+                if not isinstance(inherited,int) or isinstance(inherited,bool) or inherited<1:
+                    inherited=defaults["agent_control"]["inherited_turn_estimated_tokens"]
+                for mode,value in legacy_increment.items():
+                    if (
+                        mode in overhead
+                        and isinstance(value,int) and not isinstance(value,bool)
+                        and value!=legacy_seed_increment.get(mode)
+                    ):
+                        overhead[mode]=max(50,value-inherited)
+                # A carry can break the fast<=standard<=release invariant
+                # (e.g. a project that tuned only release below standard's
+                # new default would migrate into a config agentctl validate
+                # rejects).  Clamp carried values upward to monotonicity;
+                # an invalid migrated config is worse than imperfect tuning.
+                floor=0
+                for mode in ("fast","standard","release"):
+                    current=overhead.get(mode)
+                    if isinstance(current,int) and not isinstance(current,bool):
+                        if current<floor:
+                            overhead[mode]=floor
+                        else:
+                            floor=current
+        context.pop("automatic_transition_token_increment",None)
         control=config.setdefault("agent_control",{})
         if control.get("child_system_tool_margin_tokens")==1000:
             control["child_system_tool_margin_tokens"]=security_defaults["child_system_tool_margin_tokens"]
@@ -1873,7 +1931,7 @@ def execute(args,source_root,target):
         return 2
     wanted,plugin_wanted,wanted_entry,entry_digest=source_contract(source_root)
     installed=manifest(manifest_path,required=True)
-    if version_relation(installed.get("version"),VERSION)=="target_newer" or int(installed.get("migration_version",0))>MIGRATION_VERSION:
+    if version_relation(installed.get("version"),VERSION)=="target_newer" or installed_migration_version(installed)>MIGRATION_VERSION:
         reason=(
             f"installed workflow {installed.get('version')} (migration {installed.get('migration_version')}) "
             f"is newer than template {VERSION} (migration {MIGRATION_VERSION})"
@@ -1890,14 +1948,14 @@ def execute(args,source_root,target):
     if conflicts:
         print("UPDATE BLOCKED: locally modified managed files"); [print(f"- {item}") for item in conflicts]; return 2
     if args.check:
-        validate_project_guardrails(destination,allow_legacy=int(installed.get("migration_version",0))<33)
+        validate_project_guardrails(destination,allow_legacy=installed_migration_version(installed)<33)
         planned_agents_sha256=hashlib.sha256(render_bootstrap(target/"AGENTS.md").encode()).hexdigest()
         planned_claude_sha256=hashlib.sha256(render_bootstrap(target/"CLAUDE.md").encode()).hexdigest()
         manifest_matches_source=installed==install_manifest(wanted,plugin_wanted,entry_digest,planned_agents_sha256,planned_claude_sha256)
         if writes or removes or agents_write or claude_write or installed.get("version")!=VERSION or installed.get("migration_version")!=MIGRATION_VERSION or not manifest_matches_source:
             print(f"UPDATE AVAILABLE: writes={len(writes)} removes={len(removes)} bootstrap={int(agents_write or claude_write)} version={installed.get('version')}->{VERSION}"); return 1
         print(f"WORKFLOW CURRENT: {VERSION}"); return 0
-    if int(installed.get("migration_version",0))<34:
+    if installed_migration_version(installed)<34:
         validate_legacy_active_context(destination)
     if args.dry_run: print(f"DRY RUN update: writes={len(writes)} removes={len(removes)}"); return 0
     candidate_parent=begin_transaction(target)

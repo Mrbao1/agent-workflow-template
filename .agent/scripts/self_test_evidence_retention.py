@@ -343,6 +343,86 @@ with tempfile.TemporaryDirectory(prefix="delivery-chain-") as raw:
         raise AssertionError("epoch did not advance across repeated non-empty resets")
     run_delivery(root, "validate")
 
+# A corrupt or foreign prior delivery state must never poison the epoch chain:
+# init archives the exact bytes UNLINKED and restarts at a fresh epoch 1.
+with tempfile.TemporaryDirectory(prefix="delivery-chain-break-") as raw:
+    root = Path(raw); state = root / ".agent/state"
+    fresh_project(root, delivery=True)
+    write_json(state / "TASK.json", {"environment": "local", "deployment_requested": True})
+
+    (state / "delivery.json").write_bytes(b"{not json")
+    output = run_delivery(root, "init")
+    if "DELIVERY CHAIN BREAK" not in output or "unparseable JSON" not in output:
+        raise AssertionError(f"corrupt prior state did not break the chain loudly: {output}")
+    current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
+    if current["epoch"] != 1 or current["previous_head"] is not None:
+        raise AssertionError(f"chain break did not restart at an unlinked epoch 1: {current}")
+    run_delivery(root, "validate")
+    broken_archives = list((state / "evidence/delivery-archives").glob("*.json"))
+    if len(broken_archives) != 1 or broken_archives[0].read_bytes() != b"{not json":
+        raise AssertionError("corrupt prior bytes were not preserved as unlinked evidence")
+
+    # A foreign-schema state (parseable but not a delivery state) breaks too.
+    foreign = dict(current)
+    foreign["schema"] = "agent-delivery/v99"
+    foreign["epoch"] = 7
+    write_json(state / "delivery.json", foreign)
+    output = run_delivery(root, "init")
+    if "DELIVERY CHAIN BREAK" not in output or "foreign schema" not in output:
+        raise AssertionError(f"foreign prior state did not break the chain loudly: {output}")
+    current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
+    if current["epoch"] != 1 or current["previous_head"] is not None:
+        raise AssertionError(f"foreign schema did not restart the chain: {current}")
+    run_delivery(root, "validate")
+
+    # A schema-valid state with a non-integer epoch would be archived and
+    # linked, wedging every later validate on chain continuity: break instead.
+    wedged = dict(current)
+    wedged["epoch"] = "corrupt"
+    write_json(state / "delivery.json", wedged)
+    output = run_delivery(root, "init")
+    if "DELIVERY CHAIN BREAK" not in output or "invalid epoch" not in output:
+        raise AssertionError(f"non-integer epoch did not break the chain loudly: {output}")
+    current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
+    if current["epoch"] != 1 or current["previous_head"] is not None:
+        raise AssertionError(f"invalid epoch did not restart the chain: {current}")
+    run_delivery(root, "validate")
+
+    # An empty state whose previous_head is a malformed head would be KEPT and
+    # fail "archive head is invalid or missing" on every validate: break instead.
+    wedged = dict(current)
+    wedged["previous_head"] = {"path": "bogus", "sha256": "not-hex", "bytes": "lots"}
+    write_json(state / "delivery.json", wedged)
+    output = run_delivery(root, "init")
+    if "DELIVERY CHAIN BREAK" not in output or "malformed previous_head" not in output:
+        raise AssertionError(f"malformed previous_head did not break the chain loudly: {output}")
+    current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
+    if current["epoch"] != 1 or current["previous_head"] is not None:
+        raise AssertionError(f"malformed previous_head did not restart the chain: {current}")
+    run_delivery(root, "validate")
+
+    # The chain keeps working after a break: the next non-empty reset links
+    # epoch 2 back to the post-break state and validate accepts it.
+    artifact = root / "dist/app.bin"; artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact_bytes = b"post-break artifact\n"; artifact.write_bytes(artifact_bytes)
+    artifact_sha = sha256(artifact_bytes)
+    current.update({
+        "status": "awaiting_test",
+        "artifact": {
+            "path": "dist/app.bin", "sha256": artifact_sha, "bytes": len(artifact_bytes),
+            "digest": f"sha256:{artifact_sha}", "built_by": "builder-1",
+            "source_branch": "release/1.0", "source_revision": "a" * 40,
+            "build_run_id": "run-1", "recorded_at": "2026-01-01T00:00:00+00:00",
+        },
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    })
+    write_json(state / "delivery.json", current)
+    run_delivery(root, "init")
+    current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
+    if current["epoch"] != 2 or not isinstance(current["previous_head"], dict):
+        raise AssertionError(f"post-break reset did not link epoch 2: {current}")
+    run_delivery(root, "validate")
+
 # Reference roots are configurable; orphans are reported then GC'd; restore holds the lock.
 with tempfile.TemporaryDirectory(prefix="evidence-roots-") as raw:
     root = Path(raw); state = root / ".agent/state"
