@@ -18,4 +18,4 @@ jobs:
         with:
           python-version: "3.x"
       - name: Run self-test shard ${{ matrix.shard }}
-        run: python3 tests/run_all.py --shard ${{ matrix.shard }}
+        run: python3 tests/run_all.py --shard ${{ matrix.shard }} --test-timeout 600
