@@ -1,6 +1,6 @@
 {
   "files": {
-    "config.json": "94909f8299b9a784227331c350dfc67f04c09a03e89d2aa6f8efd268256a4228",
+    "config.json": "db510aad7715f34696766c8f769f0cbaa50ffa021359bcfcd191ac90749071bc",
     "policies/PROJECT_GUARDRAILS.md": "946f0d7e305e07207abbb04aad1510926b5b55015f936b29a1d3607ff9b44410",
     "state/.agents.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.context.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -12,7 +12,7 @@
     "state/.template.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.test-budget.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.tool-leases.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "state/CONTEXT.json": "f680b78f54fbf138e61832937d2155451174555c35508433b955302a22e21b4d",
+    "state/CONTEXT.json": "7a81fe47938b431eaec9824b9d051e9c2d5818c77e26f2c5410f83ca3374193a",
     "state/EVIDENCE_INDEX.json": "07a69ede5e76baa6c76785bf4ce9af2867eb1196e3beadec7f188443c0eb71bc",
     "state/REQUIREMENT_CONTRACT.md": "6448c992b8fd13a4ea74ab8dc51dd8ace85eb2d77023ceb63246c2c61c39fe01",
     "state/STAGE_INDEX.md": "2989e930da2c51d925569d4b497ae80b70e38045e0f5d22aeb3ab90774a4bfda",
@@ -24,5 +24,5 @@
     "state/tool-leases.json": "30a8abc54262011d90f3019ee31ba8ed9fa59105f33236e11924534c031f304f"
   },
   "schema": "agent-workflow-fresh-state-seed/v1",
-  "seed_sha256": "6ab28a916d51cddf0384baf60a7c073e214dcd7ba6864d875eb76963e74be826"
+  "seed_sha256": "f0cdbe87d53cb70947d752c30723b4fc1caf36bb3d79ab7203d9fd8b2590450e"
 }

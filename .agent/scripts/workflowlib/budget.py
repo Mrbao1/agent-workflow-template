@@ -15,11 +15,13 @@ from typing import Dict, List, Optional, Tuple
 # mid-task turn (host system-prompt replay + capsule + tool definitions) is
 # multi-thousand tokens, not 150/300/500.  Hosts calibrate these per provider.
 DEFAULT_TURN_OVERHEAD_TOKENS = {"fast": 2000, "standard": 3000, "release": 4000}
+DEFAULT_TRANSITION_INCREMENT_TOKENS = {"fast": 200, "standard": 400, "release": 800}
 DEFAULT_DISPATCH_PAYLOAD_LIMITS = {"fast": 0, "standard": 16000, "release": 32000}
 DEFAULT_CHILD_SYSTEM_TOOL_MARGIN = 4000
 DEFAULT_CHILD_OUTPUT_MARGIN = 2000
 DEFAULT_INHERITED_TURN_TOKENS = 800
 TURN_OVERHEAD_KEY = "estimated_turn_overhead_tokens"
+TRANSITION_INCREMENT_KEY = "transition_token_increment"
 LEGACY_TURN_OVERHEAD_KEY = "automatic_transition_token_increment"
 
 
@@ -75,30 +77,51 @@ def turn_overhead_policy(config: Dict[str, object]) -> Tuple[Dict[str, object], 
     return dict(DEFAULT_TURN_OVERHEAD_TOKENS), False
 
 
-def transition_overhead_estimate(config: Dict[str, object], mode: str) -> int:
-    """Estimated tokens one recorded root transition adds to the active window.
+def transition_increment_policy(config: Dict[str, object]) -> Tuple[Dict[str, object], bool]:
+    """Resolve the per-mode bookkeeping increment; the bool marks the legacy alias.
 
-    Under the current key this is the per-turn host overhead plus the
-    inherited host context charged per root turn
-    (``agent_control.inherited_turn_estimated_tokens``, the same quantity
-    charged per fork turn at child dispatch).
+    A TASK/CONTEXT transition is a control-plane checkpoint inside a host turn,
+    not evidence that the host replayed an entire turn. Current projects use a
+    small explicit transition increment. Pre-migration projects keep the exact
+    arithmetic of the deprecated alias until the installer carries it forward.
     """
-    overheads, legacy = turn_overhead_policy(config)
-    increment = overheads.get(mode)
+    context = config.get("context", {}) if isinstance(config.get("context"), dict) else {}
+    configured = context.get(TRANSITION_INCREMENT_KEY)
+    if isinstance(configured, dict):
+        return configured, False
+    if configured is not None:
+        return {}, False
+    legacy = context.get(LEGACY_TURN_OVERHEAD_KEY)
+    if isinstance(legacy, dict):
+        return legacy, True
+    return dict(DEFAULT_TRANSITION_INCREMENT_TOKENS), False
+
+
+def transition_increment_estimate(config: Dict[str, object], mode: str) -> int:
+    """Estimated active-window growth caused by one canonical transition."""
+    increments, _ = transition_increment_policy(config)
+    increment = increments.get(mode)
     if not isinstance(increment, int) or isinstance(increment, bool) or increment <= 0:
+        raise ValueError(f"transition token increment is invalid for mode {mode}")
+    return increment
+
+
+def turn_overhead_estimate(config: Dict[str, object], mode: str) -> int:
+    """Estimated active-window growth caused by one real host/model turn."""
+    overheads, _ = turn_overhead_policy(config)
+    overhead = overheads.get(mode)
+    if not isinstance(overhead, int) or isinstance(overhead, bool) or overhead <= 0:
         raise ValueError(f"estimated turn overhead is invalid for mode {mode}")
-    if legacy:
-        return increment
-    agent = config.get("agent_control", {}) if isinstance(config.get("agent_control"), dict) else {}
-    return increment + _integer(agent.get("inherited_turn_estimated_tokens"), DEFAULT_INHERITED_TURN_TOKENS)
+    return overhead
 
 
 def measured_turn_delta(task: Dict[str, object]) -> Optional[int]:
-    """Provider-observed growth between the two latest usage receipts, if any.
+    """Return cumulative-cost growth between the two latest usage receipts.
 
-    Cumulative receipts cannot replace the active-window estimate, but the
-    delta between two provider-observed cumulative measurements is real
-    per-period growth and is preferred over the configured turn estimate.
+    This helper is intentionally not used by active-window transition
+    accounting. A cumulative provider receipt measures task/session cost, not
+    the currently replayed context, and reusing its latest delta at more than
+    one state transition would charge the same period repeatedly.
     """
     receipts = task.get("usage_receipts")
     latest = receipts[-2:] if isinstance(receipts, list) else []
@@ -153,6 +176,10 @@ def config_budget_errors(config: Dict[str, object]) -> List[str]:
     output_margin = _integer(agent.get("child_output_margin_tokens"), DEFAULT_CHILD_OUTPUT_MARGIN)
     inherited = 0 if legacy else _integer(agent.get("inherited_turn_estimated_tokens"), DEFAULT_INHERITED_TURN_TOKENS)
     turn_key = LEGACY_TURN_OVERHEAD_KEY if legacy else TURN_OVERHEAD_KEY
+    increments, increment_legacy = transition_increment_policy(config)
+    increment_key = LEGACY_TURN_OVERHEAD_KEY if increment_legacy else TRANSITION_INCREMENT_KEY
+    if not increments and context.get(TRANSITION_INCREMENT_KEY) is not None:
+        errors.append(f"context.{TRANSITION_INCREMENT_KEY} must be a per-mode object of positive integers")
     for mode in sorted(modes):
         mode_policy = modes.get(mode)
         budget = _integer(mode_policy.get("token_budget")) if isinstance(mode_policy, dict) else 0
@@ -163,6 +190,11 @@ def config_budget_errors(config: Dict[str, object]) -> List[str]:
         if not isinstance(turn, int) or isinstance(turn, bool) or turn <= 0:
             errors.append(f"context.{turn_key}.{mode} must be a positive integer")
             continue
+        transition = increments.get(mode)
+        if not isinstance(transition, int) or isinstance(transition, bool) or transition <= 0:
+            errors.append(f"context.{increment_key}.{mode} must be a positive integer")
+        elif not increment_legacy and transition > 1000:
+            errors.append(f"context.{increment_key}.{mode} must not exceed 1000 tokens")
         payload = _integer(limits.get(mode), 0)
         charge = payload + system_margin + output_margin if payload > 0 else 0
         baseline = bootstrap + turn + inherited

@@ -57,6 +57,7 @@ def fixture(root: Path) -> None:
             "max_bytes": 8192, "max_list_items": 10,
             "max_capsule_tokens": {"fast": 2200, "standard": 2600, "release": 3200},
             "estimated_turn_overhead_tokens": {"fast": 150, "standard": 300, "release": 500},
+            "transition_token_increment": {"fast": 200, "standard": 400, "release": 800},
             "bootstrap_overhead_tokens": 1200,
             "soft_budget_ratio": 0.6, "compact_budget_ratio": 0.75,
             "hard_budget_ratio": 0.9, "max_active_checkpoint_age_minutes": 45,
@@ -107,7 +108,8 @@ def rewrite_context(root: Path, body: str) -> None:
             + body
             + "comp=v['compaction'];est=contextctl.normalized_token_estimate(v);"
             "comp['capsule_estimated_tokens']=est;"
-            "comp['tokens_removed']=int(comp['source_estimated_tokens'])-est;"
+            "comp['capsule_reduction_tokens']=int(comp['source_estimated_tokens'])-est;"
+            "comp['tokens_removed']=0;"
             "comp['compression_ratio']=round(int(comp['source_estimated_tokens'])/max(est,1),2);"
             "v['integrity']['content_sha256']='0'*64;"
             "v['integrity']['content_sha256']=contextctl.content_sha256(v);"
@@ -392,6 +394,30 @@ def main() -> int:
             or not re.fullmatch(r"[0-9a-f]{64}", str(approval.get("routing_profile_sha256", "")))
         ):
             raise AssertionError("local repair approval was not recorded with its routing profile")
+        run(root, sys.executable, contextctl, "check", "--quiet")
+        run(root, sys.executable, contextctl, "account-turn", "--turn-id", "reviewed-repair-turn")
+        reviewed_turn = json.loads(context_path.read_text())
+        if (
+            reviewed_turn.get("integrity", {}).get("source") != "user:fixture-review"
+            or reviewed_turn.get("compaction", {}).get("source", "").startswith("host-turn:") is not True
+        ):
+            raise AssertionError("host-turn accounting overwrote reviewed repair approval provenance")
+        run(root, sys.executable, contextctl, "check", "--quiet")
+
+        # A reviewed repair belongs to the verified pre-transition capsule.
+        # The next legal TASK transition may intentionally change the routing
+        # profile; contextctl must reverify the old approval against the
+        # authorization's before_task, then seal a fresh post-transition
+        # capsule. Revalidating it against the already-written after_task
+        # deadlocks every new task/profile.
+        run(root, sys.executable, "-c", (
+            "import copy,json,sys;sys.path.insert(0,'.agent/scripts');import contexttx;"
+            "p='.agent/state/TASK.json';before=json.load(open(p));after=copy.deepcopy(before);"
+            "after['files']=int(before.get('files',0))+1;"
+            "after['next_action']='legal post-repair routing transition';"
+            "contexttx.transition_task(before,after,mutator='agentctl',operation='start',"
+            "reason='post-repair-route-change',summary='change route after reviewed repair')"
+        ))
         run(root, sys.executable, contextctl, "check", "--quiet")
 
         # A canonical transition cleans up its crash journal and records
@@ -749,31 +775,103 @@ def main() -> int:
                           'estimated_turn_overhead_tokens.standard', 'hard_budget_ratio'):
                 assert field in message, (field, message)
 
-            # The deprecated alias keeps its exact legacy arithmetic; the
-            # current key charges turn overhead + inherited host context.
+            # The deprecated alias keeps its exact legacy arithmetic. The
+            # current transition key is independent from the honest per-turn
+            # overhead: state changes inside one turn must not fabricate
+            # another system-prompt replay.
             previous = {{'usage_freshness': {{'estimated_tokens': 1000}}}}
             plain = {{'mode': 'standard', 'usage_receipts': []}}
             legacy = {{'context': {{'automatic_transition_token_increment': {{'standard': 300}}}}, 'agent_control': {{}}}}
             assert contextctl.automatic_transition_source_tokens(legacy, previous, plain) == 1300
-            current = {{'context': {{'estimated_turn_overhead_tokens': {{'standard': 300}}}},
+            current = {{'context': {{
+                            'estimated_turn_overhead_tokens': {{'standard': 3000}},
+                            'transition_token_increment': {{'standard': 400}},
+                       }},
                         'agent_control': {{'inherited_turn_estimated_tokens': 800}}}}
-            assert contextctl.automatic_transition_source_tokens(current, previous, plain) == 2100
+            assert contextctl.automatic_transition_source_tokens(current, previous, plain) == 1400
 
-            # A provider-observed delta between the two latest cumulative
-            # receipts is preferred over the configured estimate; a shrinking
-            # delta (real compaction) falls back to the estimate.
+            # Cumulative provider receipts affect the cumulative-cost account
+            # only. Their latest delta is a useful diagnostic, but must not be
+            # replayed at one or more active-window transitions.
             measured = {{'mode': 'standard', 'usage_receipts': [
                 {{'total_tokens': 5000, 'sha256': '0' * 64}},
                 {{'total_tokens': 14000, 'sha256': '1' * 64}},
             ]}}
-            assert contextctl.automatic_transition_source_tokens(current, previous, measured) == 10000
+            assert budget.measured_turn_delta(measured) == 9000
+            first = contextctl.automatic_transition_source_tokens(current, previous, measured)
+            second = contextctl.automatic_transition_source_tokens(
+                current, {{'usage_freshness': {{'estimated_tokens': first}}}}, measured
+            )
+            assert (first, second) == (1400, 1800), (first, second)
             shrinking = {{'mode': 'standard', 'usage_receipts': [
                 {{'total_tokens': 9000, 'sha256': '0' * 64}},
                 {{'total_tokens': 4000, 'sha256': '1' * 64}},
             ]}}
-            assert contextctl.automatic_transition_source_tokens(current, previous, shrinking) == 2100
+            assert contextctl.automatic_transition_source_tokens(current, previous, shrinking) == 1400
+
+            # Post-completion accounting preserves either an ordinary
+            # complete-task receipt or one of the two installer-verified
+            # terminal migration origins. Arbitrary markers fail closed.
+            completion_auth = {{
+                'mutator': 'workflowctl', 'operation': 'complete-task',
+                'receipt_sha256': 'a' * 64,
+            }}
+            ordinary_origin = contextctl.terminal_completion_origin({{
+                'checkpoint': {{'transition_authorization': completion_auth}},
+                'compaction': {{'source': 'mutator:workflowctl'}},
+            }})
+            assert ordinary_origin == {{
+                'schema': 'agent-terminal-completion-origin/v1',
+                'kind': 'complete-task',
+                'transition_authorization': completion_auth,
+            }}
+            for reason, source in (
+                ('migration-26-final-state-rebind', 'installer-verified-active-migration'),
+                ('migration-34-final-state-rebind', 'installer-verified-context-efficiency-migration'),
+            ):
+                migration_origin = contextctl.terminal_completion_origin({{
+                    'checkpoint': {{'reason': reason, 'transition_authorization': None}},
+                    'compaction': {{'source': source}},
+                }})
+                assert migration_origin == {{
+                    'schema': 'agent-terminal-completion-origin/v1',
+                    'kind': 'installer-migration',
+                    'reason': reason,
+                    'source': source,
+                }}
+            try:
+                contextctl.terminal_completion_origin({{
+                    'checkpoint': {{'reason': 'forged-terminal'}},
+                    'compaction': {{'source': 'agent-self-assertion'}},
+                }})
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError('forged terminal completion origin was accepted')
             print('P7 function probes OK')
         """))
+
+        # A real host turn is charged independently and exactly once. Retrying
+        # the same caller-stable ID must leave the entire capsule byte-identical.
+        before_turn = json.loads((root / ".agent/state/CONTEXT.json").read_text())
+        before_turn_count = before_turn.get("turn_accounting", {}).get("turns_accounted", 0)
+        run(root, sys.executable, contextctl, "account-turn", "--turn-id", "fixture-turn-1")
+        after_turn_path = root / ".agent/state/CONTEXT.json"
+        after_turn = json.loads(after_turn_path.read_text())
+        if (
+            after_turn["usage_freshness"]["estimated_tokens"]
+            != before_turn["usage_freshness"]["estimated_tokens"] + 300
+            or after_turn.get("turn_accounting", {}).get("turns_accounted") != before_turn_count + 1
+        ):
+            raise AssertionError("host turn did not charge the configured per-turn estimate exactly once")
+        once_bytes = after_turn_path.read_bytes()
+        replay = run(root, sys.executable, contextctl, "account-turn", "--turn-id", "fixture-turn-1")
+        if "ALREADY ACCOUNTED" not in replay.stdout or after_turn_path.read_bytes() != once_bytes:
+            raise AssertionError("same host turn ID was not an idempotent byte-for-byte no-op")
+        run(root, sys.executable, contextctl, "account-turn", "--turn-id", "fixture-turn-2")
+        twice = json.loads(after_turn_path.read_text())
+        if twice["usage_freshness"]["estimated_tokens"] != before_turn["usage_freshness"]["estimated_tokens"] + 600:
+            raise AssertionError("distinct host turns did not receive independent per-turn charges")
 
         # The invariant is enforced fail-closed at capsule validation: a
         # config that lets one permitted child cross the hard watermark is

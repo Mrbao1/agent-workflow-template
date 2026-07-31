@@ -38,6 +38,8 @@ AUTH_DIR = AGENT_DIR / "state" / ".context-authorizations"
 LIST_FIELDS = ("confirmed_facts", "decisions", "open_questions", "changed_files", "evidence", "open_risks")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 UNAPPROVED_CONTRACT_BINDING = "unapproved-draft"
+TURN_ACCOUNTING_SCHEMA = "agent-context-turn-accounting/v1"
+MAX_ACCOUNTED_TURN_IDS = 64
 
 # This snapshot binds the enumerated canonical TASK fields: scope, routing,
 # evidence, gates, rollback behavior, resource budgets and completion
@@ -90,6 +92,7 @@ TASK_INVARIANT_KEYS = (
     "rollback_archive",
     "failure_ledger",
     "failure_archive",
+    "failure_escalation",
     "mode_status",
     "decision_policy_version",
     "projection",
@@ -145,6 +148,7 @@ TRANSITION_PROFILES = {
     },
     ("templatectl", "route"): {
         "selected_templates", "selected_capabilities", "template_route", "rendered_artifacts",
+        "next_action",
     },
     ("templatectl", "render"): {"rendered_artifacts"},
     ("workflowctl", "submit-gate"): {
@@ -155,11 +159,15 @@ TRANSITION_PROFILES = {
     },
     ("workflowctl", "advance"): {
         "node_artifacts", "accepted_nodes", "current_node", "status", "phase", "next_action",
+        "failure_escalation", "gate_approvals",
     },
     ("workflowctl", "return-node"): {
         "current_node", "status", "phase", "next_action", "accepted_nodes",
         "node_artifacts", "rollback_ledger", "rollback_archive", "failure_ledger",
-        "failure_archive",
+        "failure_archive", "failure_escalation",
+    },
+    ("workflowctl", "resolve-failure"): {
+        "gate_approvals", "failure_escalation", "status", "next_action",
     },
     ("workflowctl", "compact-state"): {
         "rollback_ledger", "rollback_archive", "failure_ledger", "failure_archive",
@@ -274,7 +282,10 @@ def normalized_token_estimate(value: Dict[str, object]) -> int:
     clone = copy.deepcopy(value)
     compaction = clone.get("compaction")
     if isinstance(compaction, dict):
-        for key in ("source_estimated_tokens", "capsule_estimated_tokens", "tokens_removed", "compression_ratio"):
+        for key in (
+            "source_estimated_tokens", "capsule_estimated_tokens",
+            "tokens_removed", "capsule_reduction_tokens", "compression_ratio",
+        ):
             compaction[key] = 0
     integrity = clone.get("integrity")
     if isinstance(integrity, dict):
@@ -296,7 +307,7 @@ def authorization_receipt(
     args: argparse.Namespace,
     previous: Dict[str, object],
     current_task: Dict[str, object],
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], Dict[str, object]]:
     path = (ROOT / raw).resolve()
     try:
         path.relative_to(AUTH_DIR.resolve())
@@ -350,7 +361,7 @@ def authorization_receipt(
         key for key in set(before) | set(after)
         if key not in TASK_INVARIANT_KEYS and before.get(key) != after.get(key)
     )
-    return {
+    receipt = {
         "schema": value["schema"],
         "mutator": profile[0],
         "operation": profile[1],
@@ -358,6 +369,7 @@ def authorization_receipt(
         "non_invariant_changed_fields": non_invariant,
         "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
+    return receipt, before
 
 
 def list_value(value: object) -> List[str]:
@@ -418,33 +430,27 @@ def automatic_transition_source_tokens(
 ) -> int:
     """Return the minimum honest active-window estimate for a canonical transition.
 
-    A canonical transition adds control-plane work to the same active context;
-    it is not evidence that the session was compacted.  Therefore its estimate
-    must advance from the prior checkpoint.  The per-transition floor is the
-    estimated per-turn host overhead (``context.estimated_turn_overhead_tokens``
-    — system-prompt replay plus turn cost) plus the inherited host context
-    charged per root turn; the deprecated
+    A canonical transition adds bounded control-plane bookkeeping to the same
+    active context; it is not evidence that the host replayed a whole turn or
+    that the session was compacted. Therefore its estimate advances by
+    ``context.transition_token_increment[mode]``. The deprecated
     ``context.automatic_transition_token_increment`` alias keeps its exact
-    legacy arithmetic.  When two provider-observed cumulative usage receipts
-    exist, their measured delta is preferred over the estimate.  A
-    provider-verified cumulative measurement remains in TASK.tokens_used for
-    the independent cost gate; it is not an active-window measurement and must
-    not undo a real compaction. Only an explicit plain ``sync`` (the real
-    compaction path) may establish a lower active-context baseline.
+    legacy arithmetic. Cumulative provider usage receipts remain exclusively
+    in TASK's cumulative-cost account: they do not measure the active window,
+    and their latest delta must never be replayed at multiple transitions.
+    Real host turns are charged independently by ``account-turn``. Only a
+    verified host-compaction handshake may establish a lower active-context
+    baseline.
     """
     mode = str(task.get("mode", ""))
-    measured = total_budget.measured_turn_delta(task)
-    if measured is not None:
-        increment = measured
-    else:
-        try:
-            increment = total_budget.transition_overhead_estimate(config, mode)
-        except ValueError as error:
-            raise SystemExit(
-                f"context turn-overhead estimate is unusable: {error} "
-                f"(configure context.estimated_turn_overhead_tokens; "
-                f"deprecated alias context.automatic_transition_token_increment)"
-            )
+    try:
+        increment = total_budget.transition_increment_estimate(config, mode)
+    except ValueError as error:
+        raise SystemExit(
+            f"context transition increment is unusable: {error} "
+            f"(configure context.transition_token_increment; "
+            f"deprecated alias context.automatic_transition_token_increment)"
+        )
     freshness = previous.get("usage_freshness")
     prior = freshness.get("estimated_tokens") if isinstance(freshness, dict) else None
     if not isinstance(prior, int) or isinstance(prior, bool) or prior <= 0:
@@ -471,6 +477,129 @@ def resume_contract(task: Dict[str, object], snapshot_sha256: str) -> Dict[str, 
         "next_action":task.get("next_action"),"budget_state":task.get("budget_state"),
         "terminal":terminal,"resume_action":action,"task_invariant_sha256":snapshot_sha256,
     }
+
+
+def turn_accounting_value(previous: Dict[str, object]) -> Dict[str, object]:
+    value = previous.get("turn_accounting")
+    if not isinstance(value, dict):
+        return {
+            "schema": TURN_ACCOUNTING_SCHEMA,
+            "applied_turn_ids_sha256": [],
+            "turns_accounted": 0,
+            "estimated_tokens_charged": 0,
+        }
+    return copy.deepcopy(value)
+
+
+def turn_accounting_errors(context: Dict[str, object]) -> List[str]:
+    value = context.get("turn_accounting")
+    if value is None:
+        # Legacy capsules are upgraded by their next sync/transition.
+        return []
+    required = {
+        "schema", "applied_turn_ids_sha256", "turns_accounted",
+        "estimated_tokens_charged",
+    }
+    ids = value.get("applied_turn_ids_sha256") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != TURN_ACCOUNTING_SCHEMA
+        or not isinstance(ids, list)
+        or len(ids) > MAX_ACCOUNTED_TURN_IDS
+        or len(ids) != len(set(ids))
+        or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in ids)
+        or value.get("turns_accounted") != len(ids)
+        or not isinstance(value.get("estimated_tokens_charged"), int)
+        or isinstance(value.get("estimated_tokens_charged"), bool)
+        or int(value.get("estimated_tokens_charged", -1)) < 0
+    ):
+        return ["host-turn accounting record is malformed or unbounded"]
+    return []
+
+
+def terminal_completion_origin(context: Dict[str, object]) -> Dict[str, object]:
+    """Return exact durable terminal provenance for post-completion accounting."""
+    checkpoint = context.get("checkpoint")
+    compaction = context.get("compaction")
+    if not isinstance(checkpoint, dict) or not isinstance(compaction, dict):
+        raise SystemExit("accepted task host-turn accounting lacks terminal checkpoint records")
+    origin = checkpoint.get("terminal_completion_origin")
+    current_authorization = checkpoint.get("transition_authorization")
+    if origin is None and (
+        isinstance(current_authorization, dict)
+        and current_authorization.get("mutator") == "workflowctl"
+        and current_authorization.get("operation") == "complete-task"
+    ):
+        origin = {
+            "schema": "agent-terminal-completion-origin/v1",
+            "kind": "complete-task",
+            "transition_authorization": copy.deepcopy(current_authorization),
+        }
+    elif origin is None and (
+        checkpoint.get("reason") in {
+            "migration-26-final-state-rebind",
+            "migration-34-final-state-rebind",
+        }
+        and compaction.get("source") in {
+            "installer-verified-active-migration",
+            "installer-verified-context-efficiency-migration",
+        }
+    ):
+        origin = {
+            "schema": "agent-terminal-completion-origin/v1",
+            "kind": "installer-migration",
+            "reason": checkpoint.get("reason"),
+            "source": compaction.get("source"),
+        }
+    ordinary_origin = (
+        isinstance(origin, dict)
+        and set(origin) == {"schema", "kind", "transition_authorization"}
+        and origin.get("schema") == "agent-terminal-completion-origin/v1"
+        and origin.get("kind") == "complete-task"
+        and isinstance(origin.get("transition_authorization"), dict)
+        and origin["transition_authorization"].get("mutator") == "workflowctl"
+        and origin["transition_authorization"].get("operation") == "complete-task"
+    )
+    migration_origin = (
+        isinstance(origin, dict)
+        and set(origin) == {"schema", "kind", "reason", "source"}
+        and origin.get("schema") == "agent-terminal-completion-origin/v1"
+        and origin.get("kind") == "installer-migration"
+        and (origin.get("reason"), origin.get("source")) in {
+            (
+                "migration-26-final-state-rebind",
+                "installer-verified-active-migration",
+            ),
+            (
+                "migration-34-final-state-rebind",
+                "installer-verified-context-efficiency-migration",
+            ),
+        }
+    )
+    if not (ordinary_origin or migration_origin):
+        raise SystemExit(
+            "accepted task host-turn accounting requires durable terminal completion provenance"
+        )
+    assert isinstance(origin, dict)
+    return copy.deepcopy(origin)
+
+
+def update_compaction_metrics(
+    compaction: Dict[str, object],
+    capsule_estimate: int,
+    *,
+    host_tokens_removed: Optional[int] = None,
+) -> None:
+    source = int(compaction.get("source_estimated_tokens", 0))
+    already_separated = "capsule_reduction_tokens" in compaction
+    compaction["capsule_estimated_tokens"] = capsule_estimate
+    compaction["capsule_reduction_tokens"] = source - capsule_estimate
+    if host_tokens_removed is not None:
+        compaction["tokens_removed"] = host_tokens_removed
+    elif not already_separated:
+        compaction["tokens_removed"] = 0
+    compaction["compression_ratio"] = round(source / max(capsule_estimate, 1), 2)
 
 
 def build_capsule(
@@ -554,10 +683,12 @@ def build_capsule(
             "estimated_tokens": int(args.source_tokens),
             "observed_at": checkpoint_at,
         },
+        "turn_accounting": turn_accounting_value(previous),
         "compaction": {
             "source_estimated_tokens": int(args.source_tokens),
             "capsule_estimated_tokens": 0,
             "tokens_removed": 0,
+            "capsule_reduction_tokens": 0,
             "compression_ratio": 0,
             "method": "explicit-estimate/v1",
             "reason": args.reason,
@@ -592,9 +723,28 @@ def build_capsule(
         )
     compaction = capsule["compaction"]
     assert isinstance(compaction, dict)
-    compaction["capsule_estimated_tokens"] = estimated
-    compaction["tokens_removed"] = int(args.source_tokens) - estimated
-    compaction["compression_ratio"] = round(int(args.source_tokens) / max(estimated, 1), 2)
+    host_removed = None
+    verified_host = getattr(args, "verified_host_compaction_receipt", None)
+    if isinstance(verified_host, dict):
+        before_tokens = verified_host.get("from_estimated_tokens")
+        after_tokens = verified_host.get("to_estimated_tokens")
+        if isinstance(before_tokens, int) and isinstance(after_tokens, int):
+            host_removed = before_tokens - after_tokens
+    elif isinstance(previous.get("host_compaction"), dict):
+        previous_receipt = previous["host_compaction"].get("receipt")
+        if isinstance(previous_receipt, dict):
+            before_tokens = previous_receipt.get("from_estimated_tokens")
+            after_tokens = previous_receipt.get("to_estimated_tokens")
+            if not isinstance(before_tokens, int) or not isinstance(after_tokens, int):
+                try:
+                    legacy_receipt = load_json(ROOT / str(previous_receipt.get("path", "")))
+                    before_tokens = legacy_receipt.get("from_estimated_tokens")
+                    after_tokens = legacy_receipt.get("to_estimated_tokens")
+                except (OSError, ValueError, SystemExit, json.JSONDecodeError):
+                    before_tokens = after_tokens = None
+            if isinstance(before_tokens, int) and isinstance(after_tokens, int):
+                host_removed = before_tokens - after_tokens
+    update_compaction_metrics(compaction, estimated, host_tokens_removed=host_removed)
     capsule["integrity"]["content_sha256"] = content_sha256(capsule)  # type: ignore[index]
     return capsule
 
@@ -620,8 +770,25 @@ def internal_compaction_errors(context: Dict[str, object]) -> List[str]:
         errors.append("stored source token estimate is below capsule size")
     if compaction.get("capsule_estimated_tokens") != estimate:
         errors.append("stored capsule token estimate is stale")
-    if isinstance(source, int) and compaction.get("tokens_removed") != source - estimate:
-        errors.append("stored removed-token evidence is stale")
+    capsule_reduction = compaction.get("capsule_reduction_tokens")
+    if capsule_reduction is None:
+        # Legacy v2 records used tokens_removed for the theoretical difference
+        # between active-window source and serialized capsule size.
+        if isinstance(source, int) and compaction.get("tokens_removed") != source - estimate:
+            errors.append("stored legacy removed-token evidence is stale")
+    else:
+        if capsule_reduction != source - estimate:
+            errors.append("stored capsule-reduction evidence is stale")
+        removed = compaction.get("tokens_removed")
+        if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
+            errors.append("stored host-token removal evidence is invalid")
+        host = context.get("host_compaction")
+        if removed and (
+            not isinstance(host, dict)
+            or host.get("state") != "resumed"
+            or not isinstance(host.get("receipt"), dict)
+        ):
+            errors.append("unverified checkpoint cannot claim host tokens were removed")
     if compaction.get("method") != "explicit-estimate/v1" or not str(compaction.get("reason", "")).strip():
         errors.append("stored compaction method or reason is invalid")
     expected_ratio = round(source / max(estimate, 1), 2) if isinstance(source, int) else None
@@ -646,8 +813,18 @@ def internal_compaction_errors(context: Dict[str, object]) -> List[str]:
                         int(receipt_value.get("to_estimated_tokens", -1)), require_fresh=False,
                         expected_task_invariant_sha256=str(record.get("task_invariant_sha256", "")),
                     )
-                    if verified != record:
+                    legacy_verified = {
+                        key: value for key, value in verified.items()
+                        if key not in {"from_estimated_tokens", "to_estimated_tokens"}
+                    }
+                    if record != verified and record != legacy_verified:
                         errors.append("stored host compaction receipt or adapter provenance drifted")
+                    elif (
+                        compaction.get("capsule_reduction_tokens") is not None
+                        and compaction.get("tokens_removed")
+                        != int(verified["from_estimated_tokens"]) - int(verified["to_estimated_tokens"])
+                    ):
+                        errors.append("stored host-token removal amount differs from its verified receipt")
                 except (OSError, ValueError, TypeError, SystemExit, json.JSONDecodeError):
                     errors.append("stored host compaction receipt cannot be durably reverified")
     abort = compaction.get("host_compaction_abort")
@@ -739,6 +916,8 @@ def verify_host_compaction_receipt(raw: str, task: Dict[str, object],
     return {
         "path": str(path.relative_to(ROOT)), "sha256": digest, "bytes": path.stat().st_size,
         "task_invariant_sha256": value["task_invariant_sha256"],
+        "from_estimated_tokens": value["from_estimated_tokens"],
+        "to_estimated_tokens": value["to_estimated_tokens"],
         "host_id": value["host_id"], "observed_at": value["observed_at"],
         "adapter_path": str(adapter), "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
     }
@@ -801,7 +980,7 @@ def repair_approval_errors(
     return []
 
 
-def stored_capsule_errors() -> List[str]:
+def stored_capsule_errors(task: Optional[Dict[str, object]] = None) -> List[str]:
     """Check capsule integrity against its own bound snapshot before a transition."""
     try:
         context = load_json(CONTEXT_PATH)
@@ -845,8 +1024,10 @@ def stored_capsule_errors() -> List[str]:
         errors.append("stored capsule content hash is invalid")
     errors.extend(internal_compaction_errors(context))
     errors.extend(usage_freshness_errors(context))
+    errors.extend(turn_accounting_errors(context))
     try:
-        errors.extend(repair_approval_errors(context, load_json(CONFIG_PATH), load_json(TASK_PATH)))
+        approval_task = task if task is not None else load_json(TASK_PATH)
+        errors.extend(repair_approval_errors(context, load_json(CONFIG_PATH), approval_task))
     except (OSError, ValueError, SystemExit, json.JSONDecodeError):
         errors.append("stored repair approval could not be reverified")
     return errors
@@ -941,6 +1122,8 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
                     continue
                 if not path.is_file() or path.is_symlink():
                     errors.append(f"{field} path is missing: {raw}")
+    if task.get("status") == "accepted" and context.get("open_risks") != []:
+        errors.append("accepted terminal context must not retain unresolved risks")
     if not context.get("confirmed_facts"):
         errors.append("confirmed_facts cannot be empty")
     encoded = CONTEXT_PATH.read_bytes()
@@ -949,6 +1132,7 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
     estimate = normalized_token_estimate(context)
     errors.extend(internal_compaction_errors(context))
     errors.extend(usage_freshness_errors(context))
+    errors.extend(turn_accounting_errors(context))
     compaction = context.get("compaction")
     checkpoint_estimate = int(compaction.get("source_estimated_tokens", 0)) if isinstance(compaction, dict) else 0
     if isinstance(compaction, dict) and compaction.get("budget_snapshot") != budget_snapshot(config, task, checkpoint_estimate):
@@ -1036,9 +1220,7 @@ def abort_host_compaction(args: argparse.Namespace) -> int:
     estimated = normalized_token_estimate(context)
     if int(compaction.get("source_estimated_tokens", 0)) < estimated:
         raise SystemExit("aborted capsule exceeds its source estimate; use repair --reset")
-    compaction["capsule_estimated_tokens"] = estimated
-    compaction["tokens_removed"] = int(compaction["source_estimated_tokens"]) - estimated
-    compaction["compression_ratio"] = round(int(compaction["source_estimated_tokens"]) / max(estimated, 1), 2)
+    update_compaction_metrics(compaction, estimated)
     integrity["verified_at"] = now()
     integrity["content_sha256"] = "0" * 64
     integrity["content_sha256"] = content_sha256(context)
@@ -1046,6 +1228,96 @@ def abort_host_compaction(args: argparse.Namespace) -> int:
     result = validate_context(ignore_checkpoint_age=True)
     if result == 0:
         print("HOST COMPACTION ABORTED: awaiting state cleared; renew the checkpoint with a plain sync before continuing")
+    return result
+
+
+def account_host_turn(args: argparse.Namespace) -> int:
+    """Charge one real host/model turn exactly once by caller-stable identity."""
+    if not isinstance(args.turn_id, str) or not args.turn_id.strip():
+        raise SystemExit("--turn-id must be a non-empty caller-stable host turn identity")
+    if len(args.turn_id.encode("utf-8")) > 256:
+        raise SystemExit("--turn-id exceeds the bounded 256-byte identity limit")
+    if validate_context(quiet=True, ignore_checkpoint_age=True) != 0:
+        raise SystemExit("host turn accounting requires an exact verified context checkpoint")
+    context = load_json(CONTEXT_PATH)
+    host = context.get("host_compaction")
+    if isinstance(host, dict) and host.get("state") == "awaiting_host_compaction":
+        raise SystemExit("host turn accounting is paused while host compaction awaits its receipt")
+    accounting = turn_accounting_value(context)
+    errors = turn_accounting_errors({**context, "turn_accounting": accounting})
+    if errors:
+        raise SystemExit(errors[0])
+    digest = hashlib.sha256(args.turn_id.encode("utf-8")).hexdigest()
+    applied = accounting["applied_turn_ids_sha256"]
+    assert isinstance(applied, list)
+    if digest in applied:
+        print(f"HOST TURN ALREADY ACCOUNTED: sha256={digest}")
+        return 0
+    if len(applied) >= MAX_ACCOUNTED_TURN_IDS:
+        raise SystemExit(
+            "host turn identity ledger is full; establish a verified host compaction "
+            "or split into a fresh project session before continuing"
+        )
+    task = load_json(TASK_PATH)
+    config = load_json(CONFIG_PATH)
+    try:
+        overhead = total_budget.turn_overhead_estimate(config, str(task.get("mode", "")))
+    except ValueError as error:
+        raise SystemExit(str(error))
+    freshness = context.get("usage_freshness")
+    checkpoint = context.get("checkpoint")
+    compaction = context.get("compaction")
+    integrity = context.get("integrity")
+    if not all(isinstance(value, dict) for value in (freshness, checkpoint, compaction, integrity)):
+        raise SystemExit("host turn accounting requires complete context checkpoint records")
+    prior = int(freshness["estimated_tokens"])  # type: ignore[index]
+    timestamp = now()
+    previous_file_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+    applied.append(digest)
+    accounting["turns_accounted"] = len(applied)
+    accounting["estimated_tokens_charged"] = int(accounting["estimated_tokens_charged"]) + overhead
+    context["turn_accounting"] = accounting
+    checkpoint["sequence"] = int(checkpoint["sequence"]) + 1  # type: ignore[index]
+    checkpoint["reason"] = "host-turn-accounted"
+    checkpoint["updated_at"] = timestamp
+    checkpoint["previous_sha256"] = previous_file_sha256
+    checkpoint["previous_task_invariant_sha256"] = invariant_sha256(task)
+    checkpoint["task_delta"] = ["turn_accounting"]
+    # A completed task can receive later host/model turns (for example, the
+    # maintainer's next review request) without ceasing to be terminal. Keep
+    # the exact complete-task transition receipt as immutable provenance while
+    # this accounting checkpoint becomes the current checkpoint. Subsequent
+    # task transitions build a new capsule and naturally discard the marker.
+    if task.get("status") == "accepted":
+        checkpoint["terminal_completion_origin"] = terminal_completion_origin(context)
+    else:
+        checkpoint.pop("terminal_completion_origin", None)
+    checkpoint["transition_authorization"] = None
+    new_source = prior + overhead
+    freshness["checkpoint_sequence"] = checkpoint["sequence"]  # type: ignore[index]
+    freshness["task_invariant_sha256"] = invariant_sha256(task)
+    freshness["estimated_tokens"] = new_source
+    freshness["observed_at"] = timestamp
+    compaction["source_estimated_tokens"] = new_source
+    compaction["reason"] = "host-turn-accounted"
+    compaction["source"] = f"host-turn:{digest}"
+    compaction["budget_snapshot"] = budget_snapshot(config, task, new_source)
+    integrity["verified_at"] = timestamp
+    # A reviewed repair keeps its human-decision source because the stored
+    # approval is revalidated against that exact source on every checkpoint.
+    # The host-turn provenance is independently recorded in compaction.source.
+    if "repair_approval" not in integrity:
+        integrity["source"] = f"host-turn:{digest}"
+    integrity["content_sha256"] = "0" * 64
+    estimated = normalized_token_estimate(context)
+    if new_source < estimated:
+        raise SystemExit("host turn estimate is below the expanded bounded capsule size")
+    update_compaction_metrics(compaction, estimated)
+    integrity["content_sha256"] = content_sha256(context)
+    atomic_json(CONTEXT_PATH, context)
+    result = validate_context(ignore_checkpoint_age=True)
+    if result == 0:
+        print(f"HOST TURN ACCOUNTED: sha256={digest} overhead={overhead}")
     return result
 
 
@@ -1078,6 +1350,8 @@ def _main() -> int:
     abort = sub.add_parser("abort-host-compaction")
     abort.add_argument("--source", required=True)
     abort.add_argument("--human-decision-receipt")
+    account_turn = sub.add_parser("account-turn")
+    account_turn.add_argument("--turn-id", required=True)
     journal = sub.add_parser("journal")
     journal.add_argument("--restore", action="store_true")
     journal.add_argument("--discard", action="store_true")
@@ -1107,6 +1381,8 @@ def _main() -> int:
         return 0 if status.get("state") == "restored" else 1
     if args.command == "abort-host-compaction":
         return abort_host_compaction(args)
+    if args.command == "account-turn":
+        return account_host_turn(args)
     if args.command == "approve-repair":
         if not args.source.startswith("user:"):
             raise SystemExit("repair approval source must start with user:")
@@ -1131,9 +1407,7 @@ def _main() -> int:
         compaction = context.get("compaction")
         if not isinstance(compaction, dict) or int(compaction.get("source_estimated_tokens", 0)) < estimated:
             raise SystemExit("repair review changed capsule size beyond its source estimate; repair again")
-        compaction["capsule_estimated_tokens"] = estimated
-        compaction["tokens_removed"] = int(compaction["source_estimated_tokens"]) - estimated
-        compaction["compression_ratio"] = round(int(compaction["source_estimated_tokens"]) / max(estimated, 1), 2)
+        update_compaction_metrics(compaction, estimated)
         context["integrity"]["content_sha256"] = content_sha256(context)
         atomic_json(CONTEXT_PATH, context)
         return validate_context()
@@ -1161,9 +1435,6 @@ def _main() -> int:
         if args.transition:
             if args.host_compaction:
                 raise SystemExit("a canonical TASK transition cannot also claim a host context compaction")
-            errors = stored_capsule_errors()
-            if errors:
-                raise SystemExit("context drift or corruption detected; use repair instead of overwriting evidence:\n- " + "\n- ".join(errors))
             expected = previous.get("task_invariant_sha256")
             if not args.from_task_sha256 or args.from_task_sha256 != expected or not HEX64.fullmatch(args.from_task_sha256):
                 raise SystemExit("transition must bind --from-task-sha256 to the verified previous capsule")
@@ -1171,9 +1442,12 @@ def _main() -> int:
                 raise SystemExit("--transition requires an actual canonical TASK state change; use plain sync for compaction")
             if not args.authorization:
                 raise SystemExit("transition requires a fresh field-level authorization from a canonical TASK mutator")
-            transition_authorization = authorization_receipt(
+            transition_authorization, before_task = authorization_receipt(
                 args.authorization, args, previous, load_json(TASK_PATH)
             )
+            errors = stored_capsule_errors(before_task)
+            if errors:
+                raise SystemExit("context drift or corruption detected; use repair instead of overwriting evidence:\n- " + "\n- ".join(errors))
             minimum_source_tokens = automatic_transition_source_tokens(
                 load_json(CONFIG_PATH), previous, load_json(TASK_PATH)
             )

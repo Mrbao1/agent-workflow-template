@@ -4,8 +4,8 @@
 from pathlib import Path
 import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 
-VERSION="3.1.43"
-MIGRATION_VERSION=36
+VERSION="3.1.46"
+MIGRATION_VERSION=38
 MANAGED=("INDEX.md","scripts","skills","templates","workflows","assets","capabilities")
 MANAGED_FILES=("knowledge/INDEX.md",)
 FRESH_STATE_RELATIVE=Path("assets")/"fresh-state"/"v1"
@@ -27,7 +27,7 @@ BOOTSTRAP_START="<!-- agent-workflow-bootstrap:start -->"
 BOOTSTRAP_END="<!-- agent-workflow-bootstrap:end -->"
 BOOTSTRAP_BODY="""# Agent Bootstrap
 
-Before project work, read `.agent/INDEX.md`, `.agent/config.json`, `.agent/state/TASK.json`, `.agent/state/CONTEXT.json`, and `.agent/policies/PROJECT_GUARDRAILS.md`. The guardrails are hash-bound (`project_initialization.guardrails_sha256`) and verified by bootstrap-check. Load `.agent/skills/` only when routed. Before starting the first task, run `python3 .agent/scripts/agentctl.py bootstrap-check`. Without a provider decision adapter, local non-deploy fast/standard tasks may use explicitly recorded current-chat decisions. Projects may explicitly opt local, reversible and non-external release-mode implementation into the same boundary; test, production, deploy, irreversible and external-impact gates remain blocked. Requirements must be clarified before design or implementation; local runtimes must be bounded and cleaned with `.agent/scripts/agentctl.py`.
+Before project work, read `.agent/INDEX.md`, `.agent/config.json`, `.agent/state/TASK.json`, `.agent/state/CONTEXT.json`, and `.agent/policies/PROJECT_GUARDRAILS.md`. The guardrails are hash-bound (`project_initialization.guardrails_sha256`) and verified by bootstrap-check. Load `.agent/skills/` only when routed. Before starting the first task, run `python3 .agent/scripts/agentctl.py bootstrap-check`. At the start of each real host/model turn, account it exactly once with `python3 .agent/scripts/contextctl.py account-turn --turn-id <caller-stable-host-turn-id>`; retries of the same turn must reuse the same ID, and post-completion accounting must preserve the durable `complete-task` origin. Without a provider decision adapter, local non-deploy fast/standard tasks may use explicitly recorded current-chat decisions. Projects may explicitly opt local, reversible and non-external release-mode implementation into the same boundary; test, production, deploy, irreversible and external-impact gates remain blocked. Requirements must be clarified before design or implementation; local runtimes must be bounded and cleaned with `.agent/scripts/agentctl.py`.
 
 After every child-agent terminal event, after every compaction, and immediately before any final reply, run `python3 .agent/scripts/workflowctl.py route-resume`. Treat that receipt as the only root-task terminal decision: when `terminal=false`, do not present the root task as complete. Repository state preserves a deterministic resume contract, but only the host scheduler can start a later model turn.
 """
@@ -1546,58 +1546,73 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
             entry=modes.setdefault(mode,{})
             if entry.get("token_budget")==previous_budgets[mode]:
                 entry["token_budget"]=new_budget
-        # Retire the deprecated transition-increment alias: deep_fill has
-        # already supplied the honest per-turn overhead and bootstrap floor
-        # from the seed, so the alias must not survive the migration.  A
-        # project's CUSTOMIZED legacy values are not discarded, though: when
-        # the new key is still at the seed default, carry each mode whose
-        # legacy value differs from that mode's legacy seed constant
-        # (150/300/500) before popping the alias.  Modes left at the legacy
-        # seed constant are dropped on purpose — the recalibrated honest
-        # overhead replaces them, and carrying them would write the fiction
-        # back over it.
+        # Retire the deprecated transition-increment alias: its true
+        # historical semantic was the per-TRANSITION bookkeeping increment,
+        # not the per-turn overhead, so customized legacy values carry into
+        # context.transition_token_increment (filled with the honest
+        # 200/400/800 defaults), never into estimated_turn_overhead_tokens.
+        # A mode is carried only when its legacy value differs from that
+        # mode's legacy seed constant (150/300/500) — those seed constants
+        # were fictional and are replaced by the honest defaults — and each
+        # carried increment is clamped to the sane range [50, 1000].  The
+        # carry never overwrites a project-owned transition_token_increment
+        # policy.  The alias itself never survives the migration.
         context=config.setdefault("context",{})
         legacy_increment=context.get("automatic_transition_token_increment")
         legacy_seed_increment={"fast":150,"standard":300,"release":500}
-        if (
-            isinstance(legacy_increment,dict)
-            and context.get("estimated_turn_overhead_tokens")==defaults["context"]["estimated_turn_overhead_tokens"]
-        ):
-            overhead=context.get("estimated_turn_overhead_tokens")
-            if isinstance(overhead,dict):
-                # The legacy alias was charged as the bare value per
-                # transition; the new key is charged as value PLUS
-                # agent_control.inherited_turn_estimated_tokens.  Subtract
-                # the inherited surcharge so the carried value preserves the
-                # tuned TOTAL per transition, floored at the new key's
-                # minimum of 50.
-                inherited=config.get("agent_control",{}).get("inherited_turn_estimated_tokens")
-                if not isinstance(inherited,int) or isinstance(inherited,bool) or inherited<1:
-                    inherited=defaults["agent_control"]["inherited_turn_estimated_tokens"]
+        if isinstance(legacy_increment,dict):
+            increment_defaults=defaults["context"].get("transition_token_increment")
+            if not isinstance(increment_defaults,dict):
+                increment_defaults={"fast":200,"standard":400,"release":800}
+            increments=context.get("transition_token_increment")
+            if increments is None:
+                increments=dict(increment_defaults)
+                context["transition_token_increment"]=increments
+            if isinstance(increments,dict) and increments==increment_defaults:
                 for mode,value in legacy_increment.items():
                     if (
-                        mode in overhead
-                        and isinstance(value,int) and not isinstance(value,bool)
+                        isinstance(value,int) and not isinstance(value,bool)
                         and value!=legacy_seed_increment.get(mode)
                     ):
-                        overhead[mode]=max(50,value-inherited)
-                # A carry can break the fast<=standard<=release invariant
-                # (e.g. a project that tuned only release below standard's
-                # new default would migrate into a config agentctl validate
-                # rejects).  Clamp carried values upward to monotonicity;
-                # an invalid migrated config is worse than imperfect tuning.
-                floor=0
-                for mode in ("fast","standard","release"):
-                    current=overhead.get(mode)
-                    if isinstance(current,int) and not isinstance(current,bool):
-                        if current<floor:
-                            overhead[mode]=floor
-                        else:
-                            floor=current
+                        increments[mode]=min(1000,max(50,value))
         context.pop("automatic_transition_token_increment",None)
         control=config.setdefault("agent_control",{})
         if control.get("child_system_tool_margin_tokens")==1000:
             control["child_system_tool_margin_tokens"]=security_defaults["child_system_tool_margin_tokens"]
+    if prior_migration<37:
+        # Fill the per-transition bookkeeping increment (charged once per
+        # context transition as a fixed honest estimate: fast/standard/release
+        # = 200/400/800).  Migration 36 carries customized values of the
+        # retired alias into this key; fill every remaining mode from the
+        # seed defaults.  This step removes nothing, so projects already
+        # migrated by 36 simply gain the new key.
+        increment_defaults=defaults["context"].get("transition_token_increment")
+        if not isinstance(increment_defaults,dict):
+            increment_defaults={"fast":200,"standard":400,"release":800}
+        increments=config.setdefault("context",{}).setdefault("transition_token_increment",{})
+        if isinstance(increments,dict):
+            for mode,value in increment_defaults.items():
+                increments.setdefault(mode,value)
+    if prior_migration<38:
+        # v3.1.44 could carry a customized lower-mode legacy increment above
+        # the next mode's default (for example 900/400/800), report a
+        # successful update, and leave agentctl validation impossible. Repair
+        # only invalid numeric maps: clamp every value to the supported range
+        # and raise later modes to preserve fast <= standard <= release.
+        increments=config.setdefault("context",{}).get("transition_token_increment")
+        if (
+            isinstance(increments,dict)
+            and all(
+                isinstance(increments.get(mode),int)
+                and not isinstance(increments.get(mode),bool)
+                for mode in ("fast","standard","release")
+            )
+        ):
+            floor=50
+            for mode in ("fast","standard","release"):
+                normalized=min(1000,max(floor,int(increments[mode])))
+                increments[mode]=normalized
+                floor=normalized
     if prior_migration<21:
         for mode in ("fast", "standard", "release"):
             config.setdefault("routing",{}).setdefault("modes",{}).setdefault(mode,{}).update({

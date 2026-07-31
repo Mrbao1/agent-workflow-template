@@ -105,6 +105,11 @@
       "standard": 3000,
       "release": 4000
     },
+    "transition_token_increment": {
+      "fast": 200,
+      "standard": 400,
+      "release": 800
+    },
     "bootstrap_overhead_tokens": 7000,
     "soft_budget_ratio": 0.6,
     "compact_budget_ratio": 0.75,

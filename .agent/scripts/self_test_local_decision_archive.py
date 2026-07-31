@@ -106,13 +106,27 @@ with tempfile.TemporaryDirectory(prefix="local-decision-archive-") as raw:
         "--path", reference.name, "--purpose", "verify retained accounting",
     ])
     loaded = json.loads(task_path.read_text(encoding="utf-8"))
+    loaded_context = json.loads(
+        (project / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+    )
     charge = int(loaded["loaded_references"][0]["estimated_tokens"])
     run(project, [
         sys.executable, ".agent/scripts/agentctl.py", "reference-unload", "--path", reference.name,
     ])
     unloaded = json.loads(task_path.read_text(encoding="utf-8"))
+    unloaded_context = json.loads(
+        (project / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+    )
     if unloaded.get("loaded_references") != [] or unloaded.get("tokens_used") != before_reference_tokens + charge:
         raise AssertionError("reference unload released already-active Token charge")
+    loaded_estimate = int(loaded_context["usage_freshness"]["estimated_tokens"])
+    unloaded_estimate = int(unloaded_context["usage_freshness"]["estimated_tokens"])
+    transition_increment = 400
+    if unloaded_estimate != loaded_estimate + transition_increment + charge:
+        raise AssertionError(
+            "reference unload failed to settle its reservation into the active-window estimate: "
+            f"loaded={loaded_estimate} unloaded={unloaded_estimate} charge={charge}"
+        )
 
     run(project, [
         sys.executable, ".agent/scripts/agentctl.py", "escalate-mode", "--files", "5",
@@ -132,6 +146,18 @@ with tempfile.TemporaryDirectory(prefix="local-decision-archive-") as raw:
         "--title", "must fail without archive", "--mode", "standard",
         "--environment", "local", "--files", "3",
     ], expected=1)
+    # A task rollover clears the reusable reference registry, but the bytes
+    # remain in the same host context and must be settled into its estimate.
+    run(project, [
+        sys.executable, ".agent/scripts/agentctl.py", "reference-load",
+        "--path", reference.name, "--purpose", "verify task-rollover accounting",
+    ])
+    rollover_task = json.loads(task_path.read_text(encoding="utf-8"))
+    rollover_charge = int(rollover_task["loaded_references"][0]["estimated_tokens"])
+    rollover_context = json.loads(
+        (project / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+    )
+    rollover_estimate = int(rollover_context["usage_freshness"]["estimated_tokens"])
     old_task_bytes = task_path.read_bytes()
     old_contract_bytes = (project / ".agent/state/REQUIREMENT_CONTRACT.md").read_bytes()
     run(project, [
@@ -142,9 +168,18 @@ with tempfile.TemporaryDirectory(prefix="local-decision-archive-") as raw:
         "--archive-reason", "the user explicitly replaced the unfinished local task",
     ])
     second = json.loads(task_path.read_text(encoding="utf-8"))
+    second_context = json.loads(
+        (project / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+    )
     head = second.get("task_archive")
     if second.get("title") != "second local task" or not isinstance(head, dict):
         raise AssertionError("active task replacement did not start the new clarification")
+    if (
+        second.get("loaded_references") != []
+        or int(second_context["usage_freshness"]["estimated_tokens"])
+        != rollover_estimate + transition_increment + rollover_charge
+    ):
+        raise AssertionError("task rollover released an active reference reservation")
     archive_path = project / str(head.get("path", ""))
     archive_bytes = archive_path.read_bytes()
     archive = json.loads(archive_bytes)

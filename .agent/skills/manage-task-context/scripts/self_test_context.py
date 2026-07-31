@@ -478,8 +478,10 @@ def main() -> int:
         compaction = transitioned["compaction"]
         if (
             compaction.get("method") != "explicit-estimate/v1"
-            or compaction.get("tokens_removed") != compaction["source_estimated_tokens"] - compaction["capsule_estimated_tokens"]
-            or compaction.get("tokens_removed", 0) <= 0
+            or compaction.get("tokens_removed") != 0
+            or compaction.get("capsule_reduction_tokens")
+            != compaction["source_estimated_tokens"] - compaction["capsule_estimated_tokens"]
+            or compaction.get("capsule_reduction_tokens", 0) <= 0
             or compaction.get("reason") != "enter-validation"
         ):
             print("FAIL: transition lacks auditable budget-compression evidence")
@@ -647,6 +649,7 @@ def main() -> int:
             compacted.returncode != 0
             or compacted_context.get("usage_freshness", {}).get("estimated_tokens") != 1500
             or compacted_context.get("host_compaction", {}).get("state") != "resumed"
+            or compacted_context.get("compaction", {}).get("tokens_removed") != 1400
             or run(root, "check") != 0
         ):
             print("FAIL: explicit host context compaction could not establish a smaller honest baseline")

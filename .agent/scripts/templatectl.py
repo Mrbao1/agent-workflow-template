@@ -519,6 +519,15 @@ def expected_route(task: Dict[str, object], capabilities: List[str]) -> List[str
     ordered = [str(item["id"]) for item in manifest_entries if item["id"] in selected_set]
     if task_projection(str(task.get("task_type")), str(mode)) == "lightweight":
         lightweight = {"requirement-contract", "node-implementation", "node-acceptance", "retrospective"}
+        if mode == "fast":
+            # Fast node 7 is accepted by the rendered targeted-acceptance
+            # template (which depends on fast-projection), never by
+            # node-acceptance, so the lightweight projection must keep the
+            # full fast acceptance chain or node 7 can never pass.
+            lightweight = {
+                "requirement-contract", "fast-projection", "node-implementation",
+                "targeted-acceptance", "retrospective",
+            }
         ordered = [template_id for template_id in ordered if template_id in lightweight]
     selected_outputs: Dict[str, str] = {}
     for template_id in ordered:
@@ -566,6 +575,7 @@ def commit_with_context(
     reason: str,
     summary: str,
     output: Optional[Tuple[Path, bytes]] = None,
+    side_effects: Iterable[Tuple[Path, bytes]] = (),
 ) -> None:
     before = load(TASK_PATH)
     operation = "route" if reason == "templates-routed" else "render"
@@ -576,7 +586,7 @@ def commit_with_context(
         operation=operation,
         reason=reason,
         summary=summary,
-        side_effects=([output] if output else []),
+        side_effects=([output] if output else []) + list(side_effects),
         files=([str(output[0].relative_to(ROOT))] if output else []),
     )
 
@@ -608,7 +618,21 @@ def command_route(args: argparse.Namespace) -> int:
     task["selected_capabilities"] = capabilities
     task["template_route"] = receipt
     task["rendered_artifacts"] = records
-    commit_with_context(task, "templates-routed", "deterministically routed provenance-bound templates")
+    current_node = task.get("current_node")
+    if isinstance(current_node, int) and current_node >= 2:
+        if current_node == 2 and (
+            task.get("mode") == "fast" or task_projection(
+                str(task.get("task_type")), str(task.get("mode"))
+            ) == "lightweight"
+        ):
+            task["next_action"] = "render routed artifacts and complete projected nodes 2-6"
+        else:
+            task["next_action"] = f"execute the routed workflow from node {current_node}"
+    import workflowctl
+    commit_with_context(
+        task, "templates-routed", "deterministically routed provenance-bound templates",
+        side_effects=[workflowctl.stage_side_effect(task)],
+    )
     print(json.dumps({"mode": task.get("mode"), "capabilities": capabilities, "templates": selected, "route": receipt["sha256"]}, indent=2))
     return 0
 

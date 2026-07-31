@@ -381,6 +381,23 @@ def transition_task(
         effective_source_tokens = contextctl.automatic_transition_source_tokens(
             contextctl.load_json(contextctl.CONFIG_PATH), previous_context, after, source_tokens
         )
+        # A loaded reference is a separate reservation only while it remains
+        # reusable. Removing it from TASK (explicit unload or new-task reset)
+        # does not remove its bytes from the active provider window. Settle the
+        # released reservation into the monotonic active-window estimate so the
+        # unified total cannot decrease without verified host compaction.
+        def reference_tokens(value: Dict[str, object]) -> int:
+            references = value.get("loaded_references")
+            return sum(
+                max(0, int(item.get("estimated_tokens", 0)))
+                for item in references
+                if isinstance(references, list) and isinstance(item, dict)
+            ) if isinstance(references, list) else 0
+
+        released_reference_tokens = max(
+            0, reference_tokens(before) - reference_tokens(after)
+        )
+        effective_source_tokens += released_reference_tokens
         backups = {
             TASK_PATH: TASK_PATH.read_bytes(),
             CONTEXT_PATH: CONTEXT_PATH.read_bytes() if CONTEXT_PATH.is_file() else None,

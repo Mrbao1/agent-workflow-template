@@ -44,6 +44,7 @@ def fixture(root: Path, clarified: bool) -> None:
     shutil.copy2(SOURCE_AGENT / "scripts/contexttx.py", root / ".agent/scripts/contexttx.py")
     shutil.copy2(SOURCE_AGENT / "scripts/agentctl.py", root / ".agent/scripts/agentctl.py")
     shutil.copy2(SOURCE_AGENT / "scripts/humandecision.py", root / ".agent/scripts/humandecision.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/workflowctl.py", root / ".agent/scripts/workflowctl.py")
     shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib", dirs_exist_ok=True)
     shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
     shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows", dirs_exist_ok=True)
@@ -255,6 +256,139 @@ def fixture(root: Path, clarified: bool) -> None:
         },
     }
     write_json(root / ".agent/state/TASK.json", task)
+
+
+MODE_BUDGETS = {"fast": 16000, "standard": 48000, "release": 96000}
+
+
+def mode_fixture(root: Path, mode: str, task_type: str) -> None:
+    """Clarified fixture over the REAL template manifest for route regressions."""
+    (root / ".agent/scripts").mkdir(parents=True, exist_ok=True)
+    (root / ".agent/state/artifacts").mkdir(parents=True, exist_ok=True)
+    for script in ("templatectl.py", "contextctl.py", "contexttx.py", "agentctl.py", "humandecision.py", "workflowctl.py"):
+        shutil.copy2(SOURCE_AGENT / "scripts" / script, root / ".agent/scripts" / script)
+    shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "templates", root / ".agent/templates", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "assets/templates", root / ".agent/assets/templates", dirs_exist_ok=True)
+    shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
+    shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "policies", root / ".agent/policies", dirs_exist_ok=True)
+    shutil.copytree(SOURCE_AGENT / "skills/run-ai-coding-pipeline", root / ".agent/skills/run-ai-coding-pipeline", dirs_exist_ok=True)
+    config = {
+        "context": {
+            "max_bytes": 8192,
+            "max_list_items": 30,
+            "max_capsule_tokens": {"fast": 1000, "standard": 1200, "release": 2000},
+            "estimated_turn_overhead_tokens": {"fast": 2000, "standard": 3000, "release": 4000},
+            "transition_token_increment": {"fast": 200, "standard": 400, "release": 800},
+            "bootstrap_overhead_tokens": 7000,
+            "max_active_checkpoint_age_minutes": 45,
+            "soft_budget_ratio": 0.6,
+            "compact_budget_ratio": 0.75,
+            "hard_budget_ratio": 0.9,
+        },
+        "routing": {
+            "modes": {
+                mode_name: {"token_budget": budget}
+                for mode_name, budget in MODE_BUDGETS.items()
+            },
+        },
+        "acceptance_adapters": {},
+        "context_transport": {
+            "default": "native",
+            "pxpipe": {
+                "enabled": False,
+                "activation": "explicit-opt-in",
+                "plugin_name": "pxpipe-context",
+                "plugin_version": "0.1.0+codex.20260721210500",
+                "models": ["gpt-5.6-sol"],
+                "primary_mode": "provider-proxy",
+                "provider_activation": "default-new-local-sessions",
+                "provider_configuration": "user-model-provider-plus-launch-agent",
+                "provider_content_scope": "whole-request-eligible-content",
+                "mcp_role": "optional-cold-reference",
+                "selection": "analyze-then-render",
+                "content_scope": "new-cold-reference-only",
+                "session_boundary": "plugin-load-requires-new-chat",
+                "fallback": "native",
+            },
+        },
+    }
+    write_json(root / ".agent/config.json", config)
+    contract = "# Requirement Contract\n\nClarified by user.\n"
+    (root / ".agent/state/REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
+    task = {
+        "schema": "agent-task/v2",
+        "title": f"{mode} {task_type} route fixture",
+        "task_type": task_type,
+        "complexity": "simple",
+        "mode": mode,
+        "files": 1,
+        "environment": "local",
+        "deployment_requested": False,
+        "branch": "unversioned",
+        "risk_flags": {},
+        "requirements_clarified": True,
+        "requirement_source": "user:fixture",
+        "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
+        "requirement_contract_sha256": hashlib.sha256(contract.encode()).hexdigest(),
+        "token_budget": MODE_BUDGETS[mode],
+        "tokens_used": 100,
+        "token_usage_source": "estimated",
+        "child_agents_used": 0,
+        "peak_child_agents": 0,
+        "loaded_references": [],
+        "primary_skill": "run-ai-coding-pipeline",
+        "phase": "planning",
+        "status": "in_progress",
+        "decisions": [],
+        "open_questions": [],
+        "next_action": "route templates",
+        "current_node": 2,
+        "accepted_nodes": [0, 1],
+        "node_artifacts": {},
+        "gate_approvals": {"requirement": {
+            "source": "user:fixture",
+            "decision_receipt": {"sha256": "a" * 64},
+        }},
+        "decision_policy_version": 1,
+        "pending_gate_artifacts": {},
+        "rollback_ledger": [],
+        "rollback_archive": None,
+        "failure_ledger": {},
+        "failure_archive": None,
+        "mode_status": "confirmed",
+        "selected_templates": ["requirement-contract"],
+        "selected_capabilities": ["core"],
+        "rendered_artifacts": [],
+        "metrics": {
+            "tokens": 100,
+            "token_source": "estimated",
+            "child_agents": 0,
+            "peak_children": 0,
+            "tool_calls": 0,
+            "test_runs": 0,
+            "test_failures": 0,
+            "repair_rounds": 0,
+            "user_corrections": 0,
+            "context_compactions": 0,
+            "references_loaded": 0,
+        },
+    }
+    write_json(root / ".agent/state/TASK.json", task)
+    context = subprocess.run(
+        [
+            sys.executable, ".agent/scripts/contextctl.py", "sync",
+            "--reason", "fixture", "--summary", f"{mode} {task_type} route fixture",
+            "--source-tokens", "1800",
+        ],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if context.returncode:
+        raise SystemExit(context.stdout)
 
 
 def main() -> int:
@@ -838,6 +972,98 @@ def main() -> int:
         profile = json.loads((root / ".agent/state/artifacts/04-context-transport-profile.json").read_text(encoding="utf-8"))
         if profile.get("schema") != "agent-context-transport-profile/v2":
             raise AssertionError(f"v4 install render produced an unexpected profile: {profile}")
+
+    # Regression: fast + lightweight (maintenance/governance/documentation)
+    # dead-ended at node 7 because the lightweight route filter dropped
+    # targeted-acceptance, the template fast node 7 is accepted by.  The fast
+    # lightweight route must keep the full fast acceptance chain and render
+    # must accept targeted-acceptance for it.
+    with tempfile.TemporaryDirectory(prefix="templatectl-fast-lightweight-") as raw:
+        root = Path(raw)
+        mode_fixture(root, "fast", "maintenance")
+        routed = invoke(root, "route")
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        expected_fast = [
+            "requirement-contract",
+            "fast-projection",
+            "node-implementation",
+            "targeted-acceptance",
+            "retrospective",
+        ]
+        if task["selected_templates"] != expected_fast:
+            raise SystemExit(f"fast lightweight route cannot pass node 7: {task['selected_templates']}")
+        if task.get("next_action") != "render routed artifacts and complete projected nodes 2-6":
+            raise SystemExit("fast route left a stale pre-route next_action")
+        if task.get("template_route", {}).get("projection") != "lightweight":
+            raise SystemExit("fast maintenance task must keep the lightweight projection")
+        require_failure(
+            root, "fast-lightweight-node-acceptance-not-selected", "render", "--id", "node-acceptance",
+            "--output", ".agent/state/artifacts/07-acceptance.json",
+            "--var", "mode=fast", "--var", "status=verified", "--var", "human_decision=not_required",
+            "--var", "node_bindings=[]", "--var", "acceptance_checks=[]",
+            "--var", "mode_appropriate_reviewers=[]", "--var", "release_review_chain=null",
+            "--var", "release_scenario_receipt_sha256=null", "--var", "release_scenarios=null",
+            "--var", "release_live_gate_receipt=null", "--var", "release_platform_assurance=null",
+            "--var", "release_platform_observation_set=null",
+            "--var", "release_platform_observation_set_sha256=", "--var", "release_supervision_debt=null",
+            "--var", "release_supervision_debt_sha256=", "--var", "recommendation=complete",
+        )
+        rendered_projection = invoke(
+            root, "render", "--id", "fast-projection",
+            "--output", ".agent/state/artifacts/01-fast-projection.json",
+            "--var", f"requirement_contract_sha256={task['requirement_contract_sha256']}",
+            "--var", "scope_summary=fixture", "--var", "change_receipts=[]",
+            "--var", "check_receipts=[]", "--var", "cleanup_receipt={}", "--var", "exclusions=[]",
+        )
+        if rendered_projection.returncode:
+            raise SystemExit(f"fast lightweight projection template refused by render:\n{rendered_projection.stdout}")
+        rendered = invoke(
+            root, "render", "--id", "targeted-acceptance",
+            "--output", ".agent/state/artifacts/07-acceptance.json",
+            "--var", "mode=fast", "--var", "node_bindings=[]", "--var", "acceptance_checks=[]",
+        )
+        if rendered.returncode:
+            raise SystemExit(f"fast lightweight node 7 template refused by render:\n{rendered.stdout}")
+        validated = invoke(root, "validate")
+        if validated.returncode:
+            raise SystemExit(f"fast lightweight route failed validation:\n{validated.stdout}")
+
+    # Fast product tasks keep the same acceptance chain (no lightweight filter).
+    with tempfile.TemporaryDirectory(prefix="templatectl-fast-product-") as raw:
+        root = Path(raw)
+        mode_fixture(root, "fast", "feature")
+        routed = invoke(root, "route")
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        if task["selected_templates"] != [
+            "requirement-contract",
+            "fast-projection",
+            "node-implementation",
+            "targeted-acceptance",
+            "retrospective",
+        ]:
+            raise SystemExit(f"fast product route regressed: {task['selected_templates']}")
+
+    # Standard lightweight keeps its existing working route untouched.
+    with tempfile.TemporaryDirectory(prefix="templatectl-standard-lightweight-") as raw:
+        root = Path(raw)
+        mode_fixture(root, "standard", "documentation")
+        routed = invoke(root, "route")
+        if routed.returncode:
+            raise SystemExit(routed.stdout)
+        task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+        if task["selected_templates"] != [
+            "requirement-contract",
+            "node-implementation",
+            "node-acceptance",
+            "retrospective",
+        ]:
+            raise SystemExit(f"standard lightweight route regressed: {task['selected_templates']}")
+        if task.get("next_action") != "render routed artifacts and complete projected nodes 2-6":
+            raise SystemExit("standard lightweight route left a stale reroute next_action")
 
     print("TEMPLATECTL SELF-TEST PASSED")
     return 0

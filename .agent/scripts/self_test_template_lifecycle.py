@@ -27,13 +27,23 @@ def run(*command: str, cwd: Optional[Path] = None, expected: int = 0) -> subproc
     )
     if result.returncode != expected:
         raise SystemExit(
-            f"unexpected exit {result.returncode}, expected {expected}: {' '.join(command)}\n{result.stdout}"
+            f"unexpected exit {result.returncode}, expected {expected} "
+            f"(cwd={cwd or Path.cwd()}): {' '.join(command)}\n{result.stdout}"
         )
     return result
 
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def receipt(root: Path, path: Path) -> dict[str, object]:
+    data = path.read_bytes()
+    return {
+        "path": str(path.relative_to(root)),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+    }
 
 
 def project_tree_bytes(target: Path) -> dict[str, bytes]:
@@ -115,6 +125,7 @@ def activate_migration22_hot_state(target: Path) -> None:
     config["context"].pop("max_failure_entries", None)
     config["context"].pop("max_failure_archive_depth", None)
     config["context"].pop("estimated_turn_overhead_tokens", None)
+    config["context"].pop("transition_token_increment", None)
     config["context"].pop("bootstrap_overhead_tokens", None)
     config["context"]["automatic_transition_token_increment"] = {
         "fast": 150, "standard": 300, "release": 500,
@@ -233,6 +244,9 @@ def main() -> int:
             or fresh_full_config.get("context", {}).get("estimated_turn_overhead_tokens") != {
                 "fast": 2000, "standard": 3000, "release": 4000,
             }
+            or fresh_full_config.get("context", {}).get("transition_token_increment") != {
+                "fast": 200, "standard": 400, "release": 800,
+            }
             or fresh_full_config.get("context", {}).get("bootstrap_overhead_tokens") != 7000
             or "automatic_transition_token_increment" in fresh_full_config.get("context", {})
             or fresh_config.get("status_interval_seconds") != 30
@@ -278,7 +292,9 @@ def main() -> int:
         ):
             raise SystemExit("fresh install lacks the fail-closed workflow and v9 Agent defaults")
 
-        def assert_fresh_fast_start(name: str, requested_mode: str, approve: bool = False) -> Path:
+        def assert_fresh_fast_start(
+            name: str, requested_mode: str, approve: bool = False, complete: bool = False,
+        ) -> Path:
             fast_target = workspace / name
             adapterless_install = subprocess.run(
                 [
@@ -371,10 +387,427 @@ def main() -> int:
                     raise SystemExit("fresh fast approval exceeded its bounded capsule or failed to enter Node 2")
                 run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=fast_target)
                 run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=fast_target)
+                if complete:
+                    # Real installed lifecycle: do not replace contextctl,
+                    # contexttx, workflowctl or agentctl. This covers the
+                    # fast+lightweight template route and proves that the
+                    # canonical transition estimate survives the whole chain
+                    # below the fast hard watermark.
+                    run(sys.executable, ".agent/scripts/templatectl.py", "route", cwd=fast_target)
+                    routed_task = json.loads(
+                        (fast_target / ".agent/state/TASK.json").read_text(encoding="utf-8")
+                    )
+                    if routed_task.get("selected_templates") != [
+                        "requirement-contract", "fast-projection", "node-implementation",
+                        "targeted-acceptance", "retrospective",
+                    ]:
+                        raise SystemExit("real fast lightweight lifecycle lacks its node 7 template")
+
+                    change_path = fast_target / "real-lifecycle-change.txt"
+                    change_path.write_text("real contexttx lifecycle candidate\n", encoding="utf-8")
+                    check_result = run(
+                        sys.executable, ".agent/scripts/contextctl.py", "check", cwd=fast_target,
+                    )
+                    check_output = fast_target / ".agent/state/evidence/real-lifecycle-context-check.txt"
+                    check_output.parent.mkdir(parents=True, exist_ok=True)
+                    check_output.write_text(check_result.stdout, encoding="utf-8")
+                    cleanup = {
+                        "runtime_state": receipt(
+                            fast_target, fast_target / ".agent/state/runtime.json"
+                        ),
+                        "residual": {"processes": 0, "docker_projects": 0, "ports": 0},
+                    }
+                    changes = [receipt(fast_target, change_path)]
+                    checks = [{
+                        "id": "real-contexttx-lifecycle",
+                        "command": [
+                            sys.executable, ".agent/scripts/contextctl.py", "check",
+                        ],
+                        "exit_code": 0,
+                        "output": receipt(fast_target, check_output),
+                    }]
+
+                    def render(template_id: str, output: str, variables: dict[str, object]) -> None:
+                        command = [
+                            sys.executable, ".agent/scripts/templatectl.py", "render",
+                            "--id", template_id, "--output", output,
+                        ]
+                        for key, value in variables.items():
+                            rendered = (
+                                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                                if not isinstance(value, str) else value
+                            )
+                            command.extend(["--var", f"{key}={rendered}"])
+                        run(*command, cwd=fast_target)
+
+                    render("fast-projection", ".agent/state/artifacts/01-fast-projection.json", {
+                        "requirement_contract_sha256": routed_task["requirement_contract_sha256"],
+                        "scope_summary": "real installed fast lifecycle",
+                        "change_receipts": changes,
+                        "check_receipts": checks,
+                        "cleanup_receipt": cleanup,
+                        "exclusions": [],
+                    })
+                    render("node-implementation", ".agent/state/artifacts/06-implementation.json", {
+                        "mode": "fast",
+                        "requirement_contract_sha256": routed_task["requirement_contract_sha256"],
+                        "mode_appropriate_implementer_agent_id": None,
+                        "projection": [2, 3, 4, 5, 6],
+                        "change_receipts": changes,
+                        "check_receipts": checks,
+                        "cleanup_receipt": cleanup,
+                        "scope_summary": "real installed fast lifecycle",
+                    })
+                    run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "advance",
+                        "--node", "6", "--artifact", ".agent/state/artifacts/06-implementation.json",
+                        cwd=fast_target,
+                    )
+                    node6_task = json.loads(
+                        (fast_target / ".agent/state/TASK.json").read_text(encoding="utf-8")
+                    )
+                    acceptance_checks = [{
+                        "id": "real-lifecycle-acceptance",
+                        "result": "passed",
+                        "case_ids": ["fast-lightweight-route", "real-contexttx-budget"],
+                        "assertions": ["node 7 template is routed", "context remains below hard watermark"],
+                        "reviewer": "fixture-integrator",
+                        "evidence": [receipt(fast_target, check_output)],
+                    }]
+                    render("targeted-acceptance", ".agent/state/artifacts/07-acceptance.json", {
+                        "mode": "fast",
+                        "node_bindings": {
+                            "requirement_contract_sha256": node6_task["requirement_contract_sha256"],
+                            "implementation_sha256": node6_task["node_artifacts"]["6"]["sha256"],
+                        },
+                        "acceptance_checks": acceptance_checks,
+                    })
+                    run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "advance",
+                        "--node", "7", "--artifact", ".agent/state/artifacts/07-acceptance.json",
+                        cwd=fast_target,
+                    )
+                    render("retrospective", ".agent/state/artifacts/08-retrospective.md", {
+                        "result": "real fast lifecycle completed",
+                        "time": "bounded fixture",
+                        "tokens": "estimated and below hard watermark",
+                        "resources": "no child agents",
+                        "costs": "one bounded lifecycle",
+                        "learning": "real contexttx path is required",
+                        "candidates": "none",
+                        "promotion": "not requested",
+                    })
+                    final_snapshot = empty_platform_snapshot(
+                        fast_target / ".agent/state/evidence/real-lifecycle-empty-platform.json"
+                    )
+                    run(
+                        sys.executable,
+                        ".agent/skills/manage-agent-team/scripts/agentledger.py", "init",
+                        "--platform-snapshot", str(final_snapshot.relative_to(fast_target)),
+                        cwd=fast_target,
+                    )
+                    terminal_risk = "fixture terminal risk requires explicit resolution"
+                    before_completion_context = json.loads(
+                        (fast_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+                    )
+                    run(
+                        sys.executable, ".agent/scripts/contextctl.py", "sync",
+                        "--reason", "terminal-risk-fixture",
+                        "--summary", "record an explicit terminal risk",
+                        "--source-tokens", str(
+                            before_completion_context["usage_freshness"]["estimated_tokens"]
+                        ),
+                        "--source", "fixture:terminal-risk",
+                        "--risk", terminal_risk,
+                        cwd=fast_target,
+                    )
+                    blocked_completion = run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "complete-task",
+                        "--retrospective", ".agent/state/artifacts/08-retrospective.md",
+                        "--platform-snapshot", str(final_snapshot.relative_to(fast_target)),
+                        expected=1, cwd=fast_target,
+                    )
+                    if "unresolved context risks" not in blocked_completion.stdout:
+                        raise SystemExit(
+                            "terminal completion did not fail closed on an unresolved risk"
+                        )
+                    run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "complete-task",
+                        "--retrospective", ".agent/state/artifacts/08-retrospective.md",
+                        "--platform-snapshot", str(final_snapshot.relative_to(fast_target)),
+                        "--resolve-risk", terminal_risk,
+                        cwd=fast_target,
+                    )
+                    completed_task = json.loads(
+                        (fast_target / ".agent/state/TASK.json").read_text(encoding="utf-8")
+                    )
+                    completed_context = json.loads(
+                        (fast_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+                    )
+                    hard_limit = (
+                        fast_config["routing"]["modes"]["fast"]["token_budget"]
+                        * fast_config["context"]["hard_budget_ratio"]
+                    )
+                    estimate = completed_context["usage_freshness"]["estimated_tokens"]
+                    completed_compaction = completed_context.get("compaction", {})
+                    if (
+                        completed_task.get("status") != "accepted"
+                        or completed_task.get("budget_state") == "hard_blocked"
+                        or estimate >= hard_limit
+                        or completed_context.get("open_risks") != []
+                        or completed_compaction.get("tokens_removed") != 0
+                        or completed_compaction.get("capsule_reduction_tokens")
+                        != completed_compaction.get("source_estimated_tokens")
+                        - completed_compaction.get("capsule_estimated_tokens")
+                    ):
+                        raise SystemExit(
+                            f"real fast lifecycle hit the fabricated budget ratchet: "
+                            f"estimate={estimate} hard={hard_limit}"
+                        )
+                    routed = run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                        cwd=fast_target,
+                    )
+                    if json.loads(routed.stdout).get("terminal") is not True:
+                        raise SystemExit("real fast lifecycle did not reach a terminal route receipt")
+                    # The next real host/model turn must be charged without
+                    # erasing the explicit complete-task origin. This used to
+                    # turn an accepted task back into a non-terminal route
+                    # because account-turn replaced the current checkpoint.
+                    run(
+                        sys.executable, ".agent/scripts/contextctl.py", "account-turn",
+                        "--turn-id", "real-lifecycle-post-completion-turn",
+                        cwd=fast_target,
+                    )
+                    post_turn_context_path = fast_target / ".agent/state/CONTEXT.json"
+                    post_turn_context = json.loads(
+                        post_turn_context_path.read_text(encoding="utf-8")
+                    )
+                    completion_origin = post_turn_context.get("checkpoint", {}).get(
+                        "terminal_completion_origin", {}
+                    )
+                    completion_authorization = completion_origin.get(
+                        "transition_authorization", {}
+                    )
+                    if (
+                        completion_origin.get("schema")
+                        != "agent-terminal-completion-origin/v1"
+                        or completion_origin.get("kind") != "complete-task"
+                        or completion_authorization.get("mutator") != "workflowctl"
+                        or completion_authorization.get("operation") != "complete-task"
+                    ):
+                        raise SystemExit(
+                            "post-completion host turn did not preserve the complete-task origin"
+                        )
+                    first_accounting_bytes = post_turn_context_path.read_bytes()
+                    duplicate_turn = run(
+                        sys.executable, ".agent/scripts/contextctl.py", "account-turn",
+                        "--turn-id", "real-lifecycle-post-completion-turn",
+                        cwd=fast_target,
+                    )
+                    if (
+                        "ALREADY ACCOUNTED" not in duplicate_turn.stdout
+                        or post_turn_context_path.read_bytes() != first_accounting_bytes
+                    ):
+                        raise SystemExit(
+                            "post-completion host turn replay was not a byte-identical no-op"
+                        )
+                    post_turn_route = run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                        cwd=fast_target,
+                    )
+                    if json.loads(post_turn_route.stdout).get("terminal") is not True:
+                        raise SystemExit(
+                            "post-completion host turn erased the terminal route receipt"
+                        )
             return fast_target
 
-        assert_fresh_fast_start("fresh-explicit-fast", "fast", approve=True)
+        assert_fresh_fast_start("fresh-explicit-fast", "fast", approve=True, complete=True)
         assert_fresh_fast_start("fresh-auto-fast", "auto")
+
+        # Real three-strike recovery over installed contexttx/contextctl. The
+        # state-machine unit fixture intentionally stubs those modules, so it
+        # cannot prove that resolve-failure has an authorized transition
+        # profile. Prepare a valid in-progress checkpoint, drive three actual
+        # return-node transactions, then exercise the real approval exit.
+        strike_target = workspace / "real-three-strike-recovery"
+        strike_install = subprocess.run(
+            [
+                sys.executable, str(installer), str(strike_target),
+                "--project-name", "real-three-strike-recovery",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+        if strike_install.returncode:
+            raise SystemExit(f"real three-strike install failed:\n{strike_install.stdout}")
+        strike_guardrails = strike_target / "project-guardrails.md"
+        strike_guardrails.write_text(
+            "# Project Guardrails\n\n"
+            "## Required project facts\n\n"
+            "- Product and users: Disposable three-strike lifecycle fixture.\n"
+            "- Technology and architecture: Installed Python workflow controls and JSON state.\n"
+            "- Writable and read-only areas: The temporary fixture is writable; external paths are read-only.\n"
+            "- Security, privacy, compliance and performance red lines: No credentials or external effects.\n"
+            "- Build, test and lint commands: Run the template lifecycle self-test.\n"
+            "- Deployment authority and rollback owner: No deployment; the fixture owner rolls back.\n",
+            encoding="utf-8",
+        )
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "project-init",
+            "--guardrails-file", strike_guardrails.name, cwd=strike_target,
+        )
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "start",
+            "--title", "real three-strike recovery", "--mode", "standard",
+            "--environment", "local", "--task-type", "maintenance",
+            "--complexity", "bounded", "--files", "3", cwd=strike_target,
+        )
+        strike_contract = strike_target / ".agent/state/REQUIREMENT_CONTRACT.md"
+        strike_contract.write_text(
+            "# Requirement Contract\n\n"
+            "- Goal: Verify the real three-strike recovery exit.\n"
+            "- Users: Template lifecycle maintainers.\n"
+            "- Success: resolve-failure commits through real contexttx.\n"
+            "- In scope: Disposable local workflow state.\n"
+            "- Out of scope: External effects.\n"
+            "- Constraints: Remain local and reversible.\n"
+            "- Data and permissions: No credentials or external data.\n"
+            "- Target environment: local\n"
+            "- Context transport: native\n"
+            "- Acceptance: Context authorization records resolve-failure.\n"
+            "- Provenance: template lifecycle fixture\n"
+            "- Production provider target: none\n"
+            "- Human decisions: user:real-three-strike\n"
+            "- Clarified: true\n",
+            encoding="utf-8",
+        )
+        run(
+            sys.executable, ".agent/scripts/agentctl.py", "approve-requirements",
+            "--source", "user:real-three-strike", cwd=strike_target,
+        )
+        run(
+            sys.executable, ".agent/scripts/templatectl.py", "route",
+            cwd=strike_target,
+        )
+        strike_task_path = strike_target / ".agent/state/TASK.json"
+        strike_task = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        strike_task.update({
+            "current_node": 5,
+            "accepted_nodes": [0, 1, 2, 3, 4],
+            "status": "in_progress",
+            "phase": "testing",
+            "next_action": "exercise repeated root-cause returns",
+        })
+        strike_task_path.write_text(
+            json.dumps(strike_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        run(
+            sys.executable, ".agent/scripts/contextctl.py", "repair", "--reset",
+            "--reason", "prepare-real-three-strike",
+            "--summary", "bind the real repeated-failure fixture",
+            "--source-tokens", "1600", expected=1, cwd=strike_target,
+        )
+        run(
+            sys.executable, ".agent/scripts/contextctl.py", "approve-repair",
+            "--source", "user:real-three-strike", cwd=strike_target,
+        )
+        for from_node, to_node in ((5, 4), (4, 3), (3, 2)):
+            run(
+                sys.executable, ".agent/scripts/workflowctl.py", "return-node",
+                "--from-node", str(from_node), "--to", str(to_node),
+                "--issue-id", "REAL-STRIKE", "--cause-category", "implementation",
+                "--subtask", "real transaction", "--root-cause", "same defect",
+                "--change", "retry after root-cause repair", cwd=strike_target,
+            )
+        escalated = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        if (
+            escalated.get("status") != "waiting_human"
+            or "three times" not in str(escalated.get("next_action"))
+        ):
+            raise SystemExit("real three-strike lifecycle did not reach its human decision gate")
+        run(
+            sys.executable, ".agent/scripts/workflowctl.py", "resolve-failure",
+            "--source", "user:real-three-strike", cwd=strike_target,
+        )
+        resolved = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        resolved_context = json.loads(
+            (strike_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+        )
+        authorization = resolved_context.get("checkpoint", {}).get("transition_authorization", {})
+        if (
+            "failure-escalation" not in resolved.get("gate_approvals", {})
+            or authorization.get("mutator") != "workflowctl"
+            or authorization.get("operation") != "resolve-failure"
+            or resolved.get("status") != "in_progress"
+            or resolved.get("failure_escalation", {}).get("state") != "resolved"
+        ):
+            raise SystemExit("real resolve-failure did not commit its bound context transition")
+        resumed = run(
+            sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+            cwd=strike_target,
+        )
+        resumed_receipt = json.loads(resumed.stdout)
+        if (
+            resumed_receipt.get("action") == "waiting_human"
+            or resumed_receipt.get("control") == "human-decision-required"
+        ):
+            raise SystemExit("resolved three-strike recovery remained stuck at waiting_human")
+
+        strike_change = strike_target / "real-three-strike-change.txt"
+        strike_change.write_text("repaired three-strike candidate\n", encoding="utf-8")
+        strike_check = run(
+            sys.executable, ".agent/scripts/contextctl.py", "check", cwd=strike_target,
+        )
+        strike_check_output = strike_target / ".agent/state/evidence/real-three-strike-check.txt"
+        strike_check_output.parent.mkdir(parents=True, exist_ok=True)
+        strike_check_output.write_text(strike_check.stdout, encoding="utf-8")
+        strike_variables = {
+            "mode": "standard",
+            "requirement_contract_sha256": resolved["requirement_contract_sha256"],
+            "mode_appropriate_implementer_agent_id": None,
+            "projection": [2, 3, 4, 5, 6],
+            "change_receipts": [receipt(strike_target, strike_change)],
+            "check_receipts": [{
+                "id": "resolved-three-strike-context",
+                "command": [sys.executable, ".agent/scripts/contextctl.py", "check"],
+                "exit_code": 0,
+                "output": receipt(strike_target, strike_check_output),
+            }],
+            "cleanup_receipt": {
+                "runtime_state": receipt(strike_target, strike_target / ".agent/state/runtime.json"),
+                "residual": {"processes": 0, "docker_projects": 0, "ports": 0},
+            },
+            "scope_summary": "advance the repaired real three-strike lifecycle",
+        }
+        strike_render = [
+            sys.executable, ".agent/scripts/templatectl.py", "render",
+            "--id", "node-implementation",
+            "--output", ".agent/state/artifacts/06-implementation.json",
+        ]
+        for key, value in strike_variables.items():
+            rendered = (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                if not isinstance(value, str) else value
+            )
+            strike_render.extend(["--var", f"{key}={rendered}"])
+        run(*strike_render, cwd=strike_target)
+        run(
+            sys.executable, ".agent/scripts/workflowctl.py", "advance",
+            "--node", "6", "--artifact", ".agent/state/artifacts/06-implementation.json",
+            cwd=strike_target,
+        )
+        advanced = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        if (
+            advanced.get("current_node") != 7
+            or "failure_escalation" in advanced
+            or "failure-escalation" in advanced.get("gate_approvals", {})
+        ):
+            raise SystemExit("first successful advance did not consume the resolved failure escalation")
+        run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=strike_target)
+        run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=strike_target)
 
         legacy_fast = workspace / "migration32-legacy-fast"
         run(sys.executable, str(installer), str(legacy_fast), "--project-name", "migration32-legacy-fast")
@@ -478,7 +911,8 @@ def main() -> int:
                 "'state':'awaiting_host_compaction','history':['handoff_written'],'receipt':None};"
                 "comp=v['compaction'];est=contextctl.normalized_token_estimate(v);"
                 "comp['capsule_estimated_tokens']=est;"
-                "comp['tokens_removed']=int(comp['source_estimated_tokens'])-est;"
+                "comp['capsule_reduction_tokens']=int(comp['source_estimated_tokens'])-est;"
+                "comp['tokens_removed']=0;"
                 "comp['compression_ratio']=round(int(comp['source_estimated_tokens'])/max(est,1),2);"
                 "v['integrity']['content_sha256']='0'*64;"
                 "v['integrity']['content_sha256']=contextctl.content_sha256(v);"
@@ -577,13 +1011,13 @@ def main() -> int:
             raise SystemExit("migrations 35/36 overwrote a project-owned custom fast token budget")
 
         # Migration 36 carries CUSTOMIZED legacy transition-increment values
-        # into the honest overhead key instead of silently discarding them;
-        # only the legacy seed constants are recalibrated away (covered by
-        # the migration-22 fixture above).  The carry is reinterpreted: the
-        # alias was charged as the bare value per transition while the new
-        # key adds the inherited-turn surcharge (800), so each carried value
-        # is reduced by that surcharge to preserve the tuned TOTAL, floored
-        # at the new key's minimum of 50 (250 -> 50, 1200 -> 400, 1500 -> 700).
+        # into the per-transition increment key instead of silently
+        # discarding them; only the legacy seed constants are recalibrated
+        # away (covered by the migration-22 fixture above).  The alias's true
+        # historical semantic was the per-transition increment, so each
+        # carried value is clamped to the sane range [50, 1000]
+        # (250 -> 250, 1200 -> 1000, 1500 -> 1000) and the honest per-turn
+        # overhead is never rewritten from the alias.
         tuned36 = workspace / "migration36-tuned-increment"
         run(sys.executable, str(installer), str(tuned36), "--project-name", "fixture-migration36-tuned")
         tuned36_config_path = tuned36 / ".agent/config.json"
@@ -601,14 +1035,17 @@ def main() -> int:
         run(sys.executable, str(installer), str(tuned36), "--update")
         tuned36_migrated = json.loads(tuned36_config_path.read_text(encoding="utf-8"))
         if (
-            tuned36_migrated["context"].get("estimated_turn_overhead_tokens")
-            != {"fast": 50, "standard": 400, "release": 700}
+            tuned36_migrated["context"].get("transition_token_increment")
+            != {"fast": 250, "standard": 1000, "release": 1000}
+            or tuned36_migrated["context"].get("estimated_turn_overhead_tokens")
+            != {"fast": 2000, "standard": 3000, "release": 4000}
             or "automatic_transition_token_increment" in tuned36_migrated["context"]
         ):
-            raise SystemExit("migration 36 discarded a project's customized legacy turn-increment values")
+            raise SystemExit("migration 36 discarded a project's customized legacy transition-increment values")
 
-        # A project that already tuned the NEW overhead key keeps it; the
-        # legacy alias is still retired without carrying anything.
+        # A project that already tuned the per-turn overhead key keeps it:
+        # the alias carry targets the transition-increment key only, so the
+        # two policies stay independent and the alias is still retired.
         kept36 = workspace / "migration36-tuned-overhead"
         run(sys.executable, str(installer), str(kept36), "--project-name", "fixture-migration36-kept")
         kept36_config_path = kept36 / ".agent/config.json"
@@ -630,9 +1067,67 @@ def main() -> int:
         if (
             kept36_migrated["context"].get("estimated_turn_overhead_tokens")
             != {"fast": 2100, "standard": 3100, "release": 4100}
+            or kept36_migrated["context"].get("transition_token_increment")
+            != {"fast": 250, "standard": 350, "release": 600}
             or "automatic_transition_token_increment" in kept36_migrated["context"]
         ):
             raise SystemExit("migration 36 overwrote a project-owned estimated_turn_overhead_tokens policy")
+
+        # Migration 37 fills the honest per-transition increment for projects
+        # that already passed migration 36 (alias long retired) and removes
+        # nothing else from the project config.
+        filled37 = workspace / "migration37-fill-increment"
+        run(sys.executable, str(installer), str(filled37), "--project-name", "fixture-migration37-fill")
+        filled37_config_path = filled37 / ".agent/config.json"
+        filled37_before = json.loads(filled37_config_path.read_text(encoding="utf-8"))
+        filled37_before["context"].pop("transition_token_increment", None)
+        filled37_config_path.write_text(
+            json.dumps(filled37_before, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        filled37_manifest_path = filled37 / ".agent/.workflow-manifest.json"
+        filled37_manifest = json.loads(filled37_manifest_path.read_text(encoding="utf-8"))
+        filled37_manifest["version"] = "3.1.43"
+        filled37_manifest["migration_version"] = 36
+        filled37_manifest_path.write_text(json.dumps(filled37_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        run(sys.executable, str(installer), str(filled37), "--update")
+        filled37_after = json.loads(filled37_config_path.read_text(encoding="utf-8"))
+        if filled37_after["context"].get("transition_token_increment") != {
+            "fast": 200, "standard": 400, "release": 800,
+        }:
+            raise SystemExit("migration 37 did not fill the honest per-transition increment defaults")
+        filled37_after["context"].pop("transition_token_increment")
+        if filled37_after != filled37_before:
+            raise SystemExit("migration 37 mutated project config beyond filling transition_token_increment")
+
+        # Migration 38 repairs the invalid lower-mode carry produced by
+        # v3.1.44 (900/400/800) and leaves a validator-accepted monotonic map.
+        normalized38 = workspace / "migration38-normalize-increment"
+        run(sys.executable, str(installer), str(normalized38), "--project-name", "fixture-migration38-normalize")
+        normalized38_config_path = normalized38 / ".agent/config.json"
+        normalized38_config = json.loads(normalized38_config_path.read_text(encoding="utf-8"))
+        normalized38_config["context"]["transition_token_increment"] = {
+            "fast": 900, "standard": 400, "release": 800,
+        }
+        normalized38_config_path.write_text(
+            json.dumps(normalized38_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        normalized38_manifest_path = normalized38 / ".agent/.workflow-manifest.json"
+        normalized38_manifest = json.loads(normalized38_manifest_path.read_text(encoding="utf-8"))
+        normalized38_manifest["version"] = "3.1.44"
+        normalized38_manifest["migration_version"] = 37
+        normalized38_manifest_path.write_text(
+            json.dumps(normalized38_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        run(sys.executable, str(installer), str(normalized38), "--update")
+        normalized38_after = json.loads(normalized38_config_path.read_text(encoding="utf-8"))
+        if normalized38_after["context"].get("transition_token_increment") != {
+            "fast": 900, "standard": 900, "release": 900,
+        }:
+            raise SystemExit("migration 38 did not repair the v3.1.44 non-monotonic increment")
+        run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=normalized38)
 
         # An install from before the budget recalibration that has NOT been
         # migrated still validates: the deprecated transition-increment alias
@@ -646,6 +1141,7 @@ def main() -> int:
         for mode, budget in (("fast", 12000), ("standard", 24000), ("release", 48000)):
             legacy_config["routing"]["modes"][mode]["token_budget"] = budget
         legacy_config["context"].pop("estimated_turn_overhead_tokens", None)
+        legacy_config["context"].pop("transition_token_increment", None)
         legacy_config["context"].pop("bootstrap_overhead_tokens", None)
         legacy_config["context"]["automatic_transition_token_increment"] = {
             "fast": 150, "standard": 300, "release": 500,

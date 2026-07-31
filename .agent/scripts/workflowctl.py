@@ -310,6 +310,19 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
     if not (AGENT_DIR/"state/CONTEXT.json").is_file(): return False
     context=load(AGENT_DIR/"state/CONTEXT.json"); checkpoint=context.get("checkpoint",{})
     authorization=checkpoint.get("transition_authorization",{}) if isinstance(checkpoint,dict) else {}
+    completion_origin=(
+        checkpoint.get("terminal_completion_origin",{})
+        if isinstance(checkpoint,dict) else {}
+    )
+    completion_authorization=(
+        completion_origin.get("transition_authorization",{})
+        if (
+            isinstance(completion_origin,dict)
+            and set(completion_origin)=={"schema","kind","transition_authorization"}
+            and completion_origin.get("schema")=="agent-terminal-completion-origin/v1"
+            and completion_origin.get("kind")=="complete-task"
+        ) else {}
+    )
     binding=task.get("completion_binding",{})
     terminal=8 if task.get("mode")=="release" else 7
     artifact_set=[
@@ -365,9 +378,12 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
         and last_snapshot.get("sha256")==binding.get("completion_platform_snapshot_sha256")
     )
     ordinary_checkpoint = (
-        isinstance(authorization, dict)
-        and authorization.get("mutator") == "workflowctl"
-        and authorization.get("operation") == "complete-task"
+        any(
+            isinstance(candidate, dict)
+            and candidate.get("mutator") == "workflowctl"
+            and candidate.get("operation") == "complete-task"
+            for candidate in (authorization, completion_authorization)
+        )
     )
     migration_checkpoint = (
         historical_artifact_set is not None
@@ -383,9 +399,29 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
             )
         )
     )
+    migration_origin = (
+        historical_artifact_set is not None
+        and isinstance(completion_origin,dict)
+        and set(completion_origin)=={"schema","kind","reason","source"}
+        and completion_origin.get("schema")=="agent-terminal-completion-origin/v1"
+        and completion_origin.get("kind")=="installer-migration"
+        and (
+            completion_origin.get("reason"),
+            completion_origin.get("source"),
+        ) in {
+            (
+                "migration-26-final-state-rebind",
+                "installer-verified-active-migration",
+            ),
+            (
+                "migration-34-final-state-rebind",
+                "installer-verified-context-efficiency-migration",
+            ),
+        }
+    )
     return (
         context.get("task_invariant_sha256")==contexttx.contextctl.invariant_sha256(task)
-        and (ordinary_checkpoint or migration_checkpoint)
+        and (ordinary_checkpoint or migration_checkpoint or migration_origin)
         and binding_valid
     )
 
@@ -760,17 +796,30 @@ def failure_escalation_digest(task: Dict[str, object]) -> str:
 
 
 def failure_escalation_gate(task: Dict[str, object]) -> None:
-    """A three-strike marker blocks progression until a bound human decision exists."""
-    if not three_strike_marker(task):
+    """Block pending escalation and revalidate a resolved decision until advance."""
+    escalation = task.get("failure_escalation")
+    if escalation is None and not three_strike_marker(task):
         return
     digest = failure_escalation_digest(task)
+    if isinstance(escalation, dict):
+        if (
+            escalation.get("schema") != "agent-failure-escalation/v1"
+            or escalation.get("artifact_sha256") != digest
+            or escalation.get("state") not in {"pending", "resolved"}
+        ):
+            raise SystemExit("three-strike failure escalation state is invalid or stale")
+        state = escalation.get("state")
+    else:
+        # Backward-compatible pending marker from pre-R4 state.
+        state = "pending"
     approvals = task.get("gate_approvals", {})
     approval = approvals.get("failure-escalation") if isinstance(approvals, dict) else None
     source = str(approval.get("source", "")) if isinstance(approval, dict) else ""
-    if not isinstance(approval, dict) or not humandecision.decision_approval_valid(
+    valid = isinstance(approval, dict) and humandecision.decision_approval_valid(
         ROOT, load(AGENT_DIR / "config.json"), task, gate="failure-escalation",
         artifact_sha256=digest, source=source, record=approval,
-    ):
+    )
+    if state != "resolved" or not valid:
         raise SystemExit(
             "three-strike failure escalation requires a recorded human decision: "
             "run `python3 .agent/scripts/workflowctl.py resolve-failure --source user:<decision>`"
@@ -926,6 +975,7 @@ def command_advance(args: argparse.Namespace) -> int:
 def command_return(args: argparse.Namespace) -> int:
     task=load(TASK_PATH); target=args.to
     execution_gate(task, "return-node")
+    failure_escalation_gate(task)
     before=copy.deepcopy(task)
     if target<0 or target>8: raise SystemExit("return node must be 0-8")
     if target in {0,1}:
@@ -952,6 +1002,12 @@ def command_return(args: argparse.Namespace) -> int:
         if count==2 and int(task["current_node"])>4: target=4
         task.update({"current_node":target,"status":"in_progress","phase":PHASES[target],"next_action":f"repair root cause at node {target}"})
     task.setdefault("rollback_ledger",[]).append({"from":args.from_node,"to":target,"issue_id":args.issue_id,"cause_category":args.cause_category,"subtask":args.subtask,"root_cause":args.root_cause,"change":args.change,"signature":signature,"count":count})
+    if count >= 3:
+        task["failure_escalation"] = {
+            "schema": "agent-failure-escalation/v1",
+            "state": "pending",
+            "artifact_sha256": failure_escalation_digest(task),
+        }
     task["accepted_nodes"]=[node for node in task.get("accepted_nodes",[]) if node<target]
     task["node_artifacts"]={key:value for key,value in task.get("node_artifacts",{}).items() if int(key)<target}
     side_effects=[*compact_rollback_state(task),*compact_failure_state(task),stage_side_effect(task)]
@@ -972,7 +1028,10 @@ def command_resolve_failure(args: argparse.Namespace) -> int:
     if not args.source.startswith("user:"): raise SystemExit("failure decision source must start with user:")
     task=load(TASK_PATH)
     execution_gate(task, "request-decision")
-    if not three_strike_marker(task):
+    escalation = task.get("failure_escalation")
+    if not three_strike_marker(task) and not (
+        isinstance(escalation, dict) and escalation.get("state") == "pending"
+    ):
         raise SystemExit("no three-strike failure escalation is pending")
     digest=failure_escalation_digest(task)
     approval=humandecision.record_decision_approval(
@@ -983,6 +1042,13 @@ def command_resolve_failure(args: argparse.Namespace) -> int:
     approvals=task.setdefault("gate_approvals",{})
     if not isinstance(approvals,dict): raise SystemExit("gate_approvals must be an object")
     approvals["failure-escalation"]=approval
+    task["failure_escalation"] = {
+        "schema": "agent-failure-escalation/v1",
+        "state": "resolved",
+        "artifact_sha256": digest,
+    }
+    task["status"] = "in_progress"
+    task["next_action"] = f"repair root cause at node {task.get('current_node')} and advance the repaired artifact"
     contexttx.transition_task(before,task,mutator="workflowctl",operation="resolve-failure",reason="failure-escalation-decision",summary="recorded human three-strike failure decision",side_effects=[stage_side_effect(task)])
     print("FAILURE ESCALATION RESOLVED: advance the repaired node")
     return 0
@@ -997,6 +1063,7 @@ def command_compact_state() -> int:
             f"failure_entries={len(task.get('failure_ledger',{}))}"
         )
         return 0
+    side_effects.append(stage_side_effect(task))
     contexttx.transition_task(
         before,task,mutator="workflowctl",operation="compact-state",
         reason="compact-workflow-hot-state",summary="archived superseded rollback and failure entries",
@@ -1022,6 +1089,23 @@ def command_complete(args: argparse.Namespace) -> int:
     full_errors=workflow_validation_errors(task,require_full=True)
     if full_errors:
         raise SystemExit("task completion full-chain validation failed:\n- " + "\n- ".join(full_errors))
+    context = load(AGENT_DIR / "state/CONTEXT.json")
+    open_risks = context.get("open_risks", [])
+    if not isinstance(open_risks, list) or any(
+        not isinstance(item, str) or not item.strip() for item in open_risks
+    ):
+        raise SystemExit("task completion requires a valid bounded open-risk list")
+    requested_resolutions = list(dict.fromkeys(args.resolve_risk or []))
+    unknown_resolutions = sorted(set(requested_resolutions) - set(open_risks))
+    if unknown_resolutions:
+        raise SystemExit(f"task completion cannot resolve unknown context risks: {unknown_resolutions}")
+    remaining_risks = [item for item in open_risks if item not in requested_resolutions]
+    if remaining_risks:
+        flags = " ".join(f"--resolve-risk {json.dumps(item, ensure_ascii=False)}" for item in remaining_risks)
+        raise SystemExit(
+            "task completion is blocked by unresolved context risks; explicitly resolve each verified risk: "
+            + flags
+        )
     completion_snapshot=artifact(args.platform_snapshot)
     acceptance_approval=task.get("gate_approvals",{}).get("acceptance",{}) if isinstance(task.get("gate_approvals"),dict) else {}
     completion_decision_receipt=None
@@ -1078,7 +1162,11 @@ def command_complete(args: argparse.Namespace) -> int:
         "completion_decision_receipt":completion_decision_receipt,
     }
     task.update({"current_node":"idle","status":"accepted","phase":"idle","next_action":"start the next requirement in clarification"})
-    contexttx.transition_task(before,task,mutator="workflowctl",operation="complete-task",reason="task-completed",summary="completed accepted task and bounded retrospective",side_effects=[stage_side_effect(task)])
+    contexttx.transition_task(
+        before,task,mutator="workflowctl",operation="complete-task",
+        reason="task-completed",summary="completed accepted task and bounded retrospective",
+        side_effects=[stage_side_effect(task)],resolve_risks=requested_resolutions,
+    )
     print("TASK COMPLETED")
     return 0
 
@@ -1116,6 +1204,23 @@ def state_machine_errors(task: Dict[str, object]) -> List[str]:
             errors.append("active workflow accepted nodes must exactly precede current_node")
     else:
         errors.append("workflow status is invalid")
+    escalation = task.get("failure_escalation")
+    if escalation is not None:
+        try:
+            escalation_valid = (
+                isinstance(escalation, dict)
+                and escalation.get("schema") == "agent-failure-escalation/v1"
+                and escalation.get("state") in {"pending", "resolved"}
+                and escalation.get("artifact_sha256") == failure_escalation_digest(task)
+            )
+        except SystemExit:
+            escalation_valid = False
+        if not escalation_valid:
+            errors.append("failure escalation record is invalid or no longer binds its rollback entry")
+        elif escalation.get("state") == "pending" and not three_strike_marker(task):
+            errors.append("pending failure escalation must remain at its waiting-human marker")
+        elif escalation.get("state") == "resolved" and status != "in_progress":
+            errors.append("resolved failure escalation must resume the repaired node in progress")
     return errors
 
 
@@ -1692,7 +1797,7 @@ def main() -> int:
     advance=sub.add_parser("advance"); advance.add_argument("--node",type=int,required=True); advance.add_argument("--artifact",required=True)
     back=sub.add_parser("return-node"); back.add_argument("--from-node",type=int,required=True); back.add_argument("--to",type=int,required=True); back.add_argument("--issue-id",required=True); back.add_argument("--cause-category",choices=("requirements","provenance","scope","solution","tests","implementation","acceptance","runtime","delivery","agent-control"),required=True); back.add_argument("--subtask",required=True); back.add_argument("--root-cause",required=True); back.add_argument("--change",required=True)
     resolve=sub.add_parser("resolve-failure"); resolve.add_argument("--source",required=True); resolve.add_argument("--human-decision-receipt")
-    complete=sub.add_parser("complete-task"); complete.add_argument("--retrospective",required=True); complete.add_argument("--knowledge-candidates",action="append"); complete.add_argument("--platform-snapshot",required=True); complete.add_argument("--completion-source"); complete.add_argument("--completion-platform-transcript-verified-sha256"); complete.add_argument("--human-decision-receipt")
+    complete=sub.add_parser("complete-task"); complete.add_argument("--retrospective",required=True); complete.add_argument("--knowledge-candidates",action="append"); complete.add_argument("--resolve-risk",action="append"); complete.add_argument("--platform-snapshot",required=True); complete.add_argument("--completion-source"); complete.add_argument("--completion-platform-transcript-verified-sha256"); complete.add_argument("--human-decision-receipt")
     sub.add_parser("compact-state")
     resume=sub.add_parser("route-resume"); resume.add_argument("--after-cursor"); resume.add_argument("--scheduler-receipt")
     sub.add_parser("validate")

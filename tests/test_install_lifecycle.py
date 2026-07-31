@@ -332,11 +332,13 @@ def main() -> int:
             if tree(malformed_version) != version_before:
                 raise SystemExit(f"malformed migration_version {bad_value!r} changed project bytes")
 
-        # Migration 36 retires the transition-increment alias honestly: a mode
-        # is carried only when its legacy value differs from that mode's
-        # legacy seed constant (150/300/500), and each carried value is
-        # reduced by the inherited-turn surcharge (800) so the tuned TOTAL per
-        # transition is preserved (floored at the new key's minimum of 50).
+        # Migration 36 retires the transition-increment alias honestly: the
+        # alias's true historical semantic was the per-transition increment,
+        # so a mode is carried into context.transition_token_increment only
+        # when its legacy value differs from that mode's legacy seed constant
+        # (150/300/500), clamped to [50, 1000] (release 900 -> 900).  The
+        # honest per-turn overhead is never rewritten by the alias, and
+        # migration 37 fills the remaining modes with 200/400/800.
         carry = workspace / "migration-36-carry"
         run(
             sys.executable, str(installer), str(carry),
@@ -354,9 +356,54 @@ def main() -> int:
         migrated_context = json.loads(carry_config_path.read_text(encoding="utf-8"))["context"]
         if "automatic_transition_token_increment" in migrated_context:
             raise SystemExit("migration 36 left the deprecated transition-increment alias behind")
-        carried = migrated_context.get("estimated_turn_overhead_tokens")
-        if carried != {"fast": 2000, "standard": 3000, "release": 3000}:
+        carried = migrated_context.get("transition_token_increment")
+        if carried != {"fast": 200, "standard": 400, "release": 900}:
             raise SystemExit(f"migration 36 did not carry per-mode honestly: {carried}")
+        if migrated_context.get("estimated_turn_overhead_tokens") != {"fast": 2000, "standard": 3000, "release": 4000}:
+            raise SystemExit("migration 36 rewrote the honest per-turn overhead from the alias")
+
+        # Migration 38 repairs every lower-mode carry permutation that
+        # v3.1.44 could leave non-monotonic while reporting update success.
+        for label, legacy, expected in (
+            (
+                "fast", {"fast": 900, "standard": 300, "release": 500},
+                {"fast": 900, "standard": 900, "release": 900},
+            ),
+            (
+                "standard", {"fast": 150, "standard": 900, "release": 500},
+                {"fast": 200, "standard": 900, "release": 900},
+            ),
+            (
+                "release", {"fast": 150, "standard": 300, "release": 900},
+                {"fast": 200, "standard": 400, "release": 900},
+            ),
+        ):
+            target = workspace / f"migration-38-{label}-carry"
+            run(
+                sys.executable, str(installer), str(target),
+                "--project-name", f"migration-38-{label}", cwd=polluted,
+            )
+            config_path = target / ".agent/config.json"
+            value = json.loads(config_path.read_text(encoding="utf-8"))
+            value["context"].pop("transition_token_increment", None)
+            value["context"]["automatic_transition_token_increment"] = legacy
+            config_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+            manifest_path = target / ".agent/.workflow-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "3.1.42"
+            manifest["migration_version"] = 35
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            run(sys.executable, str(installer), str(target), "--update", cwd=polluted)
+            migrated = json.loads(config_path.read_text(encoding="utf-8"))
+            if migrated["context"].get("transition_token_increment") != expected:
+                raise SystemExit(
+                    f"migration 38 did not normalize {label} legacy carry: "
+                    f"{migrated['context'].get('transition_token_increment')}"
+                )
+            run(
+                sys.executable, str(target / ".agent/scripts/agentctl.py"), "validate",
+                cwd=target,
+            )
 
         # Read-only modes never create directories for missing targets.
         ghost = workspace / "ghost-parent" / "ghost-project"

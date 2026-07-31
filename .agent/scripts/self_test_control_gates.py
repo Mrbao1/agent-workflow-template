@@ -489,7 +489,7 @@ with tempfile.TemporaryDirectory(prefix="workflow-hot-state-") as raw:
 with tempfile.TemporaryDirectory(prefix="fast-route-") as raw:
     root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
     scripts.mkdir(parents=True); state.mkdir(parents=True)
-    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "templatectl.py", "humandecision.py"):
+    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "templatectl.py", "humandecision.py", "workflowctl.py"):
         shutil.copy2(SOURCE / "scripts" / name, scripts / name)
     copy_policy_runtime(root, scripts)
     shutil.copytree(SOURCE / "assets", root / ".agent/assets")
@@ -516,7 +516,10 @@ with tempfile.TemporaryDirectory(prefix="fast-route-") as raw:
     run(root, "contextctl", "sync", "--reason", "fast", "--summary", "fast route fixture", "--source-tokens", "1400")
     run(root, "templatectl", "route")
     routed = json.loads((state / "TASK.json").read_text(encoding="utf-8"))["selected_templates"]
-    expected = ["requirement-contract", "node-implementation", "retrospective"]
+    expected = [
+        "requirement-contract", "fast-projection", "node-implementation",
+        "targeted-acceptance", "retrospective",
+    ]
     if routed != expected or any(item in routed for item in ("task-plan", "acceptance-matrix", "node-acceptance")):
         raise AssertionError(f"fast route is still heavy or dependency-invalid: {routed}")
 

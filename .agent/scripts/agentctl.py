@@ -1645,14 +1645,17 @@ def command_validate() -> int:
         errors.append("atomic candidate test budget registry is missing or invalid")
     context_policy = config.get("context", {})
     if isinstance(context_policy, dict):
-        transition_increments, _ = total_budget.turn_overhead_policy(config)
+        transition_increments, legacy_transition_increment = (
+            total_budget.transition_increment_policy(config)
+        )
         transition_configured = isinstance(
-            context_policy.get(total_budget.TURN_OVERHEAD_KEY), dict
+            context_policy.get(total_budget.TRANSITION_INCREMENT_KEY), dict
         ) or isinstance(
             context_policy.get(total_budget.LEGACY_TURN_OVERHEAD_KEY), dict
         )
     else:
         transition_increments, transition_configured = {}, False
+        legacy_transition_increment = False
     if (
         not isinstance(context_policy, dict)
         or not isinstance(context_policy.get("max_rollback_entries"), int)
@@ -1671,6 +1674,7 @@ def command_validate() -> int:
         or set(transition_increments) != {"fast", "standard", "release"}
         or any(
             not isinstance(value, int) or isinstance(value, bool) or value < 50
+            or (not legacy_transition_increment and value > 1000)
             for value in transition_increments.values()
         )
         or not (
@@ -1680,8 +1684,8 @@ def command_validate() -> int:
         )
     ):
         errors.append(
-            "context estimated turn-overhead tokens are missing or invalid "
-            "(context.estimated_turn_overhead_tokens; deprecated alias "
+            "context transition token increments are missing or invalid "
+            "(context.transition_token_increment; deprecated alias "
             "context.automatic_transition_token_increment)"
         )
     errors.extend(total_budget.config_budget_errors(config))
@@ -2540,9 +2544,13 @@ def command_escalate_mode(args: argparse.Namespace) -> int:
     ledger = load_json(AGENTS_PATH)
     preparations = ledger.get("prepared_dispatches", [])
     members = ledger.get("members", [])
-    if any(isinstance(item, dict) and (item.get("token_reservation") or {}).get("status") == "reserved" for item in preparations if isinstance(preparations, list)):
+    if not isinstance(preparations, list) or not isinstance(members, list):
+        raise SystemExit(
+            "agent ledger prepared_dispatches/members must be lists; refusing mode escalation"
+        )
+    if any(isinstance(item, dict) and (item.get("token_reservation") or {}).get("status") == "reserved" for item in preparations):
         raise SystemExit("mode escalation requires no active child Token reservation")
-    if any(isinstance(item, dict) and item.get("status") == "active" for item in members if isinstance(members, list)):
+    if any(isinstance(item, dict) and item.get("status") == "active" for item in members):
         raise SystemExit("mode escalation requires all child Agents to reach a terminal state")
     archive_value = {
         "schema": "agent-route-archive/v1", "reason": "mode-or-risk-escalation",

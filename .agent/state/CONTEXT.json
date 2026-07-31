@@ -1,11 +1,11 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "44e311e31e3336f5d031446cb5778ce017b0aa1565403a0ce3fd4edae2c5f74a",
+  "policy_bundle_sha256": "15b9cc47f185ecd05512286583bc0d762dc32da35307ad46a99d892bd8660d1e",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+  "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
   "requirement_contract_sha256": "unapproved-draft",
   "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
@@ -27,14 +27,14 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
+    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156"
   },
   "checkpoint": {
-    "sequence": 12,
-    "reason": "rebind live capsule after review round 2",
-    "updated_at": "2026-07-31T00:31:23+00:00",
-    "previous_sha256": "45714dab23c476efcc1354a87a8951a90e69d8da8e5c84b104a969551370784e",
-    "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+    "sequence": 15,
+    "reason": "fresh-project-seed",
+    "updated_at": "2026-07-31T06:59:04+00:00",
+    "previous_sha256": "7a81fe47938b431eaec9824b9d051e9c2d5818c77e26f2c5410f83ca3374193a",
+    "previous_task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
     "task_delta": [
       "canonical_task_state"
     ],
@@ -42,24 +42,31 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 12,
-    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+    "checkpoint_sequence": 15,
+    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
-    "estimated_tokens": 1000,
-    "observed_at": "2026-07-31T00:31:23+00:00"
+    "estimated_tokens": 800,
+    "observed_at": "2026-07-31T06:59:04+00:00"
+  },
+  "turn_accounting": {
+    "schema": "agent-context-turn-accounting/v1",
+    "applied_turn_ids_sha256": [],
+    "turns_accounted": 0,
+    "estimated_tokens_charged": 0
   },
   "compaction": {
-    "source_estimated_tokens": 1000,
-    "capsule_estimated_tokens": 710,
-    "tokens_removed": 290,
-    "compression_ratio": 1.41,
+    "source_estimated_tokens": 800,
+    "capsule_estimated_tokens": 644,
+    "tokens_removed": 0,
+    "capsule_reduction_tokens": 156,
+    "compression_ratio": 1.24,
     "method": "explicit-estimate/v1",
-    "reason": "rebind live capsule after review round 2",
-    "source": "agent:contextctl",
+    "reason": "fresh-project-seed",
+    "source": "project-init:bootstrap",
     "budget_snapshot": {
       "task_tokens_used": 0,
-      "current_checkpoint_estimated_tokens": 1000,
+      "current_checkpoint_estimated_tokens": 800,
       "task_token_budget": 48000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
@@ -78,15 +85,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-31T00:31:23+00:00",
-    "source": "user:review fixes round 2",
-    "repair_capsule_sha256": "243a818b8661b51dd3c4662976d5e71c8d4a693b25c6b34d2dc4e06473eeaa41",
-    "repair_approval": {
-      "source": "user:review fixes round 2",
-      "artifact_sha256": "243a818b8661b51dd3c4662976d5e71c8d4a693b25c6b34d2dc4e06473eeaa41",
-      "assurance": "explicit-user-message;local-only;not-provider-verified",
-      "routing_profile_sha256": "4eb1c0e34b0540966fd3469921adc5f4db1f579eb5c2d78a0ccfdc636cc81f72"
-    },
-    "content_sha256": "8fa4ca43ca5bb995dbb9c00d0f611f5477dee7a5c8336c079500779b55732d11"
+    "verified_at": "2026-07-31T06:59:04+00:00",
+    "source": "project-init:bootstrap",
+    "content_sha256": "bed8c0194a489f04468aee7fa8c24cbb7960157a21bac32b3ccb749470be556a"
   }
 }

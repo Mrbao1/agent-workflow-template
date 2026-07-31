@@ -1,11 +1,11 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "7523956c5cf20f7eda46fbcfc2be67073d1886e9843e0b5ef8276e10af122512",
+  "policy_bundle_sha256": "1727fa0e5d024442296deecd118ae31035053434c28ea0d938c131f8c4c06d30",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+  "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
   "requirement_contract_sha256": "unapproved-draft",
   "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
@@ -27,14 +27,14 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611"
+    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156"
   },
   "checkpoint": {
-    "sequence": 10,
+    "sequence": 14,
     "reason": "fresh-project-seed",
-    "updated_at": "2026-07-31T00:31:10+00:00",
-    "previous_sha256": "6b0004f93a7003516c9396c9016c16a7b0ad404c12066f8f22bbd65321246e07",
-    "previous_task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+    "updated_at": "2026-07-31T06:10:50+00:00",
+    "previous_sha256": "3918b2e1855a249d2572596673466cf003ff48adc7ade4af9150a134feeedde5",
+    "previous_task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
     "task_delta": [
       "canonical_task_state"
     ],
@@ -42,18 +42,25 @@
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 10,
-    "task_invariant_sha256": "74049067b9f69d30e56c10e0262b3dfbeac91d7e6e0ea5dfb3aa2ccda307d611",
+    "checkpoint_sequence": 14,
+    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
-    "observed_at": "2026-07-31T00:31:10+00:00"
+    "observed_at": "2026-07-31T06:10:50+00:00"
+  },
+  "turn_accounting": {
+    "schema": "agent-context-turn-accounting/v1",
+    "applied_turn_ids_sha256": [],
+    "turns_accounted": 0,
+    "estimated_tokens_charged": 0
   },
   "compaction": {
     "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 601,
-    "tokens_removed": 199,
-    "compression_ratio": 1.33,
+    "capsule_estimated_tokens": 644,
+    "tokens_removed": 0,
+    "capsule_reduction_tokens": 156,
+    "compression_ratio": 1.24,
     "method": "explicit-estimate/v1",
     "reason": "fresh-project-seed",
     "source": "project-init:bootstrap",
@@ -78,8 +85,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-31T00:31:10+00:00",
+    "verified_at": "2026-07-31T06:10:50+00:00",
     "source": "project-init:bootstrap",
-    "content_sha256": "9c39a495de29dcd9984f55ea0604a3e0c7f076acd9ac11cf0655a614d3b957ee"
+    "content_sha256": "944a08e18d98700c0900f3cfe9d52729e5ee0023d305cd568054976203b2b7d9"
   }
 }
