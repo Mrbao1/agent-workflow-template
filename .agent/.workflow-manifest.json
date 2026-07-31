@@ -2,7 +2,7 @@
   "schema": "agent-workflow-install/v4",
   "version": "3.1.43",
   "migration_version": 36,
-  "source_tree_sha256": "732b24180efc4665785c49008183d76055857ab61d6aebd0a53fe6fbed6f7879",
+  "source_tree_sha256": "4a7ee52eb266867939f95f6b1a8e4007b2dded8f5b00baddbdd96891e39c92f4",
   "agent_files": {
     "INDEX.md": "d05f0280c9e8c3df622363a06ee97840929e3962f0b1cae2f328df469f5f5bcc",
     "scripts/agentctl.py": "da6c999ad767b9d929c956a61be2bf6fb2935c73f6bf15e70bac95a15cbb1c67",
@@ -56,7 +56,7 @@
     "skills/manage-task-context/agents/openai.yaml": "942593c04cc6edbd882891b7bffdf05acb9f72c5e4450045a55b03b262695163",
     "skills/manage-task-context/references/budget-policy.md": "26dbc9de9e50304764c1d6baabdbef10bf3f54cc2ef7fb2b6159faeb7814d20f",
     "skills/manage-task-context/scripts/self_test_context.py": "84693cc34880952504e192c2bd656ed1272c4fe2fa807e0e110e40457c54c157",
-    "skills/playwright-interactive/LICENSE.txt": "9a7110fc2d2f964038e5dc49128f908f29f47a574c961cba16085914e879cbda",
+    "skills/playwright-interactive/LICENSE.txt": "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b",
     "skills/playwright-interactive/NOTICE.txt": "7fe676d2e5359fb6aa0bdf5b0881b26e14c272dd36b04408366d4b0e26738322",
     "skills/playwright-interactive/SKILL.md": "f6c1155d923e6ae3ccc12abfef2266f119f8e9546df2ddeee1f5eb369845a0a1",
     "skills/playwright-interactive/agents/openai.yaml": "7342e0a2c2cb8f3e20982317467f58b06c8bf71ba308ed8fcc1cda4a6e9397d8",
