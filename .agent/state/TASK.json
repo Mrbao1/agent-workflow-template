@@ -1,16 +1,16 @@
 {
   "schema": "agent-task/v2",
-  "title": "No active task",
+  "title": "cross-task rollover audit",
   "mode": "standard",
   "task_type": "maintenance",
-  "complexity": "tiny",
-  "files": 0,
+  "complexity": "bounded",
+  "files": 12,
   "environment": "local",
   "deployment_requested": false,
-  "branch": "unversioned",
-  "status": "idle",
+  "branch": "fix/r3-lifecycle-repair",
+  "status": "accepted",
   "phase": "idle",
-  "requirements_clarified": false,
+  "requirements_clarified": true,
   "token_budget": 48000,
   "tokens_used": 0,
   "token_usage_source": "estimated",
@@ -29,45 +29,215 @@
     "irreversible": false,
     "external_impact": false
   },
-  "requirement_source": "pending",
-  "primary_skill": "clarify-task",
+  "requirement_source": "user:仔细的全量的检查，根据任务推进的错误日志，整体状态推进的日志进行更改",
+  "primary_skill": "run-ai-coding-pipeline",
   "loaded_references": [],
   "selected_templates": [
-    "requirement-contract"
+    "requirement-contract",
+    "node-implementation",
+    "node-acceptance",
+    "retrospective"
   ],
   "selected_capabilities": [
     "core"
   ],
-  "template_route": null,
-  "rendered_artifacts": [],
+  "template_route": {
+    "schema": "agent-template-route/v2",
+    "mode": "standard",
+    "task_type": "maintenance",
+    "projection": "lightweight",
+    "capabilities": [
+      "core"
+    ],
+    "templates": [
+      "requirement-contract",
+      "node-implementation",
+      "node-acceptance",
+      "retrospective"
+    ],
+    "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+    "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
+    "sha256": "54057669265a11fa8961368e0187a51bf96e1f572eb05f934038402bd3703966"
+  },
+  "rendered_artifacts": [
+    {
+      "schema": "agent-template-render/v1",
+      "template_id": "node-implementation",
+      "path": ".agent/state/artifacts/06-implementation.json",
+      "sha256": "8ee80e9ba1e4268d3660b640d16ee2de1a561268d88df568fc47f3a4000e7d26",
+      "bytes": 3579,
+      "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
+      "route_sha256": "54057669265a11fa8961368e0187a51bf96e1f572eb05f934038402bd3703966",
+      "source_path": ".agent/templates/node-implementation.json.tmpl",
+      "source_sha256": "643986a10dfe065e43b54e54b3720aca622d697976a7a566d00e9a9b7f803798",
+      "source_bytes": 449
+    },
+    {
+      "schema": "agent-template-render/v1",
+      "template_id": "node-acceptance",
+      "path": ".agent/state/artifacts/07-acceptance.json",
+      "sha256": "ca726ec9f47d69699e231e46651645ea7dd3287dd075f3443f6e8bb3f05fb329",
+      "bytes": 3733,
+      "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
+      "route_sha256": "54057669265a11fa8961368e0187a51bf96e1f572eb05f934038402bd3703966",
+      "source_path": ".agent/templates/node-acceptance.json.tmpl",
+      "source_sha256": "1e1cbfd36d1dd4abbdbcd8ee48373bb9f00c360b1d3ef64dda59c91439839d5f",
+      "source_bytes": 843
+    },
+    {
+      "schema": "agent-template-render/v1",
+      "template_id": "retrospective",
+      "path": ".agent/state/artifacts/08-retrospective.md",
+      "sha256": "c5a47d7d50b97be338994dd5d2fc850170e966158015ed8dfa6b1b12c64e67f8",
+      "bytes": 1863,
+      "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
+      "route_sha256": "54057669265a11fa8961368e0187a51bf96e1f572eb05f934038402bd3703966",
+      "source_path": ".agent/templates/retrospective.md.tmpl",
+      "source_sha256": "9fbf3a2d57acf430840028ebfd83cd19c0fceaaf8aa8c07ac0b1300729923bfa",
+      "source_bytes": 379
+    }
+  ],
   "decisions": [],
   "open_questions": [],
   "current_node": "idle",
-  "accepted_nodes": [],
-  "node_artifacts": {},
-  "gate_approvals": {},
-  "pending_gate_artifacts": {},
+  "accepted_nodes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "node_artifacts": {
+    "1": {
+      "path": ".agent/state/REQUIREMENT_CONTRACT.md",
+      "sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+      "bytes": 2173
+    },
+    "6": {
+      "path": ".agent/state/artifacts/06-implementation.json",
+      "sha256": "8ee80e9ba1e4268d3660b640d16ee2de1a561268d88df568fc47f3a4000e7d26",
+      "bytes": 3579
+    },
+    "7": {
+      "path": ".agent/state/artifacts/07-acceptance.json",
+      "sha256": "ca726ec9f47d69699e231e46651645ea7dd3287dd075f3443f6e8bb3f05fb329",
+      "bytes": 3733
+    }
+  },
+  "gate_approvals": {
+    "requirement": {
+      "source": "user:仔细的全量的检查，根据任务推进的错误日志，整体状态推进的日志进行更改",
+      "artifact_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+      "assurance": "explicit-user-message;local-only;not-provider-verified",
+      "routing_profile_sha256": "fd639a17006f27f78b384103f53a85becd3a2251bb6cb5db06f200fe5efa2719"
+    },
+    "acceptance": {
+      "source": "user:仔细的全量的检查，根据任务推进的错误日志，整体状态推进的日志进行更改",
+      "artifact_sha256": "ca726ec9f47d69699e231e46651645ea7dd3287dd075f3443f6e8bb3f05fb329",
+      "assurance": "explicit-user-message;local-only;not-provider-verified",
+      "routing_profile_sha256": "fd639a17006f27f78b384103f53a85becd3a2251bb6cb5db06f200fe5efa2719"
+    }
+  },
+  "pending_gate_artifacts": {
+    "acceptance": {
+      "path": ".agent/state/artifacts/07-acceptance.json",
+      "sha256": "ca726ec9f47d69699e231e46651645ea7dd3287dd075f3443f6e8bb3f05fb329",
+      "bytes": 3733
+    }
+  },
   "production_provider": null,
-  "rollback_ledger": [],
+  "projection": "lightweight",
+  "rollback_ledger": [
+    {
+      "from": 7,
+      "to": 6,
+      "issue_id": "r6-hard-terminal-closure-evidence",
+      "cause_category": "agent-control",
+      "subtask": "terminal-closure",
+      "root_cause": "hard watermark blocked retrospective and complete after nodes 0-7 were accepted",
+      "change": "allow only bounded retrospective/complete closure and refresh post-change implementation evidence",
+      "signature": "a7b8b09b0e1ed88479e1966e1051cf0c6aec514cd77420334e5f7e8ffea754b5",
+      "count": 1
+    },
+    {
+      "from": 7,
+      "to": 4,
+      "issue_id": "r6-hard-terminal-closure-evidence",
+      "cause_category": "agent-control",
+      "subtask": "terminal-closure",
+      "root_cause": "hard watermark blocked retrospective and complete after nodes 0-7 were accepted",
+      "change": "allow only bounded retrospective/complete closure and refresh post-change implementation evidence",
+      "signature": "a7b8b09b0e1ed88479e1966e1051cf0c6aec514cd77420334e5f7e8ffea754b5",
+      "count": 2
+    },
+    {
+      "from": 4,
+      "to": 2,
+      "issue_id": "r6-lightweight-second-strike-target",
+      "cause_category": "agent-control",
+      "subtask": "lightweight-repair-routing",
+      "root_cause": "second late failure returned standard lightweight projection to unrouted node 4",
+      "change": "return standard lightweight second failure to node 2 so node 6 can rebuild projected nodes 2-6",
+      "signature": "83e2f91b572fad11e5fa6ac9cdc9a2bac35be1a094422582c3bdcd163f517300",
+      "count": 1
+    }
+  ],
   "rollback_archive": null,
-  "failure_ledger": {},
+  "failure_ledger": {
+    "a7b8b09b0e1ed88479e1966e1051cf0c6aec514cd77420334e5f7e8ffea754b5": 2,
+    "83e2f91b572fad11e5fa6ac9cdc9a2bac35be1a094422582c3bdcd163f517300": 1
+  },
   "failure_archive": null,
-  "mode_status": "provisional",
+  "mode_status": "confirmed",
   "decision_policy_version": 2,
-  "task_archive": null,
+  "task_archive": {
+    "schema": "agent-task-archive-head/v1",
+    "path": ".agent/state/evidence/task-archives/07d2072204f14b95119c6ed209988916033d3249a171e35d30bf2e60cabf47db.json",
+    "sha256": "07d2072204f14b95119c6ed209988916033d3249a171e35d30bf2e60cabf47db",
+    "bytes": 12458,
+    "total_archives": 3
+  },
   "metrics": {
     "tokens": 0,
     "token_source": "estimated",
     "child_agents": 0,
     "peak_children": 0,
     "tool_calls": 0,
-    "test_runs": 0,
-    "test_failures": 0,
-    "repair_rounds": 0,
+    "test_runs": 11,
+    "test_failures": 7,
+    "repair_rounds": 5,
     "user_corrections": 0,
     "context_compactions": 0,
     "references_loaded": 0
   },
-  "next_action": "start clarification",
-  "updated": "2026-07-22"
+  "next_action": "start the next requirement in clarification",
+  "updated": "2026-07-31",
+  "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
+  "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+  "route_archive": {
+    "path": ".agent/state/evidence/route-archives/0922204119dfdb0d130174bc99d782e0f32aaea2eec968f8ec6efd8fa9a706cb.json",
+    "sha256": "0922204119dfdb0d130174bc99d782e0f32aaea2eec968f8ec6efd8fa9a706cb",
+    "bytes": 2431
+  },
+  "retrospective": {
+    "path": ".agent/state/artifacts/08-retrospective.md",
+    "sha256": "c5a47d7d50b97be338994dd5d2fc850170e966158015ed8dfa6b1b12c64e67f8",
+    "bytes": 1863
+  },
+  "knowledge_candidates": [],
+  "completion_binding": {
+    "schema": "agent-completion-binding/v1",
+    "accepted_artifact_set_sha256": "5e0ac6f7e10c4d67a2a2e556c8fc70d6d0456a631f07e8e380d5fa9dab22e9d7",
+    "terminal_artifact_sha256": "ca726ec9f47d69699e231e46651645ea7dd3287dd075f3443f6e8bb3f05fb329",
+    "release_approval_sha256": null,
+    "completion_platform_snapshot_sha256": "5c63096f832e07c4e47e93f193aea30ca6f1ef6422f246604680d6074a0a6be1",
+    "completion_decision_source": "not_required",
+    "completion_decision_receipt": null
+  }
 }

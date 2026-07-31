@@ -487,10 +487,61 @@ def main() -> int:
                         "--node", "7", "--artifact", ".agent/state/artifacts/07-acceptance.json",
                         cwd=fast_target,
                     )
+                    # A task with every workflow node accepted must be able to
+                    # close honestly even if accumulated real host turns have
+                    # reached the hard watermark. Only the already-routed
+                    # retrospective and complete actions are admitted.
+                    preclosure_estimate = json.loads(
+                        (fast_target / ".agent/state/CONTEXT.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["usage_freshness"]["estimated_tokens"]
+                    hard_limit = (
+                        fast_config["routing"]["modes"]["fast"]["token_budget"]
+                        * fast_config["context"]["hard_budget_ratio"]
+                    )
+                    if preclosure_estimate >= hard_limit:
+                        raise SystemExit(
+                            "minimum real fast lifecycle reached the hard watermark "
+                            f"before the explicit closure probe: estimate={preclosure_estimate} "
+                            f"hard={hard_limit}"
+                        )
+                    closure_route = json.loads(run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                        cwd=fast_target,
+                    ).stdout)
+                    for index in range(1, 9):
+                        if closure_route.get("budget_state") == "hard_blocked":
+                            break
+                        run(
+                            sys.executable, ".agent/scripts/contextctl.py", "account-turn",
+                            "--turn-id", f"real-lifecycle-terminal-closure-{index}",
+                            cwd=fast_target,
+                        )
+                        closure_route = json.loads(run(
+                            sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                            cwd=fast_target,
+                        ).stdout)
+                    closure_context = json.loads(
+                        (fast_target / ".agent/state/CONTEXT.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    if (
+                        closure_route.get("budget_state") != "hard_blocked"
+                        or closure_context.get("resume", {}).get("resume_action")
+                        != "continue"
+                        or closure_route.get("next_action")
+                        != "render retrospective and complete task"
+                    ):
+                        raise SystemExit(
+                            "hard-watermark terminal closure did not remain executable: "
+                            f"route={closure_route} resume={closure_context.get('resume')}"
+                        )
                     render("retrospective", ".agent/state/artifacts/08-retrospective.md", {
                         "result": "real fast lifecycle completed",
                         "time": "bounded fixture",
-                        "tokens": "estimated and below hard watermark",
+                        "tokens": "estimated honestly through hard-watermark closure",
                         "resources": "no child agents",
                         "costs": "one bounded lifecycle",
                         "learning": "real contexttx path is required",
@@ -544,16 +595,13 @@ def main() -> int:
                     completed_context = json.loads(
                         (fast_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
                     )
-                    hard_limit = (
-                        fast_config["routing"]["modes"]["fast"]["token_budget"]
-                        * fast_config["context"]["hard_budget_ratio"]
-                    )
                     estimate = completed_context["usage_freshness"]["estimated_tokens"]
                     completed_compaction = completed_context.get("compaction", {})
                     if (
                         completed_task.get("status") != "accepted"
                         or completed_task.get("budget_state") == "hard_blocked"
-                        or estimate >= hard_limit
+                        or preclosure_estimate >= hard_limit
+                        or estimate < hard_limit
                         or completed_context.get("open_risks") != []
                         or completed_compaction.get("tokens_removed") != 0
                         or completed_compaction.get("capsule_reduction_tokens")
@@ -562,7 +610,8 @@ def main() -> int:
                     ):
                         raise SystemExit(
                             f"real fast lifecycle hit the fabricated budget ratchet: "
-                            f"estimate={estimate} hard={hard_limit}"
+                            f"preclosure={preclosure_estimate} estimate={estimate} "
+                            f"hard={hard_limit}"
                         )
                     routed = run(
                         sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
@@ -619,6 +668,124 @@ def main() -> int:
                     if json.loads(post_turn_route.stdout).get("terminal") is not True:
                         raise SystemExit(
                             "post-completion host turn erased the terminal route receipt"
+                        )
+                    # A completed task may not roll directly into new scope
+                    # when the next checkpoint would already be compact or
+                    # hard-blocked. Drive the real accepted capsule to that
+                    # boundary and prove start fails before replacing TASK or
+                    # CONTEXT. The persisted resume contract and route receipt
+                    # must report the same effective state and recovery step.
+                    rollover_route = json.loads(post_turn_route.stdout)
+                    for index in range(1, 6):
+                        if rollover_route.get("budget_state") in {
+                            "must_compact", "hard_blocked"
+                        }:
+                            break
+                        run(
+                            sys.executable, ".agent/scripts/contextctl.py", "account-turn",
+                            "--turn-id", f"real-lifecycle-rollover-boundary-{index}",
+                            cwd=fast_target,
+                        )
+                        rollover_route = json.loads(run(
+                            sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                            cwd=fast_target,
+                        ).stdout)
+                    if rollover_route.get("budget_state") not in {
+                        "must_compact", "hard_blocked"
+                    }:
+                        raise SystemExit(
+                            "real lifecycle could not reach the rollover budget boundary"
+                        )
+                    boundary_context = json.loads(
+                        post_turn_context_path.read_text(encoding="utf-8")
+                    )
+                    boundary_resume = boundary_context.get("resume", {})
+                    if (
+                        boundary_resume.get("budget_state")
+                        != rollover_route.get("budget_state")
+                        or boundary_resume.get("next_action")
+                        != rollover_route.get("next_action")
+                        or "verified host compaction"
+                        not in str(rollover_route.get("next_action", ""))
+                    ):
+                        raise SystemExit(
+                            "persisted resume and terminal route disagree at rollover boundary"
+                        )
+                    before_rollover_task = (
+                        fast_target / ".agent/state/TASK.json"
+                    ).read_bytes()
+                    before_rollover_context = post_turn_context_path.read_bytes()
+                    blocked_rollover = run(
+                        sys.executable, ".agent/scripts/agentctl.py", "start",
+                        "--title", "blocked compact rollover",
+                        "--mode", "fast", "--environment", "local",
+                        "--task-type", "maintenance", "--complexity", "tiny",
+                        "--files", "1", expected=1, cwd=fast_target,
+                    )
+                    if (
+                        "new task would enter" not in blocked_rollover.stdout
+                        or (fast_target / ".agent/state/TASK.json").read_bytes()
+                        != before_rollover_task
+                        or post_turn_context_path.read_bytes()
+                        != before_rollover_context
+                    ):
+                        raise SystemExit(
+                            "compact rollover did not fail before replacing task/context state"
+                        )
+                    # Migration 39 rewrites pre-fix active/accepted capsules
+                    # with the effective resume state while preserving the
+                    # monotonic estimate and durable terminal provenance.
+                    installed_manifest_path = (
+                        fast_target / ".agent/.workflow-manifest.json"
+                    )
+                    installed_manifest = json.loads(
+                        installed_manifest_path.read_text(encoding="utf-8")
+                    )
+                    installed_manifest["version"] = "3.1.46"
+                    installed_manifest["migration_version"] = 38
+                    installed_manifest_path.write_text(
+                        json.dumps(installed_manifest, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    before_migration_estimate = boundary_context[
+                        "usage_freshness"
+                    ]["estimated_tokens"]
+                    run(
+                        sys.executable, str(installer), str(fast_target), "--update",
+                        cwd=fast_target,
+                    )
+                    migrated_context = json.loads(
+                        post_turn_context_path.read_text(encoding="utf-8")
+                    )
+                    migrated_route = json.loads(run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                        cwd=fast_target,
+                    ).stdout)
+                    if (
+                        migrated_context.get("checkpoint", {}).get("reason")
+                        != "migration-39-budget-resume-rebind"
+                        or migrated_context.get("compaction", {}).get("source")
+                        != "installer-verified-budget-resume-migration"
+                        or migrated_context["usage_freshness"]["estimated_tokens"]
+                        < before_migration_estimate
+                        or migrated_context.get("resume", {}).get("budget_state")
+                        != migrated_route.get("budget_state")
+                        or migrated_route.get("terminal") is not True
+                    ):
+                        raise SystemExit(
+                            "migration 39 did not preserve terminal effective-budget state"
+                        )
+                    run(
+                        sys.executable, ".agent/scripts/contextctl.py", "account-turn",
+                        "--turn-id", "real-lifecycle-post-migration-39-turn",
+                        cwd=fast_target,
+                    )
+                    if json.loads(run(
+                        sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
+                        cwd=fast_target,
+                    ).stdout).get("terminal") is not True:
+                        raise SystemExit(
+                            "migration 39 terminal origin did not survive host-turn accounting"
                         )
             return fast_target
 
@@ -694,21 +861,80 @@ def main() -> int:
         )
         strike_task_path = strike_target / ".agent/state/TASK.json"
         strike_task = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        lightweight_signature = hashlib.sha256(
+            b"REAL-LIGHTWEIGHT-SECOND|implementation"
+        ).hexdigest()
+        strike_task.update({
+            "current_node": 7,
+            "accepted_nodes": [0, 1, 2, 3, 4, 5, 6],
+            "status": "in_progress",
+            "phase": "acceptance",
+            "next_action": "exercise the lightweight second-failure return",
+            "failure_ledger": {lightweight_signature: 1},
+            "rollback_ledger": [],
+        })
+        strike_task_path.write_text(
+            json.dumps(strike_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        lightweight_estimate = json.loads(
+            (strike_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+        )["usage_freshness"]["estimated_tokens"]
+        run(
+            sys.executable, ".agent/scripts/contextctl.py", "repair", "--reset",
+            "--reason", "prepare-real-lightweight-second-failure",
+            "--summary", "bind the projected second-failure fixture",
+            "--source-tokens", str(lightweight_estimate), expected=1, cwd=strike_target,
+        )
+        run(
+            sys.executable, ".agent/scripts/contextctl.py", "approve-repair",
+            "--source", "user:real-three-strike", cwd=strike_target,
+        )
+        run(
+            sys.executable, ".agent/scripts/workflowctl.py", "return-node",
+            "--from-node", "7", "--to", "6",
+            "--issue-id", "REAL-LIGHTWEIGHT-SECOND",
+            "--cause-category", "implementation",
+            "--subtask", "real projected transaction",
+            "--root-cause", "same projected defect",
+            "--change", "rebuild through the node-six projection",
+            cwd=strike_target,
+        )
+        lightweight_returned = json.loads(strike_task_path.read_text(encoding="utf-8"))
+        lightweight_context = json.loads(
+            (strike_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+        )
+        if (
+            lightweight_returned.get("current_node") != 2
+            or lightweight_returned.get("accepted_nodes") != [0, 1]
+            or lightweight_returned.get("rollback_ledger", [{}])[-1].get("to") != 2
+            or lightweight_context.get("checkpoint", {})
+            .get("transition_authorization", {}).get("operation") != "return-node"
+        ):
+            raise SystemExit(
+                "real standard-lightweight second failure did not return to rebuildable node 2"
+            )
+
+        strike_task = lightweight_returned
         strike_task.update({
             "current_node": 5,
             "accepted_nodes": [0, 1, 2, 3, 4],
             "status": "in_progress",
             "phase": "testing",
             "next_action": "exercise repeated root-cause returns",
+            "failure_ledger": {},
+            "rollback_ledger": [],
         })
         strike_task_path.write_text(
             json.dumps(strike_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
+        strike_estimate = json.loads(
+            (strike_target / ".agent/state/CONTEXT.json").read_text(encoding="utf-8")
+        )["usage_freshness"]["estimated_tokens"]
         run(
             sys.executable, ".agent/scripts/contextctl.py", "repair", "--reset",
             "--reason", "prepare-real-three-strike",
             "--summary", "bind the real repeated-failure fixture",
-            "--source-tokens", "1600", expected=1, cwd=strike_target,
+            "--source-tokens", str(strike_estimate), expected=1, cwd=strike_target,
         )
         run(
             sys.executable, ".agent/scripts/contextctl.py", "approve-repair",

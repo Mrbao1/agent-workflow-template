@@ -1,9 +1,31 @@
 {
   "schema": "agent-runtime/v2",
   "baseline": {
-    "source": "template-uninitialized",
-    "captured_at": null,
-    "project_processes": []
+    "source": "agentctl:start",
+    "captured_at": "2026-07-31T07:33:06+00:00",
+    "project_processes": [
+      {
+        "pid": 73292,
+        "ppid": 73236,
+        "pgid": 73292,
+        "start_time": "darwin:1785466777:584891",
+        "command": "node_repl",
+        "executable": null,
+        "state": "2",
+        "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template"
+      },
+      {
+        "pid": 73461,
+        "ppid": 73236,
+        "pgid": 73461,
+        "start_time": "darwin:1785466890:954109",
+        "command": "codex-code-mode-host",
+        "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
+        "state": "2",
+        "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template"
+      }
+    ],
+    "confirmed_existing_processes": 2
   },
   "processes": [],
   "docker_projects": [],

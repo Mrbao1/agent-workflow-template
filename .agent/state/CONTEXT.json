@@ -1,16 +1,16 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "15b9cc47f185ecd05512286583bc0d762dc32da35307ad46a99d892bd8660d1e",
-  "task_title": "No active task",
+  "policy_bundle_sha256": "41da84da041e8b4479c50c3c6ce3bb88d9d7e37b17ff3995af764311905ff4fb",
+  "task_title": "cross-task rollover audit",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
-  "requirement_contract_sha256": "unapproved-draft",
-  "phase_summary": "fresh isolated idle state",
+  "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935",
+  "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
+  "phase_summary": "completed accepted task and bounded retrospective",
   "confirmed_facts": [
-    "requirement_source=pending",
-    "requirements_clarified=false",
+    "requirement_source=user:仔细的全量的检查，根据任务推进的错误日志，整体状态推进的日志进行更改",
+    "requirements_clarified=true",
     "environment=local"
   ],
   "decisions": [],
@@ -18,63 +18,88 @@
   "changed_files": [],
   "evidence": [],
   "open_risks": [],
-  "next_action": "start clarification",
+  "next_action": "start the next requirement in clarification",
   "resume": {
     "schema": "agent-context-resume/v1",
-    "task_status": "idle",
+    "task_status": "accepted",
     "current_node": "idle",
-    "next_action": "start clarification",
-    "budget_state": "ok",
-    "terminal": false,
-    "resume_action": "waiting_human",
-    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156"
+    "next_action": "before starting another requirement, establish a verified host compaction or select an authorized higher-budget mode",
+    "budget_state": "hard_blocked",
+    "terminal": true,
+    "resume_action": "complete",
+    "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935"
   },
   "checkpoint": {
-    "sequence": 15,
-    "reason": "fresh-project-seed",
-    "updated_at": "2026-07-31T06:59:04+00:00",
-    "previous_sha256": "7a81fe47938b431eaec9824b9d051e9c2d5818c77e26f2c5410f83ca3374193a",
-    "previous_task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
+    "sequence": 103,
+    "reason": "task-completed",
+    "updated_at": "2026-07-31T09:13:09+00:00",
+    "previous_sha256": "6e9ba034eb0bbe0a44934725cc6aba054d498a2cd298fdb56b04c26bfca4c9cd",
+    "previous_task_invariant_sha256": "d54e99fa7d6fd820da6e3835e1bd982cc204b5b193e7eaa37efb028c96517207",
     "task_delta": [
-      "canonical_task_state"
+      "completion_binding",
+      "current_node",
+      "knowledge_candidates",
+      "next_action",
+      "phase",
+      "retrospective",
+      "status"
     ],
-    "transition_authorization": null
+    "transition_authorization": {
+      "schema": "agent-context-transition-authorization/v1",
+      "mutator": "workflowctl",
+      "operation": "complete-task",
+      "changed_fields": [
+        "completion_binding",
+        "current_node",
+        "knowledge_candidates",
+        "next_action",
+        "phase",
+        "retrospective",
+        "status"
+      ],
+      "non_invariant_changed_fields": [],
+      "receipt_sha256": "3b2f1aca53ad5b2672443bc1ce12956c8ab78f2bbe299f8f0f5141b2a0fa645d"
+    }
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 15,
-    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
+    "checkpoint_sequence": 103,
+    "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
-    "estimated_tokens": 800,
-    "observed_at": "2026-07-31T06:59:04+00:00"
+    "estimated_tokens": 48600,
+    "observed_at": "2026-07-31T09:13:09+00:00"
   },
   "turn_accounting": {
     "schema": "agent-context-turn-accounting/v1",
-    "applied_turn_ids_sha256": [],
-    "turns_accounted": 0,
-    "estimated_tokens_charged": 0
+    "applied_turn_ids_sha256": [
+      "254f99d794329625dcd00638a6ca312156549942e43e3e2a51aeb499bbeec367",
+      "0a4689ccacab00ec6be8db9358538b11e1770560f0d770212f752136dc9cc1af",
+      "9ac41748be8022173207b1da73e68afc1fb62e554bf7612cacd1850c6b8d20a1"
+    ],
+    "turns_accounted": 3,
+    "estimated_tokens_charged": 9000
   },
   "compaction": {
-    "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 644,
+    "source_estimated_tokens": 48600,
+    "capsule_estimated_tokens": 860,
     "tokens_removed": 0,
-    "capsule_reduction_tokens": 156,
-    "compression_ratio": 1.24,
+    "capsule_reduction_tokens": 47740,
+    "compression_ratio": 56.51,
     "method": "explicit-estimate/v1",
-    "reason": "fresh-project-seed",
-    "source": "project-init:bootstrap",
+    "reason": "task-completed",
+    "source": "mutator:workflowctl",
     "budget_snapshot": {
       "task_tokens_used": 0,
-      "current_checkpoint_estimated_tokens": 800,
+      "current_checkpoint_estimated_tokens": 48600,
       "task_token_budget": 48000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
       "child_reserved_tokens": 0,
       "child_settled_tokens": 0,
-      "consumed_tokens": 7000,
-      "budget_ratio": 0.1458,
-      "watermark": "normal",
+      "consumed_tokens": 48600,
+      "budget_ratio": 1.0125,
+      "watermark": "hard",
       "assurance": {
         "level": "best-effort-estimate",
         "hard_billing_limit": false,
@@ -85,8 +110,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-31T06:59:04+00:00",
-    "source": "project-init:bootstrap",
-    "content_sha256": "bed8c0194a489f04468aee7fa8c24cbb7960157a21bac32b3ccb749470be556a"
+    "verified_at": "2026-07-31T09:13:09+00:00",
+    "source": "mutator:workflowctl",
+    "content_sha256": "e6fd7a5e25bd69e9289e45ed0430d6df7690b85e55e609239bd1e5b89de7940c"
   }
 }

@@ -397,6 +397,10 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
                 checkpoint.get("reason") == "migration-34-final-state-rebind"
                 and context.get("compaction", {}).get("source") == "installer-verified-context-efficiency-migration"
             )
+            or (
+                checkpoint.get("reason") == "migration-39-budget-resume-rebind"
+                and context.get("compaction", {}).get("source") == "installer-verified-budget-resume-migration"
+            )
         )
     )
     migration_origin = (
@@ -416,6 +420,10 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
             (
                 "migration-34-final-state-rebind",
                 "installer-verified-context-efficiency-migration",
+            ),
+            (
+                "migration-39-budget-resume-rebind",
+                "installer-verified-budget-resume-migration",
             ),
         }
     )
@@ -999,7 +1007,11 @@ def command_return(args: argparse.Namespace) -> int:
             "next_action":THREE_STRIKE_NEXT_ACTION,
         })
     else:
-        if count==2 and int(task["current_node"])>4: target=4
+        if count==2 and int(task["current_node"])>4:
+            # A standard lightweight route has no node-4 solution artifact.
+            # Return to node 2 so its routed node-6 implementation receipt can
+            # re-accept the projected 2-6 chain instead of creating a dead end.
+            target=2 if lightweight_standard(task) else 4
         task.update({"current_node":target,"status":"in_progress","phase":PHASES[target],"next_action":f"repair root cause at node {target}"})
     task.setdefault("rollback_ledger",[]).append({"from":args.from_node,"to":target,"issue_id":args.issue_id,"cause_category":args.cause_category,"subtask":args.subtask,"root_cause":args.root_cause,"change":args.change,"signature":signature,"count":count})
     if count >= 3:
@@ -1737,11 +1749,20 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
         effective_budget_state=str(total_budget.snapshot(active,config,ledger)["state"])
     except (ValueError,TypeError,OSError,KeyError,SystemExit):
         errors.append("effective unified Token budget is invalid")
+    effective_next_action=contexttx.contextctl.resume_next_action(task,effective_budget_state)
+    terminal_closure=(
+        task.get("status")=="ready_to_complete"
+        and task.get("current_node")==7
+        and task.get("accepted_nodes")==list(range(8))
+    )
+    hard_repair=contexttx.contextctl.bounded_hard_repair(task)
     action="continue"; terminal=False; control="resume-current-node"; cleanup=None
     if errors:
         action="waiting_human"; control="repair-context-or-workflow-state"
     elif task.get("status")=="accepted":
         action="complete"; terminal=True; control="explicit-complete-task-checkpoint"
+        if effective_budget_state in {"must_compact","hard_blocked"}:
+            control="explicit-complete-task-checkpoint;budget-recovery-before-next-task"
         binding_error=terminal_binding_error()
         if binding_error is not None:
             terminal=False; action="waiting_human"; control="cleanup-agent-ledger-and-runtime"
@@ -1749,14 +1770,23 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
             errors.append(f"terminal route requires an empty verified Agent ledger and clean runtime: {binding_error}")
     elif task.get("status")=="idle":
         action="waiting_human"; control="clarify-next-requirement"
+    elif effective_budget_state=="hard_blocked" and terminal_closure:
+        control="bounded-terminal-closure"
+    elif effective_budget_state=="hard_blocked" and hard_repair:
+        control="bounded-root-cause-repair"
     elif task.get("status")=="waiting_human" or effective_budget_state=="hard_blocked":
         action="waiting_human"; control="human-decision-required"
     elif effective_budget_state=="must_compact":
         resume=context.get("resume",{})
-        if not isinstance(resume,dict) or resume.get("schema")!="agent-context-resume/v1" or resume.get("task_invariant_sha256")!=contexttx.contextctl.invariant_sha256(task):
+        expected_resume=contexttx.contextctl.resume_contract(
+            task,
+            contexttx.contextctl.invariant_sha256(task),
+            effective_budget_state,
+        )
+        if resume != expected_resume:
             action="compact"; control="create-verified-compact-handoff"
         else:
-            control="verified-compact-handoff-resume"
+            control="verified-phase-handoff-resume"
     scheduler_available=False; scheduler_error=None
     if not terminal and action=="continue":
         try:
@@ -1770,7 +1800,7 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
     receipt={
         "schema":"agent-workflow-route/v2","terminal":terminal,"action":action,
         "status":task.get("status"),"current_node":task.get("current_node"),
-        "next_action":task.get("next_action"),"budget_state":effective_budget_state,
+        "next_action":effective_next_action,"budget_state":effective_budget_state,
         "control":control,"errors":errors,"scheduler_available":scheduler_available,
         "scheduler_error":scheduler_error,"recovery":recovery,"cleanup":cleanup,
         "resume_cursor":cursor,"resume_command":resume_command,

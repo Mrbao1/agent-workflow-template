@@ -151,8 +151,8 @@ def main():
         manifest=json.loads((target/".agent/.workflow-manifest.json").read_text(encoding="utf-8"))
         if (
             manifest.get("schema")!="agent-workflow-install/v4"
-            or manifest.get("version")!="3.1.46"
-            or manifest.get("migration_version")!=38
+            or manifest.get("version")!="3.1.48"
+            or manifest.get("migration_version")!=39
             or not isinstance(manifest.get("agent_files"),dict)
             or not isinstance(manifest.get("repo_plugin_files"),dict)
             or manifest.get("marketplace_entry",{}).get("name")!="pxpipe-context"

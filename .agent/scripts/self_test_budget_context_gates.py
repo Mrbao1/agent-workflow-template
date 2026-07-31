@@ -32,7 +32,10 @@ def run(root: Path, *args: str, expected: int = 0) -> subprocess.CompletedProces
 def fixture(root: Path) -> None:
     scripts = root / ".agent/scripts"
     scripts.mkdir(parents=True)
-    for name in ("testrun.py", "contextctl.py", "contexttx.py", "humandecision.py"):
+    for name in (
+        "testrun.py", "agentctl.py", "contextctl.py", "contexttx.py",
+        "humandecision.py",
+    ):
         shutil.copy2(SOURCE / name, scripts / name)
     shutil.copytree(SOURCE / "workflowlib", scripts / "workflowlib")
     shutil.copy2(AGENT / "INDEX.md", root / ".agent/INDEX.md")
@@ -504,14 +507,20 @@ def main() -> int:
             "'state':'awaiting_host_compaction','history':['handoff_written'],'receipt':None};"
         )
         rewrite_context(root, awaiting_body)
+        awaiting_estimate = json.loads(
+            context_path.read_text()
+        )["usage_freshness"]["estimated_tokens"]
         paused = run(root, sys.executable, contextctl, "sync",
-            "--reason", "paused", "--summary", "must be paused", "--source-tokens", "1400", expected=1)
+            "--reason", "paused", "--summary", "must be paused",
+            "--source-tokens", str(awaiting_estimate), expected=1)
         if "paused" not in paused.stdout:
             raise AssertionError("sync was not paused by the awaiting host compaction")
         run(root, sys.executable, contextctl, "repair",
-            "--reason", "paused", "--summary", "plain repair stays paused", "--source-tokens", "1000", expected=1)
+            "--reason", "paused", "--summary", "plain repair stays paused",
+            "--source-tokens", str(awaiting_estimate), expected=1)
         run(root, sys.executable, contextctl, "repair", "--reset",
-            "--reason", "stuck", "--summary", "rebuild a stuck awaiting capsule", "--source-tokens", "1000", expected=1)
+            "--reason", "stuck", "--summary", "rebuild a stuck awaiting capsule",
+            "--source-tokens", str(awaiting_estimate), expected=1)
         rebuilt = json.loads(context_path.read_text())
         if "host_compaction" in rebuilt:
             raise AssertionError("repair --reset resurrected the awaiting host compaction state")
@@ -554,7 +563,8 @@ def main() -> int:
         run(root, sys.executable, contextctl, "abort-host-compaction",
             "--source", "user:double-abort", expected=1)
         run(root, sys.executable, contextctl, "sync",
-            "--reason", "post-abort", "--summary", "renew after abort", "--source-tokens", "1000")
+            "--reason", "post-abort", "--summary", "renew after abort",
+            "--source-tokens", str(capsule["usage_freshness"]["estimated_tokens"]))
 
         # A leftover transition journal classifies the crash and restores the
         # pre-commit bytes; a stale committed journal can only be discarded.
@@ -745,6 +755,7 @@ def main() -> int:
         run(root, sys.executable, "-c", textwrap.dedent(f"""
             import json, sys
             sys.path.insert(0, '.agent/scripts')
+            import agentctl
             import contextctl
             from workflowlib import budget
 
@@ -809,6 +820,113 @@ def main() -> int:
             ]}}
             assert contextctl.automatic_transition_source_tokens(current, previous, shrinking) == 1400
 
+            # Resume state is derived from the active checkpoint, not TASK's
+            # cumulative/base budget marker. A terminal compact checkpoint
+            # must also replace the unsafe "start next requirement" prose.
+            resume_task = {{
+                'status': 'accepted', 'current_node': 'idle',
+                'mode': 'standard', 'token_budget': 48000,
+                'tokens_used': 0, 'token_usage_source': 'estimated',
+                'loaded_references': [], 'budget_state': 'ok',
+                'next_action': 'start the next requirement in clarification',
+            }}
+            resume_state = contextctl.effective_budget_state(shipped, resume_task, 37000)
+            assert resume_state == 'must_compact', resume_state
+            effective_resume = contextctl.resume_contract(
+                resume_task, 'f' * 64, resume_state
+            )
+            assert effective_resume['budget_state'] == 'must_compact', effective_resume
+            assert 'verified host compaction' in effective_resume['next_action'], effective_resume
+            assert effective_resume['terminal'] is True, effective_resume
+            blocked_task = dict(
+                resume_task, status='in_progress', current_node=6,
+                next_action='continue implementation',
+            )
+            blocked_resume = contextctl.resume_contract(
+                blocked_task, 'e' * 64, 'hard_blocked'
+            )
+            assert blocked_resume['resume_action'] == 'waiting_human', blocked_resume
+            assert 'do not continue' in blocked_resume['next_action'], blocked_resume
+            closure_task = dict(
+                blocked_task, status='ready_to_complete', current_node=7,
+                accepted_nodes=list(range(8)), next_action='render retrospective and complete task',
+            )
+            closure_resume = contextctl.resume_contract(
+                closure_task, 'd' * 64, 'hard_blocked'
+            )
+            assert closure_resume['resume_action'] == 'continue', closure_resume
+            hard_snapshot = {{'state': 'hard_blocked'}}
+            assert agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', closure_task
+            )
+            assert agentctl.budget_action_allowed(hard_snapshot, 'complete', closure_task)
+            assert not agentctl.budget_action_allowed(
+                hard_snapshot, 'route-templates', closure_task
+            )
+            assert not agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', blocked_task
+            )
+            signature = 'c' * 64
+            repair_task = dict(
+                blocked_task,
+                rollback_ledger=[{{'from': 7, 'to': 6, 'signature': signature}}],
+                failure_ledger={{signature: 1}},
+                next_action='repair root cause at node 6',
+            )
+            repair_resume = contextctl.resume_contract(
+                repair_task, 'b' * 64, 'hard_blocked'
+            )
+            assert repair_resume['resume_action'] == 'continue', repair_resume
+            for action in ('reroute-existing', 'render-artifact', 'finish-node', 'managed-run'):
+                assert agentctl.budget_action_allowed(
+                    hard_snapshot, action, repair_task
+                ), (action, repair_task)
+            for action in ('route-templates', 'load-reference', 'spawn-agent'):
+                assert not agentctl.budget_action_allowed(
+                    hard_snapshot, action, repair_task
+                ), (action, repair_task)
+            progressed_repair = dict(
+                repair_task, current_node=7, accepted_nodes=list(range(7)),
+                next_action='rerun acceptance at node 7',
+            )
+            assert agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', progressed_repair
+            )
+            assert contextctl.resume_contract(
+                progressed_repair, 'a' * 64, 'hard_blocked'
+            )['resume_action'] == 'continue'
+            chained_signature = 'd' * 64
+            chained_repair = dict(
+                progressed_repair,
+                rollback_ledger=[
+                    {{'from': 7, 'to': 4, 'signature': signature}},
+                    {{'from': 4, 'to': 2, 'signature': chained_signature}},
+                ],
+                failure_ledger={{signature: 2, chained_signature: 1}},
+            )
+            assert contextctl.hard_repair_interval(chained_repair) == (2, 7)
+            assert agentctl.hard_repair_interval(chained_repair) == (2, 7)
+            assert agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', chained_repair
+            )
+            disconnected_repair = dict(
+                chained_repair,
+                rollback_ledger=[
+                    {{'from': 7, 'to': 5, 'signature': signature}},
+                    {{'from': 4, 'to': 2, 'signature': chained_signature}},
+                ],
+            )
+            assert contextctl.hard_repair_interval(disconnected_repair) == (2, 4)
+            assert not agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', disconnected_repair
+            )
+            third_strike = dict(
+                repair_task, failure_ledger={{signature: 3}}
+            )
+            assert not agentctl.budget_action_allowed(
+                hard_snapshot, 'render-artifact', third_strike
+            )
+
             # Post-completion accounting preserves either an ordinary
             # complete-task receipt or one of the two installer-verified
             # terminal migration origins. Arbitrary markers fail closed.
@@ -828,6 +946,7 @@ def main() -> int:
             for reason, source in (
                 ('migration-26-final-state-rebind', 'installer-verified-active-migration'),
                 ('migration-34-final-state-rebind', 'installer-verified-context-efficiency-migration'),
+                ('migration-39-budget-resume-rebind', 'installer-verified-budget-resume-migration'),
             ):
                 migration_origin = contextctl.terminal_completion_origin({{
                     'checkpoint': {{'reason': reason, 'transition_authorization': None}},
@@ -872,6 +991,19 @@ def main() -> int:
         twice = json.loads(after_turn_path.read_text())
         if twice["usage_freshness"]["estimated_tokens"] != before_turn["usage_freshness"]["estimated_tokens"] + 600:
             raise AssertionError("distinct host turns did not receive independent per-turn charges")
+        before_repair_bytes = after_turn_path.read_bytes()
+        lowered_repair = run(
+            root, sys.executable, contextctl, "repair",
+            "--source-tokens", str(twice["usage_freshness"]["estimated_tokens"] - 1),
+            "--reason", "forged-lower-estimate", "--reset", expected=1,
+        )
+        if (
+            "repair cannot lower the active-window estimate" not in lowered_repair.stdout
+            or after_turn_path.read_bytes() != before_repair_bytes
+        ):
+            raise AssertionError(
+                "repair reset lowered usage or mutated the checkpoint before rejecting it"
+            )
 
         # The invariant is enforced fail-closed at capsule validation: a
         # config that lets one permitted child cross the hard watermark is

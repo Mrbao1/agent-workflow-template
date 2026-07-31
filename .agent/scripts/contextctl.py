@@ -463,18 +463,115 @@ def automatic_transition_source_tokens(
     return max(floor, requested)
 
 
-def resume_contract(task: Dict[str, object], snapshot_sha256: str) -> Dict[str, object]:
+def effective_budget_state(
+    config: Dict[str, object], task: Dict[str, object], current_estimate: int
+) -> str:
+    """Map the checkpoint's unified watermark to the public routing state."""
+    watermark = str(budget_snapshot(config, task, current_estimate).get("watermark", "hard"))
+    return {
+        "normal": "ok",
+        "soft": "soft",
+        "compact": "must_compact",
+        "hard": "hard_blocked",
+    }.get(watermark, "hard_blocked")
+
+
+def hard_repair_interval(task: Dict[str, object]) -> Optional[Tuple[int, int]]:
+    """Merge adjacent hot return receipts without widening beyond their route."""
+    rollback = task.get("rollback_ledger")
+    failures = task.get("failure_ledger")
+    if (
+        not isinstance(rollback, list)
+        or not rollback
+        or not isinstance(failures, dict)
+    ):
+        return None
+    receipts: List[Dict[str, object]] = []
+    for item in reversed(rollback):
+        if not isinstance(item, dict):
+            break
+        start, end = item.get("to"), item.get("from")
+        count = failures.get(item.get("signature"))
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 0 < count < 3
+        ):
+            break
+        if receipts and start != receipts[-1]["from"]:
+            break
+        receipts.append(item)
+    if not receipts:
+        return None
+    return int(receipts[0]["to"]), int(receipts[-1]["from"])
+
+
+def bounded_hard_repair(task: Dict[str, object]) -> bool:
+    current = task.get("current_node")
+    interval = hard_repair_interval(task)
+    return bool(
+        task.get("status") == "in_progress"
+        and isinstance(current, int)
+        and not isinstance(current, bool)
+        and interval is not None
+        and interval[0] <= current <= interval[1]
+    )
+
+
+def resume_next_action(task: Dict[str, object], budget_state: str) -> object:
+    """Return an executable next step for this checkpoint, not stale TASK prose."""
+    terminal = task.get("status") == "accepted" and task.get("current_node") == "idle"
+    terminal_closure = (
+        task.get("status") == "ready_to_complete"
+        and task.get("current_node") == 7
+        and task.get("accepted_nodes") == list(range(8))
+    )
+    if terminal and budget_state in {"must_compact", "hard_blocked"}:
+        return (
+            "before starting another requirement, establish a verified host compaction "
+            "or select an authorized higher-budget mode"
+        )
+    if (
+        budget_state == "hard_blocked"
+        and not terminal_closure
+        and not bounded_hard_repair(task)
+    ):
+        return (
+            "use rollback, return-node, cleanup or an explicit human decision; "
+            "do not continue or expand scope"
+        )
+    return task.get("next_action")
+
+
+def resume_contract(
+    task: Dict[str, object],
+    snapshot_sha256: str,
+    budget_state: Optional[str] = None,
+) -> Dict[str, object]:
     status=task.get("status"); current=task.get("current_node")
     terminal=status=="accepted" and current=="idle"
+    terminal_closure = (
+        status == "ready_to_complete"
+        and current == 7
+        and task.get("accepted_nodes") == list(range(8))
+    )
+    hard_repair = bounded_hard_repair(task)
+    effective_state = str(budget_state or task.get("budget_state") or "hard_blocked")
     if terminal:
         action="complete"
-    elif status in {"idle","waiting_human"} or task.get("budget_state")=="hard_blocked":
+    elif status in {"idle","waiting_human"} or (
+        effective_state=="hard_blocked" and not terminal_closure and not hard_repair
+    ):
         action="waiting_human"
     else:
         action="continue"
     return {
         "schema":"agent-context-resume/v1","task_status":status,"current_node":current,
-        "next_action":task.get("next_action"),"budget_state":task.get("budget_state"),
+        "next_action":resume_next_action(task, effective_state),"budget_state":effective_state,
         "terminal":terminal,"resume_action":action,"task_invariant_sha256":snapshot_sha256,
     }
 
@@ -540,10 +637,12 @@ def terminal_completion_origin(context: Dict[str, object]) -> Dict[str, object]:
         checkpoint.get("reason") in {
             "migration-26-final-state-rebind",
             "migration-34-final-state-rebind",
+            "migration-39-budget-resume-rebind",
         }
         and compaction.get("source") in {
             "installer-verified-active-migration",
             "installer-verified-context-efficiency-migration",
+            "installer-verified-budget-resume-migration",
         }
     ):
         origin = {
@@ -574,6 +673,10 @@ def terminal_completion_origin(context: Dict[str, object]) -> Dict[str, object]:
             (
                 "migration-34-final-state-rebind",
                 "installer-verified-context-efficiency-migration",
+            ),
+            (
+                "migration-39-budget-resume-rebind",
+                "installer-verified-budget-resume-migration",
             ),
         }
     )
@@ -660,7 +763,11 @@ def build_capsule(
         "evidence": list_value(evidence),
         "open_risks": list_value(risks),
         "next_action": task.get("next_action"),
-        "resume": resume_contract(task, snapshot_sha256),
+        "resume": resume_contract(
+            task,
+            snapshot_sha256,
+            effective_budget_state(config, task, int(args.source_tokens)),
+        ),
         "checkpoint": {
             "sequence": sequence,
             "reason": args.reason,
@@ -702,6 +809,19 @@ def build_capsule(
             "content_sha256": "0" * 64,
         },
     }
+    previous_resume = previous.get("resume") if isinstance(previous, dict) else None
+    if (
+        task.get("status") == "accepted"
+        and isinstance(previous_resume, dict)
+        and previous_resume.get("terminal") is True
+    ):
+        # Plain refreshes, installer rebinds and reviewed repairs occur after
+        # the canonical complete-task transition. Preserve that exact origin
+        # just as account-turn does, otherwise any post-completion sync would
+        # silently reopen the terminal route.
+        capsule["checkpoint"]["terminal_completion_origin"] = (  # type: ignore[index]
+            terminal_completion_origin(previous)
+        )
     if getattr(args, "request_host_compaction", False):
         capsule["host_compaction"] = {
             "schema": "agent-host-compaction-state/v1", "state": "awaiting_host_compaction",
@@ -1074,6 +1194,19 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
     mode_policy = policy.get("max_capsule_tokens", {}) if isinstance(policy.get("max_capsule_tokens"), dict) else {}
     if context.get("schema") != "agent-context/v2":
         errors.append("schema must be agent-context/v2")
+    freshness_for_resume = context.get("usage_freshness")
+    resume_estimate = (
+        freshness_for_resume.get("estimated_tokens")
+        if isinstance(freshness_for_resume, dict)
+        else None
+    )
+    resume_state = (
+        effective_budget_state(config, task, int(resume_estimate))
+        if isinstance(resume_estimate, int) and not isinstance(resume_estimate, bool)
+        else "hard_blocked"
+    )
+    expected_resume = resume_contract(task, invariant_sha256(task), resume_state)
+    legacy_resume = resume_contract(task, invariant_sha256(task))
     exact = {
         "task_title": task.get("title"),
         "phase": task.get("phase"),
@@ -1083,11 +1216,16 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
         "decisions": list_value(task.get("decisions")),
         "open_questions": list_value(task.get("open_questions")),
         "next_action": task.get("next_action"),
-        "resume": resume_contract(task, invariant_sha256(task)),
     }
     for key, expected in exact.items():
         if context.get(key) != expected:
             errors.append(f"{key} drifted from canonical task/contract state")
+    stored_resume = context.get("resume")
+    # A pre-fix capsule may still carry TASK's base budget state. It is
+    # accepted only as a one-transition compatibility value; every new
+    # sync/account-turn writes the checkpoint-effective state.
+    if stored_resume != expected_resume and stored_resume != legacy_resume:
+        errors.append("resume drifted from canonical task/checkpoint state")
     bundle_version = context.get("policy_bundle_version", LEGACY_POLICY_BUNDLE_VERSION)
     if bundle_version == POLICY_BUNDLE_VERSION:
         if context.get("policy_bundle_sha256") != policy_bundle_sha256(task):
@@ -1298,6 +1436,11 @@ def account_host_turn(args: argparse.Namespace) -> int:
     freshness["task_invariant_sha256"] = invariant_sha256(task)
     freshness["estimated_tokens"] = new_source
     freshness["observed_at"] = timestamp
+    context["resume"] = resume_contract(
+        task,
+        invariant_sha256(task),
+        effective_budget_state(config, task, new_source),
+    )
     compaction["source_estimated_tokens"] = new_source
     compaction["reason"] = "host-turn-accounted"
     compaction["source"] = f"host-turn:{digest}"
@@ -1419,6 +1562,22 @@ def _main() -> int:
     if args.command == "sync" and args.reset:
         raise SystemExit("sync --reset is forbidden; use a bound transition or fail-closed repair")
     previous, previous_file_sha256 = safe_previous()
+    if args.command == "repair" and previous:
+        prior_freshness = previous.get("usage_freshness")
+        prior_estimate = (
+            prior_freshness.get("estimated_tokens")
+            if isinstance(prior_freshness, dict)
+            else None
+        )
+        if (
+            isinstance(prior_estimate, int)
+            and not isinstance(prior_estimate, bool)
+            and args.source_tokens < prior_estimate
+        ):
+            raise SystemExit(
+                "context repair cannot lower the active-window estimate; "
+                "only a verified host compaction may establish a lower value"
+            )
     pending_host = previous.get("host_compaction") if isinstance(previous, dict) else None
     if (
         isinstance(pending_host, dict)

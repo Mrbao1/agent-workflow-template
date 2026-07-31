@@ -1,0 +1,292 @@
+{
+  "schema": "agent-workflow-full-suite/v1",
+  "status": "passed",
+  "shard": null,
+  "full": true,
+  "jobs": 1,
+  "test_timeout": 300,
+  "wall_seconds": 176.095,
+  "runs": [
+    {
+      "name": "capture-runtime-baseline",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "capture-runtime-baseline",
+        "--source",
+        "user:full-suite-controller"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/idle-source",
+      "exit_code": 0,
+      "seconds": 0.419,
+      "output": "RUNTIME BASELINE CAPTURED: project_processes=0\n",
+      "context": "idle-source"
+    },
+    {
+      "name": ".agent/scripts/self_test_control_gates.py",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/self_test_control_gates.py"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/idle-source",
+      "exit_code": 0,
+      "seconds": 31.9,
+      "output": "CONTROL GATES SELF-TEST PASSED: budget routing, clarification, signed v1 human decisions, escalation re-approval, task-archive v2, cleanup/lease/docker/baseline hygiene, knowledge promotion, adapter probes, node-0 start contracts and fast start defaults\n",
+      "context": "idle-source"
+    },
+    {
+      "name": "cleanup",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "cleanup"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/idle-source",
+      "exit_code": 0,
+      "seconds": 0.407,
+      "output": "CLEANUP PASSED: zero registered residuals\n",
+      "context": "idle-source"
+    },
+    {
+      "name": "assert-clean",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "assert-clean"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/idle-source",
+      "exit_code": 0,
+      "seconds": 0.502,
+      "output": "RUNTIME CLEAN\n",
+      "context": "idle-source"
+    },
+    {
+      "name": "capture-runtime-baseline",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "capture-runtime-baseline",
+        "--source",
+        "user:full-suite-controller"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 0.498,
+      "output": "RUNTIME BASELINE CAPTURED: project_processes=0\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": "agent-state-validation",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "validate"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 1.318,
+      "output": "VALID .agent structure: /private/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source/.agent\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": "context-validation",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/contextctl.py",
+        "check"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 0.148,
+      "output": "VALID context capsule: 644/1200 estimated tokens\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": ".agent/scripts/self_test_control_gates.py",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/self_test_control_gates.py"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 44.925,
+      "output": "CONTROL GATES SELF-TEST PASSED: budget routing, clarification, signed v1 human decisions, escalation re-approval, task-archive v2, cleanup/lease/docker/baseline hygiene, knowledge promotion, adapter probes, node-0 start contracts and fast start defaults\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": "cleanup",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "cleanup"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 0.537,
+      "output": "CLEANUP PASSED: zero registered residuals\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": "assert-clean",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "assert-clean"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/polluted-source",
+      "exit_code": 0,
+      "seconds": 0.741,
+      "output": "RUNTIME CLEAN\n",
+      "context": "polluted-source"
+    },
+    {
+      "name": "capture-runtime-baseline",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "capture-runtime-baseline",
+        "--source",
+        "user:full-suite-controller"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/installed-project",
+      "exit_code": 0,
+      "seconds": 0.684,
+      "output": "RUNTIME BASELINE CAPTURED: project_processes=0\n",
+      "context": "installed-project"
+    },
+    {
+      "name": ".agent/scripts/self_test_control_gates.py",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/self_test_control_gates.py"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/installed-project",
+      "exit_code": 0,
+      "seconds": 48.653,
+      "output": "CONTROL GATES SELF-TEST PASSED: budget routing, clarification, signed v1 human decisions, escalation re-approval, task-archive v2, cleanup/lease/docker/baseline hygiene, knowledge promotion, adapter probes, node-0 start contracts and fast start defaults\n",
+      "context": "installed-project"
+    },
+    {
+      "name": "cleanup",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "cleanup"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/installed-project",
+      "exit_code": 0,
+      "seconds": 0.55,
+      "output": "CLEANUP PASSED: zero registered residuals\n",
+      "context": "installed-project"
+    },
+    {
+      "name": "assert-clean",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "assert-clean"
+      ],
+      "cwd": "/var/folders/4t/s8_76xn13qvcg5_2yhx1ndqmlb518w/T/agent-workflow-self-suite-fr5s2vh2/installed-project",
+      "exit_code": 0,
+      "seconds": 0.756,
+      "output": "RUNTIME CLEAN\n",
+      "context": "installed-project"
+    },
+    {
+      "name": "freshness",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        "tests/check_freshness.py"
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 1.025,
+      "output": "FRESHNESS PASS: seed, live capsule, bundle and manifest are current\n",
+      "context": "source"
+    },
+    {
+      "name": "install-lifecycle",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        "tests/test_install_lifecycle.py",
+        "--template-root",
+        "."
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 33.524,
+      "output": "INSTALL LIFECYCLE PASS: idle/polluted/installed isolation and rollback\n",
+      "context": "source"
+    },
+    {
+      "name": "pxpipe-self-test",
+      "status": "pass",
+      "command": [
+        "node",
+        "plugins/pxpipe-context/scripts/self-test.mjs"
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 6.006,
+      "output": "PASS: pxpipe-context MCP protocol, render boundary, drift rejection and clean EOF exit\n",
+      "context": "source"
+    },
+    {
+      "name": "pxpipe-provider-integration",
+      "status": "pass",
+      "command": [
+        "node",
+        "plugins/pxpipe-context/scripts/provider-integration-self-test.mjs"
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 0.042,
+      "output": "PASS: pxpipe is the default new-session provider path and the file MCP is optional\n",
+      "context": "source"
+    },
+    {
+      "name": "cleanup",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "cleanup"
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 0.371,
+      "output": "CLEANUP PASSED: zero registered residuals\n",
+      "context": "source"
+    },
+    {
+      "name": "assert-clean",
+      "status": "pass",
+      "command": [
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/python3",
+        ".agent/scripts/agentctl.py",
+        "assert-clean"
+      ],
+      "cwd": "/Users/jiashuaibao/IdeaProjects/agent-workflow-template",
+      "exit_code": 0,
+      "seconds": 0.716,
+      "output": "RUNTIME CLEAN\n",
+      "context": "source"
+    }
+  ]
+}

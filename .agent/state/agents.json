@@ -40,7 +40,7 @@
     "human_verification_required": true,
     "signed_adapter": null
   },
-  "epoch": "1cb7067a5c59c3feece0ddad1d340ec2d9343ed5e7820816a1b97dcb7b9175c4",
+  "epoch": "81db2bd15329e6389850ccab9366104a87e7564f76070974927789026961dcbc",
   "members": [],
   "prepared_dispatches": [],
   "capacity_failures": [],
@@ -51,8 +51,14 @@
     "settled_tokens": 0
   },
   "task_payload_schema": "agent-task-payload/v2",
-  "last_platform_snapshot": null,
-  "platform_empty_verified": false,
+  "last_platform_snapshot": {
+    "path": ".agent/state/evidence/platform-snapshots/5c63096f832e07c4e47e93f193aea30ca6f1ef6422f246604680d6074a0a6be1.json",
+    "sha256": "5c63096f832e07c4e47e93f193aea30ca6f1ef6422f246604680d6074a0a6be1",
+    "bytes": 108
+  },
+  "platform_empty_verified": true,
   "migration_source": null,
-  "updated_at": "2026-07-22T02:17:20+00:00"
+  "updated_at": "2026-07-31T09:13:09+00:00",
+  "revision": 2,
+  "prev_sha256": "e5f8565c53d2d4c9533d83484170d50fc8c8591f5faf0dada68f24aa3eab9616"
 }

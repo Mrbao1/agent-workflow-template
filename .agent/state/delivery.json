@@ -11,5 +11,7 @@
   "promotion_receipt": null,
   "rollback_receipt": null,
   "legacy_production_chain": null,
-  "updated_at": null
+  "epoch": 1,
+  "previous_head": null,
+  "updated_at": "2026-07-31T07:33:06+00:00"
 }

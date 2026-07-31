@@ -1,0 +1,16 @@
+{
+  "schema": "agent-knowledge-pending/v1",
+  "candidates": [
+    {
+      "candidate": "Require at least one real contexttx lifecycle test for every state-machine exit.",
+      "task_title": "R3 修复状态机、预算与路由致命断裂并补真实端到端测试",
+      "recorded_at": "2026-07-31T04:55:21+00:00"
+    },
+    {
+      "candidate": "Separate per-transition bookkeeping increments from per-turn host overhead.",
+      "task_title": "R3 修复状态机、预算与路由致命断裂并补真实端到端测试",
+      "recorded_at": "2026-07-31T04:55:21+00:00"
+    }
+  ],
+  "promotions": []
+}

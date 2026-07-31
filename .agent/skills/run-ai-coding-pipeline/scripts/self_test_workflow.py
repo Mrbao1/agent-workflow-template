@@ -708,9 +708,27 @@ with tempfile.TemporaryDirectory(prefix="workflow-state-test-") as raw:
     (root / ".agent/scripts/contextctl.py").write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
     (root / ".agent/scripts/agentctl.py").write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
     (root / ".agent/scripts/contexttx.py").write_text(
-        "from pathlib import Path\nimport datetime,hashlib,json\nclass contextctl:\n @staticmethod\n def invariant_sha256(value): return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()\ndef transition_journal_status():\n p=Path('.agent/state/.context-transition-journal.json')\n if not p.is_file(): return None\n try: value=json.loads(p.read_text(encoding='utf-8'))\n except Exception: return {'schema':'agent-context-transition-journal-status/v1','state':'malformed'}\n return {'schema':'agent-context-transition-journal-status/v1','state':value.get('state','interrupted'),'recovery':value.get('recovery','')}\ndef transition_task(before,after,**kwargs):\n task_path=Path('.agent/state/TASK.json'); context_path=Path('.agent/state/CONTEXT.json')\n effects=[(Path(path),data) for path,data in (kwargs.get('side_effects') or [])]\n backups={task_path:task_path.read_bytes() if task_path.is_file() else None,context_path:context_path.read_bytes() if context_path.is_file() else None}\n for path,_ in effects: backups[path]=path.read_bytes() if path.is_file() else None\n try:\n  for path,data in effects: path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(data)\n  task_path.write_text(json.dumps(after,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n except BaseException:\n  for path,data in backups.items():\n   if data is None: path.unlink(missing_ok=True)\n   else: path.write_bytes(data)\n  raise\n invariant=contextctl.invariant_sha256(after); observed=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(); sequence=1\n context={'schema':'agent-context/v2','task_invariant_sha256':invariant,'resume':{'schema':'agent-context-resume/v1','task_status':after.get('status'),'current_node':after.get('current_node'),'next_action':after.get('next_action'),'budget_state':after.get('budget_state'),'terminal':after.get('status')=='accepted','resume_action':'complete' if after.get('status')=='accepted' else 'continue','task_invariant_sha256':invariant},'checkpoint':{'sequence':sequence,'updated_at':observed,'transition_authorization':{'mutator':kwargs.get('mutator'),'operation':kwargs.get('operation')}},'usage_freshness':{'schema':'agent-context-usage/v1','checkpoint_sequence':sequence,'task_invariant_sha256':invariant,'coverage':'through-current-checkpoint','source':'explicit-estimate','estimated_tokens':1000,'observed_at':observed}}\n context_path.write_text(json.dumps(context,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n",
+        "from pathlib import Path\nimport datetime,hashlib,json\nclass contextctl:\n @staticmethod\n def invariant_sha256(value): return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()\n @staticmethod\n def hard_repair_interval(task):\n  ledger=task.get('rollback_ledger'); failures=task.get('failure_ledger'); receipts=[]\n  if not isinstance(ledger,list) or not ledger or not isinstance(failures,dict): return None\n  for item in reversed(ledger):\n   if not isinstance(item,dict): break\n   start=item.get('to'); end=item.get('from'); count=failures.get(item.get('signature'))\n   if not isinstance(start,int) or isinstance(start,bool) or not isinstance(end,int) or isinstance(end,bool) or not isinstance(count,int) or isinstance(count,bool) or not 0<count<3: break\n   if receipts and start!=receipts[-1]['from']: break\n   receipts.append(item)\n  return (receipts[0]['to'],receipts[-1]['from']) if receipts else None\n @staticmethod\n def bounded_hard_repair(task):\n  interval=contextctl.hard_repair_interval(task); current=task.get('current_node')\n  return task.get('status')=='in_progress' and isinstance(current,int) and not isinstance(current,bool) and interval is not None and interval[0]<=current<=interval[1]\n @staticmethod\n def resume_next_action(task,budget_state):\n  terminal=task.get('status')=='accepted' and task.get('current_node')=='idle'; closure=task.get('status')=='ready_to_complete' and task.get('current_node')==7 and task.get('accepted_nodes')==list(range(8))\n  if terminal and budget_state in {'must_compact','hard_blocked'}: return 'before starting another requirement, establish a verified host compaction or select an authorized higher-budget mode'\n  if budget_state=='hard_blocked' and not closure and not contextctl.bounded_hard_repair(task): return 'use rollback, return-node, cleanup or an explicit human decision; do not continue or expand scope'\n  return task.get('next_action')\n @staticmethod\n def resume_contract(task,snapshot_sha256,budget_state=None):\n  state=str(budget_state or task.get('budget_state') or 'hard_blocked'); status=task.get('status'); current=task.get('current_node'); terminal=status=='accepted' and current=='idle'; closure=status=='ready_to_complete' and current==7 and task.get('accepted_nodes')==list(range(8)); repair=contextctl.bounded_hard_repair(task)\n  action='complete' if terminal else ('waiting_human' if status in {'idle','waiting_human'} or state=='hard_blocked' and not closure and not repair else 'continue')\n  return {'schema':'agent-context-resume/v1','task_status':status,'current_node':current,'next_action':contextctl.resume_next_action(task,state),'budget_state':state,'terminal':terminal,'resume_action':action,'task_invariant_sha256':snapshot_sha256}\ndef transition_journal_status():\n p=Path('.agent/state/.context-transition-journal.json')\n if not p.is_file(): return None\n try: value=json.loads(p.read_text(encoding='utf-8'))\n except Exception: return {'schema':'agent-context-transition-journal-status/v1','state':'malformed'}\n return {'schema':'agent-context-transition-journal-status/v1','state':value.get('state','interrupted'),'recovery':value.get('recovery','')}\ndef transition_task(before,after,**kwargs):\n task_path=Path('.agent/state/TASK.json'); context_path=Path('.agent/state/CONTEXT.json')\n effects=[(Path(path),data) for path,data in (kwargs.get('side_effects') or [])]\n backups={task_path:task_path.read_bytes() if task_path.is_file() else None,context_path:context_path.read_bytes() if context_path.is_file() else None}\n for path,_ in effects: backups[path]=path.read_bytes() if path.is_file() else None\n try:\n  for path,data in effects: path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(data)\n  task_path.write_text(json.dumps(after,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n except BaseException:\n  for path,data in backups.items():\n   if data is None: path.unlink(missing_ok=True)\n   else: path.write_bytes(data)\n  raise\n invariant=contextctl.invariant_sha256(after); observed=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(); sequence=1\n context={'schema':'agent-context/v2','task_invariant_sha256':invariant,'resume':contextctl.resume_contract(after,invariant,after.get('budget_state')),'checkpoint':{'sequence':sequence,'updated_at':observed,'transition_authorization':{'mutator':kwargs.get('mutator'),'operation':kwargs.get('operation')}},'usage_freshness':{'schema':'agent-context-usage/v1','checkpoint_sequence':sequence,'task_invariant_sha256':invariant,'coverage':'through-current-checkpoint','source':'explicit-estimate','estimated_tokens':1000,'observed_at':observed}}\n context_path.write_text(json.dumps(context,ensure_ascii=False,indent=2)+'\\n',encoding='utf-8')\n",
         encoding="utf-8",
     )
+    stub_contract = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys;sys.path.insert(0,'.agent/scripts');import contexttx;"
+            "required=('invariant_sha256','hard_repair_interval','bounded_hard_repair','resume_next_action','resume_contract');"
+            "assert all(hasattr(contexttx.contextctl,name) for name in required),required",
+        ],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if stub_contract.returncode:
+        raise AssertionError(
+            "state-machine contexttx stub drifted from workflowctl's routed interface:\n"
+            + stub_contract.stdout
+        )
     config = json.loads((root / ".agent/config.json").read_text(encoding="utf-8"))
     # The budget-calibration workstream is mid-migration: the installed
     # agentctl validator still requires the pre-rename increment key and the
@@ -896,6 +914,25 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
     early = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
     if early["current_node"] != 2 or list(early["failure_ledger"].values()) != [2]:
         raise AssertionError("stable second-failure or early-node rule failed")
+
+    # A second late failure on standard+lightweight must return to node 2.
+    # That route has no node-4 solution template and can only rebuild nodes
+    # 2-6 through its projected node-6 implementation receipt.
+    lightweight_late = task("standard", 7, list(range(7)))
+    lightweight_late["projection"] = "lightweight"
+    lightweight_signature = hashlib.sha256(b"ISSUE-LIGHTWEIGHT|implementation").hexdigest()
+    lightweight_late["failure_ledger"] = {lightweight_signature: 1}
+    install_task(root, lightweight_late)
+    run(root, "return-node", "--from-node", "7", "--to", "6",
+        "--issue-id", "ISSUE-LIGHTWEIGHT", "--cause-category", "implementation",
+        "--subtask", "x", "--root-cause", "same projected defect", "--change", "retry")
+    lightweight_late = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if (
+        lightweight_late["current_node"] != 2
+        or lightweight_late["accepted_nodes"] != [0, 1]
+        or lightweight_late["rollback_ledger"][-1]["to"] != 2
+    ):
+        raise AssertionError("standard lightweight second failure did not return to its rebuildable node")
 
     # Three-strike escalation blocks progression until a bound human decision exists.
     strikes = task("standard", 5, [0, 1, 2, 3, 4])

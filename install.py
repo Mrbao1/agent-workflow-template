@@ -4,8 +4,8 @@
 from pathlib import Path
 import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 
-VERSION="3.1.46"
-MIGRATION_VERSION=38
+VERSION="3.1.48"
+MIGRATION_VERSION=39
 MANAGED=("INDEX.md","scripts","skills","templates","workflows","assets","capabilities")
 MANAGED_FILES=("knowledge/INDEX.md",)
 FRESH_STATE_RELATIVE=Path("assets")/"fresh-state"/"v1"
@@ -1107,18 +1107,28 @@ def migrate_active_loaded_references(destination,prior_install,prior_migration):
 def finalize_active_context_binding(destination,prior_migration):
     """Bind the capsule to the final post-migration task invariant."""
     task=json.loads((destination/"state/TASK.json").read_text(encoding="utf-8"))
-    if prior_migration>=34: return
+    if prior_migration>=39: return
     # Earlier migration steps were individually validated before they changed
     # canonical task state.  Rebuild one ordinary verified checkpoint only
     # after every state migration has settled, preserving its facts and risks.
-    probe="""
+    reason=(
+        "migration-34-final-state-rebind"
+        if prior_migration<34
+        else "migration-39-budget-resume-rebind"
+    )
+    source=(
+        "installer-verified-context-efficiency-migration"
+        if prior_migration<34
+        else "installer-verified-budget-resume-migration"
+    )
+    probe=f"""
 import argparse,hashlib,json,sys
 sys.path.insert(0,'.agent/scripts')
 import contextctl
 p=contextctl.CONTEXT_PATH
 previous=json.loads(p.read_text(encoding='utf-8'))
-source_tokens=max(4000,int(previous.get('compaction',{}).get('source_estimated_tokens',0) or 0))
-args=argparse.Namespace(reason='migration-34-final-state-rebind',summary=previous.get('phase_summary','verified workflow migration'),source='installer-verified-context-efficiency-migration',source_tokens=source_tokens,fact=[],file=[],evidence=[],risk=[],resolve_risk=[],transition=False,reset=False)
+source_tokens=max(4000,int(previous.get('compaction',{{}}).get('source_estimated_tokens',0) or 0))
+args=argparse.Namespace(reason={reason!r},summary=previous.get('phase_summary','verified workflow migration'),source={source!r},source_tokens=source_tokens,fact=[],file=[],evidence=[],risk=[],resolve_risk=[],transition=False,reset=False)
 capsule=contextctl.build_capsule(args,'verified',previous,hashlib.sha256(p.read_bytes()).hexdigest())
 contextctl.atomic_json(p,capsule)
 raise SystemExit(contextctl.validate_context())
@@ -1128,7 +1138,7 @@ raise SystemExit(contextctl.validate_context())
         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120,
     )
     if result.returncode:
-        raise RuntimeError("migration-34 final context rebind failed:\n"+result.stdout.strip())
+        raise RuntimeError(f"migration-{MIGRATION_VERSION} final context rebind failed:\n"+result.stdout.strip())
 
 
 def migrate_delivery_state(destination,prior_migration):

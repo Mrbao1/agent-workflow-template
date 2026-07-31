@@ -1551,7 +1551,65 @@ def effective_budget_snapshot(task: Dict[str, object], config: Dict[str, object]
     }
 
 
-def budget_action_allowed(snapshot: Dict[str, object], action: str) -> bool:
+def bounded_terminal_closure(task: Optional[Dict[str, object]]) -> bool:
+    return bool(
+        isinstance(task, dict)
+        and task.get("status") == "ready_to_complete"
+        and task.get("current_node") == 7
+        and task.get("accepted_nodes") == list(range(8))
+    )
+
+
+def hard_repair_interval(task: Dict[str, object]) -> Optional[tuple[int, int]]:
+    """Merge a contiguous hot rollback chain into one existing-scope interval."""
+    rollback = task.get("rollback_ledger")
+    failures = task.get("failure_ledger")
+    if (
+        not isinstance(rollback, list)
+        or not rollback
+        or not isinstance(failures, dict)
+    ):
+        return None
+    receipts: List[Dict[str, object]] = []
+    for item in reversed(rollback):
+        if not isinstance(item, dict):
+            break
+        start, end = item.get("to"), item.get("from")
+        count = failures.get(item.get("signature"))
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or not 0 < count < 3
+        ):
+            break
+        if receipts and start != receipts[-1]["from"]:
+            break
+        receipts.append(item)
+    if not receipts:
+        return None
+    return int(receipts[0]["to"]), int(receipts[-1]["from"])
+
+
+def bounded_hard_repair(task: Optional[Dict[str, object]]) -> bool:
+    if not isinstance(task, dict) or task.get("status") != "in_progress":
+        return False
+    current = task.get("current_node")
+    interval = hard_repair_interval(task)
+    if not isinstance(current, int) or isinstance(current, bool) or interval is None:
+        return False
+    start, end = interval
+    return start <= current <= end
+
+
+def budget_action_allowed(
+    snapshot: Dict[str, object],
+    action: str,
+    task: Optional[Dict[str, object]] = None,
+) -> bool:
     known = {
         "spawn-agent", "spawn-review-agent", "cross-review", "load-reference",
         "route-templates", "reroute-existing", "render-artifact", "finish-node",
@@ -1566,6 +1624,18 @@ def budget_action_allowed(snapshot: Dict[str, object], action: str) -> bool:
     if state == "soft":
         return action not in {"spawn-agent", "load-reference"}
     recovery = {"compact", "split", "request-decision", "cleanup", "status", "validate", "rollback", "return-node"}
+    if state == "hard_blocked" and bounded_terminal_closure(task):
+        # No new scope is authorized: these two actions only bind the already
+        # accepted node set into its retrospective and terminal checkpoint.
+        recovery.update({"render-artifact", "complete"})
+    if state == "hard_blocked" and bounded_hard_repair(task):
+        # return-node is only a real recovery exit if the bounded root-cause
+        # repair can be executed. Keep it on the existing route and let the
+        # three-strike ledger stop the third recurrence.
+        recovery.update({
+            "reroute-existing", "render-artifact", "finish-node",
+            "acceptance", "replay", "managed-run", "tool-run",
+        })
     if state == "must_compact":
         recovery.update({
             "finish-node", "acceptance", "spawn-review-agent", "cross-review", "replay",
@@ -1581,7 +1651,14 @@ def verified_compact_handoff(task: Dict[str, object]) -> bool:
             stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120,
         )
         context=load_json(CONTEXT_PATH); resume=context.get("resume")
-        expected=contexttx.contextctl.resume_contract(task,contexttx.contextctl.invariant_sha256(task))
+        freshness=context.get("usage_freshness",{})
+        estimate=int(freshness.get("estimated_tokens",0)) if isinstance(freshness,dict) else 0
+        state=contexttx.contextctl.effective_budget_state(
+            load_json(CONFIG_PATH),task,estimate,
+        )
+        expected=contexttx.contextctl.resume_contract(
+            task,contexttx.contextctl.invariant_sha256(task),state,
+        )
         compaction=context.get("compaction",{}); budget=compaction.get("budget_snapshot",{}) if isinstance(compaction,dict) else {}
         return result.returncode==0 and resume==expected and isinstance(budget,dict) and budget.get("watermark")=="compact"
     except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError,subprocess.TimeoutExpired,SystemExit):
@@ -1590,13 +1667,13 @@ def verified_compact_handoff(task: Dict[str, object]) -> bool:
 
 def enforce_budget_action(task: Dict[str, object], config: Dict[str, object], action: str) -> Dict[str, object]:
     snapshot = effective_budget_snapshot(task, config)
-    if not budget_action_allowed(snapshot, action):
+    if not budget_action_allowed(snapshot, action, task):
         raise SystemExit(
             f"budget gate blocked action={action} state={snapshot['state']}; compact, split or request a decision"
         )
     recovery={"compact","split","request-decision","cleanup","status","validate","rollback","return-node"}
     if snapshot["state"]=="must_compact" and action not in recovery and not verified_compact_handoff(task):
-        raise SystemExit(f"budget gate blocked action={action} until a verified compact handoff binds the current task")
+        raise SystemExit(f"budget gate blocked action={action} until a verified phase handoff binds the current task")
     return snapshot
 
 
@@ -2148,7 +2225,7 @@ def command_sync_stage() -> int:
 def command_budget_gate(args: argparse.Namespace) -> int:
     task = load_json(TASK_PATH)
     snapshot = effective_budget_snapshot(task, load_json(CONFIG_PATH))
-    allowed = budget_action_allowed(snapshot, args.action)
+    allowed = budget_action_allowed(snapshot, args.action, task)
     recovery = {"compact", "split", "request-decision", "cleanup", "status", "validate", "rollback", "return-node"}
     compact_handoff_verified = None
     if allowed and snapshot["state"] == "must_compact" and args.action not in recovery:
@@ -2832,6 +2909,56 @@ def command_start(args: argparse.Namespace) -> int:
         or not isinstance(args.archive_reason, str) or not args.archive_reason.strip()
     ):
         raise SystemExit("active task archival requires an explicit user source and non-empty reason")
+    environment_policy = config["environments"][args.environment]
+    if args.deploy and environment_policy.get("deploy_allowed") is not True:
+        raise SystemExit(f"--deploy is not allowed for {args.environment}")
+    if environment_policy.get("deploy_required") is True and not args.deploy:
+        raise SystemExit(f"{args.environment} requires explicit --deploy")
+    risk_flags = {
+        "deploy": args.deploy, "data_risk": args.data_risk, "cross_system": args.cross_system, "uncertain": args.uncertain,
+        "security": args.security, "compliance": args.compliance, "migration": args.migration,
+        "irreversible": args.irreversible, "external_impact": args.external_impact,
+    }
+    minimum_mode = required_mode(args.environment, args.files, risk_flags, args.task_type, args.complexity)
+    mode = minimum_mode if args.mode == "auto" else args.mode
+    if mode not in config["routing"]["modes"]:
+        raise SystemExit(f"unsupported mode: {mode}")
+    rank = {"fast": 0, "standard": 1, "release": 2}
+    if rank[mode] < rank[minimum_mode]:
+        raise SystemExit(f"{mode} is below required minimum mode {minimum_mode} for the declared risk and environment")
+    if args.environment == "production" and mode != "release":
+        raise SystemExit("production environment requires release mode")
+    if args.environment == "test" and mode == "fast":
+        raise SystemExit("test environment requires at least standard mode")
+    if previous_task.get("status") not in {"idle", None} and CONTEXT_PATH.is_file():
+        try:
+            previous_context = load_json(CONTEXT_PATH)
+            rollover_task = copy.deepcopy(previous_task)
+            rollover_task["mode"] = mode
+            rollover_task["token_budget"] = config["routing"]["modes"][mode]["token_budget"]
+            released_reference_tokens = sum(
+                max(0, int(item.get("estimated_tokens", 0)))
+                for item in previous_task.get("loaded_references", [])
+                if isinstance(item, dict)
+            )
+            rollover_estimate = contexttx.contextctl.automatic_transition_source_tokens(
+                config, previous_context, rollover_task,
+            ) + released_reference_tokens
+            rollover_task["loaded_references"] = []
+            rollover_task["tokens_used"] = max(
+                int(previous_task.get("tokens_used", 0)), rollover_estimate,
+            )
+            rollover_state = budget_snapshot(rollover_task, config)["state"]
+        except (OSError, ValueError, TypeError, KeyError, SystemExit) as error:
+            raise SystemExit(
+                f"new task requires an exact rollover budget forecast: {error}"
+            )
+        if rollover_state in {"must_compact", "hard_blocked"}:
+            raise SystemExit(
+                f"new task would enter {rollover_state} at its first checkpoint; "
+                "establish a verified host compaction or select an authorized "
+                "higher-budget mode before starting new scope"
+            )
     agents_state = load_json(AGENTS_PATH)
     if agents_state.get("schema") != "agent-team/v9":
         raise SystemExit("new task requires the current agent-team/v9 ledger")
@@ -2856,27 +2983,6 @@ def command_start(args: argparse.Namespace) -> int:
     if command_assert_clean():
         raise SystemExit("new task blocked because the project process baseline detected a residual")
     capture_runtime_baseline("agentctl:start")
-    environment_policy = config["environments"][args.environment]
-    if args.deploy and environment_policy.get("deploy_allowed") is not True:
-        raise SystemExit(f"--deploy is not allowed for {args.environment}")
-    if environment_policy.get("deploy_required") is True and not args.deploy:
-        raise SystemExit(f"{args.environment} requires explicit --deploy")
-    risk_flags = {
-        "deploy": args.deploy, "data_risk": args.data_risk, "cross_system": args.cross_system, "uncertain": args.uncertain,
-        "security": args.security, "compliance": args.compliance, "migration": args.migration,
-        "irreversible": args.irreversible, "external_impact": args.external_impact,
-    }
-    minimum_mode = required_mode(args.environment, args.files, risk_flags, args.task_type, args.complexity)
-    mode = minimum_mode if args.mode == "auto" else args.mode
-    if mode not in config["routing"]["modes"]:
-        raise SystemExit(f"unsupported mode: {mode}")
-    rank = {"fast": 0, "standard": 1, "release": 2}
-    if rank[mode] < rank[minimum_mode]:
-        raise SystemExit(f"{mode} is below required minimum mode {minimum_mode} for the declared risk and environment")
-    if args.environment == "production" and mode != "release":
-        raise SystemExit("production environment requires release mode")
-    if args.environment == "test" and mode == "fast":
-        raise SystemExit("test environment requires at least standard mode")
     decision_policy_version = humandecision.decision_policy_version(
         config, mode=mode, environment=args.environment,
         deployment_requested=bool(args.deploy), risk_flags=risk_flags,

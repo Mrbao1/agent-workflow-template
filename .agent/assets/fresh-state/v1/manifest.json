@@ -1,4 +1,6 @@
 {
+  "schema": "agent-workflow-fresh-state-seed/v1",
+  "seed_sha256": "d8c65102b014c43f83af5ac4edcdf303c244816f72c81a4910e8df82642811cc",
   "files": {
     "config.json": "db510aad7715f34696766c8f769f0cbaa50ffa021359bcfcd191ac90749071bc",
     "policies/PROJECT_GUARDRAILS.md": "946f0d7e305e07207abbb04aad1510926b5b55015f936b29a1d3607ff9b44410",
@@ -12,7 +14,7 @@
     "state/.template.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.test-budget.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "state/.tool-leases.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "state/CONTEXT.json": "7a81fe47938b431eaec9824b9d051e9c2d5818c77e26f2c5410f83ca3374193a",
+    "state/CONTEXT.json": "f4e1f46cc364f25fad6563e8d08d4d221105f2be9c7d8dfa596a8b5d085f1b59",
     "state/EVIDENCE_INDEX.json": "07a69ede5e76baa6c76785bf4ce9af2867eb1196e3beadec7f188443c0eb71bc",
     "state/REQUIREMENT_CONTRACT.md": "6448c992b8fd13a4ea74ab8dc51dd8ace85eb2d77023ceb63246c2c61c39fe01",
     "state/STAGE_INDEX.md": "2989e930da2c51d925569d4b497ae80b70e38045e0f5d22aeb3ab90774a4bfda",
@@ -22,7 +24,5 @@
     "state/runtime.json": "2a8d211a647d8138075224fb11c68c9695e5cb2f81ff0020fee3566222362ca3",
     "state/test-budget.json": "08cc8e2671d31cc17ce4e566b0251b6fb0edd309850b2d64282f6ef27d87fe78",
     "state/tool-leases.json": "30a8abc54262011d90f3019ee31ba8ed9fa59105f33236e11924534c031f304f"
-  },
-  "schema": "agent-workflow-fresh-state-seed/v1",
-  "seed_sha256": "f0cdbe87d53cb70947d752c30723b4fc1caf36bb3d79ab7203d9fd8b2590450e"
+  }
 }
