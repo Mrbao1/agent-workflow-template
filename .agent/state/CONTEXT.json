@@ -1,15 +1,15 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "41da84da041e8b4479c50c3c6ce3bb88d9d7e37b17ff3995af764311905ff4fb",
-  "task_title": "cross-task rollover audit",
-  "phase": "idle",
-  "mode": "standard",
-  "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935",
-  "requirement_contract_sha256": "424100354e914085be90633aa65c62b420ec48f78fb900008e1cc243ec3597ee",
-  "phase_summary": "completed accepted task and bounded retrospective",
+  "policy_bundle_sha256": "bdbb389d4e31a82a00440ada091ed7bae09494f8da602f0e1cdb380be5cc0f23",
+  "task_title": "用户确认设计后动态发现评分并锁定 GitHub Skill 的通用开发工作流",
+  "phase": "implementation",
+  "mode": "release",
+  "task_invariant_sha256": "f4a116e24e1b78bcf2f65a54ba8670e075332211609c50cfb8c641b8e09f951e",
+  "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
+  "phase_summary": "Rebound final context after making workflow projection fixtures independent of live template task state.",
   "confirmed_facts": [
-    "requirement_source=user:仔细的全量的检查，根据任务推进的错误日志，整体状态推进的日志进行更改",
+    "requirement_source=user:不固定技术栈；由用户输入并确认设计后再选择最合适 Skill，完善独立通用模板并推送",
     "requirements_clarified=true",
     "environment=local"
   ],
@@ -18,88 +18,68 @@
   "changed_files": [],
   "evidence": [],
   "open_risks": [],
-  "next_action": "start the next requirement in clarification",
+  "next_action": "complete node 6: implementation",
   "resume": {
     "schema": "agent-context-resume/v1",
-    "task_status": "accepted",
-    "current_node": "idle",
-    "next_action": "before starting another requirement, establish a verified host compaction or select an authorized higher-budget mode",
-    "budget_state": "hard_blocked",
-    "terminal": true,
-    "resume_action": "complete",
-    "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935"
+    "task_status": "in_progress",
+    "current_node": 6,
+    "next_action": "complete node 6: implementation",
+    "budget_state": "soft",
+    "terminal": false,
+    "resume_action": "continue",
+    "task_invariant_sha256": "f4a116e24e1b78bcf2f65a54ba8670e075332211609c50cfb8c641b8e09f951e"
   },
   "checkpoint": {
-    "sequence": 103,
-    "reason": "task-completed",
-    "updated_at": "2026-07-31T09:13:09+00:00",
-    "previous_sha256": "6e9ba034eb0bbe0a44934725cc6aba054d498a2cd298fdb56b04c26bfca4c9cd",
-    "previous_task_invariant_sha256": "d54e99fa7d6fd820da6e3835e1bd982cc204b5b193e7eaa37efb028c96517207",
+    "sequence": 130,
+    "reason": "final-fixture-isolation-reseal",
+    "updated_at": "2026-08-24T13:49:31+00:00",
+    "previous_sha256": "daa5108ba86ab0daceb78883c3e55e810e3f87207774679d8846adb02a684a0c",
+    "previous_task_invariant_sha256": "f4a116e24e1b78bcf2f65a54ba8670e075332211609c50cfb8c641b8e09f951e",
     "task_delta": [
-      "completion_binding",
-      "current_node",
-      "knowledge_candidates",
-      "next_action",
-      "phase",
-      "retrospective",
-      "status"
+      "canonical_task_state"
     ],
-    "transition_authorization": {
-      "schema": "agent-context-transition-authorization/v1",
-      "mutator": "workflowctl",
-      "operation": "complete-task",
-      "changed_fields": [
-        "completion_binding",
-        "current_node",
-        "knowledge_candidates",
-        "next_action",
-        "phase",
-        "retrospective",
-        "status"
-      ],
-      "non_invariant_changed_fields": [],
-      "receipt_sha256": "3b2f1aca53ad5b2672443bc1ce12956c8ab78f2bbe299f8f0f5141b2a0fa645d"
-    }
+    "transition_authorization": null
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 103,
-    "task_invariant_sha256": "d1de32093775c9c40e06d46e66cb7a18608f49e4ba4695162b000c45f2986935",
+    "checkpoint_sequence": 130,
+    "task_invariant_sha256": "f4a116e24e1b78bcf2f65a54ba8670e075332211609c50cfb8c641b8e09f951e",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
-    "estimated_tokens": 48600,
-    "observed_at": "2026-07-31T09:13:09+00:00"
+    "estimated_tokens": 65400,
+    "observed_at": "2026-08-24T13:49:31+00:00"
   },
   "turn_accounting": {
     "schema": "agent-context-turn-accounting/v1",
     "applied_turn_ids_sha256": [
       "254f99d794329625dcd00638a6ca312156549942e43e3e2a51aeb499bbeec367",
       "0a4689ccacab00ec6be8db9358538b11e1770560f0d770212f752136dc9cc1af",
-      "9ac41748be8022173207b1da73e68afc1fb62e554bf7612cacd1850c6b8d20a1"
+      "9ac41748be8022173207b1da73e68afc1fb62e554bf7612cacd1850c6b8d20a1",
+      "86feded48c09dc6b0debfdf743b11e8a2441ccf6ea875c0a419f7b757bb28fb1"
     ],
-    "turns_accounted": 3,
-    "estimated_tokens_charged": 9000
+    "turns_accounted": 4,
+    "estimated_tokens_charged": 13000
   },
   "compaction": {
-    "source_estimated_tokens": 48600,
-    "capsule_estimated_tokens": 860,
+    "source_estimated_tokens": 65400,
+    "capsule_estimated_tokens": 890,
     "tokens_removed": 0,
-    "capsule_reduction_tokens": 47740,
-    "compression_ratio": 56.51,
+    "capsule_reduction_tokens": 64510,
+    "compression_ratio": 73.48,
     "method": "explicit-estimate/v1",
-    "reason": "task-completed",
-    "source": "mutator:workflowctl",
+    "reason": "final-fixture-isolation-reseal",
+    "source": "agent:final-fixture-isolation-reseal",
     "budget_snapshot": {
       "task_tokens_used": 0,
-      "current_checkpoint_estimated_tokens": 48600,
-      "task_token_budget": 48000,
+      "current_checkpoint_estimated_tokens": 65400,
+      "task_token_budget": 96000,
       "usage_source": "estimated",
       "reserved_reference_tokens": 0,
       "child_reserved_tokens": 0,
       "child_settled_tokens": 0,
-      "consumed_tokens": 48600,
-      "budget_ratio": 1.0125,
-      "watermark": "hard",
+      "consumed_tokens": 65400,
+      "budget_ratio": 0.6813,
+      "watermark": "soft",
       "assurance": {
         "level": "best-effort-estimate",
         "hard_billing_limit": false,
@@ -110,8 +90,15 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-07-31T09:13:09+00:00",
-    "source": "mutator:workflowctl",
-    "content_sha256": "e6fd7a5e25bd69e9289e45ed0430d6df7690b85e55e609239bd1e5b89de7940c"
+    "verified_at": "2026-08-24T13:49:37+00:00",
+    "source": "user:approved final isolated fixture context rebind",
+    "repair_capsule_sha256": "25805e2434c9aec419658b86982fe6a4af3519b065baabd3d2017619f737da0d",
+    "repair_approval": {
+      "source": "user:approved final isolated fixture context rebind",
+      "artifact_sha256": "25805e2434c9aec419658b86982fe6a4af3519b065baabd3d2017619f737da0d",
+      "assurance": "explicit-user-message;local-only;not-provider-verified",
+      "routing_profile_sha256": "0fbdafeb1da8aef1fff55cf33852c7d6a4c1643ac015067342bef25d4d52bbf3"
+    },
+    "content_sha256": "bf2e595ed88bb93327b556699d6318fc02d16ac1e7b178edc621c8865ed9c04c"
   }
 }

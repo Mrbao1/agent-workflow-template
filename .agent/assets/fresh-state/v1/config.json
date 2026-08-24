@@ -61,18 +61,10 @@
   },
   "branches": {
     "local": [
-      "feature/*",
-      "fix/*",
-      "chore/*"
+      "*"
     ],
-    "test": [
-      "develop",
-      "test/*",
-      "release/*"
-    ],
-    "production": [
-      "main"
-    ]
+    "test": [],
+    "production": []
   },
   "environments": {
     "local": {
@@ -81,13 +73,13 @@
       "human_approval": false
     },
     "test": {
-      "deploy_allowed": true,
+      "deploy_allowed": false,
       "deploy_required": false,
-      "human_approval": false
+      "human_approval": true
     },
     "production": {
-      "deploy_allowed": true,
-      "deploy_required": true,
+      "deploy_allowed": false,
+      "deploy_required": false,
       "human_approval": true
     }
   },
@@ -245,26 +237,6 @@
       "implemented": true,
       "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
       "receipt_schema": "workflow-release-gate/v4"
-    },
-    "acceptance-web-docker": {
-      "implemented": true,
-      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_live_release_gate.py",
-      "receipt_schema": "acceptance-live-gate/v2"
-    },
-    "acceptance-api": {
-      "implemented": true,
-      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
-      "receipt_schema": "local-command-release-gate/v1"
-    },
-    "acceptance-cli": {
-      "implemented": true,
-      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
-      "receipt_schema": "local-command-release-gate/v1"
-    },
-    "acceptance-ios": {
-      "implemented": true,
-      "runner": ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
-      "receipt_schema": "local-command-release-gate/v1"
     }
   },
   "scope": {

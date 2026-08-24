@@ -30,6 +30,8 @@ FIELDS = {
     "task_title", "task_mode", "routing_profile_sha256", "observed_at", "authority",
 }
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+DECISION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_RECEIPT_BYTES = 262144
 
 
 def canonical(value: object) -> bytes:
@@ -38,6 +40,32 @@ def canonical(value: object) -> bytes:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def receipt_snapshot(path: Path):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_RECEIPT_BYTES:
+        raise SystemExit("human decision receipt must be one bounded regular file")
+    flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if ((before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) or
+                not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+            raise SystemExit("human decision receipt changed while opening")
+        chunks = []
+        remaining = MAX_RECEIPT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk); remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_RECEIPT_BYTES:
+            raise SystemExit("human decision receipt is too large")
+        return raw, (opened.st_dev, opened.st_ino)
+    finally:
+        os.close(descriptor)
 
 
 def routing_profile_sha256(task: Dict[str, object]) -> str:
@@ -273,8 +301,9 @@ def health(root: Path, config: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def parse_receipt(path: Path, task: Dict[str, object], gate: str, artifact_sha256: str, source: str, maximum_age: int) -> Dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+def parse_receipt(path: Path, task: Dict[str, object], gate: str, artifact_sha256: str, source: str, maximum_age: int, raw: Optional[bytes] = None) -> Dict[str, object]:
+    content = raw if raw is not None else receipt_snapshot(path)[0]
+    value = json.loads(content.decode("utf-8"))
     if not isinstance(value, dict) or set(value) != FIELDS or value.get("schema") != SCHEMA:
         raise SystemExit("human decision receipt schema or fields are invalid")
     if (
@@ -287,7 +316,7 @@ def parse_receipt(path: Path, task: Dict[str, object], gate: str, artifact_sha25
         or value.get("routing_profile_sha256") != routing_profile_sha256(task)
         or value.get("authority") != "provider-signed-user-message"
         or not isinstance(value.get("decision_id"), str)
-        or not str(value.get("decision_id")).strip()
+        or DECISION_ID.fullmatch(str(value.get("decision_id"))) is None
         or HEX64.fullmatch(str(artifact_sha256)) is None
     ):
         raise SystemExit("human decision receipt does not bind the active gate, task and artifact")
@@ -306,23 +335,27 @@ def parse_receipt(path: Path, task: Dict[str, object], gate: str, artifact_sha25
 def verify(root: Path, config: Dict[str, object], task: Dict[str, object], *, gate: str, artifact_sha256: str, source: str, receipt: str, require_fresh: bool = True) -> Dict[str, object]:
     active_policy = policy(config)
     path = resolve_receipt(root, receipt)
+    raw, identity = receipt_snapshot(path)
     value = parse_receipt(
         path, task, gate, artifact_sha256, source,
-        int(active_policy.get("max_receipt_age_seconds", 0)) if require_fresh else 0,
+        int(active_policy.get("max_receipt_age_seconds", 0)) if require_fresh else 0, raw=raw,
     )
     adapter = adapter_path(root, active_policy.get("signed_adapter"))
-    digest = sha256(path)
+    digest = hashlib.sha256(raw).hexdigest()
     result = subprocess.run(
         [str(adapter), "verify", "--receipt", str(path)], cwd=str(root),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
     )
     if result.returncode or result.stdout.strip() != f"VERIFIED HUMAN DECISION sha256={digest}":
         raise SystemExit("provider-owned human decision adapter rejected the receipt")
+    after_raw, after_identity = receipt_snapshot(path)
+    if after_identity != identity or after_raw != raw:
+        raise SystemExit("human decision receipt changed during provider verification")
     return {
         "schema": SCHEMA,
         "path": str(path.relative_to(root.resolve())),
         "sha256": digest,
-        "bytes": len(path.read_bytes()),
+        "bytes": len(raw),
         "decision_id": value["decision_id"],
         "authority": value["authority"],
         "adapter_path": str(adapter),

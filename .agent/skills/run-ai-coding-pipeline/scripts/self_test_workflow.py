@@ -122,6 +122,7 @@ def task(mode: str, node: int, accepted: list[int]) -> dict[str, object]:
     value.update({
         "schema": "agent-task/v2", "title": f"{mode} fixture", "mode": mode,
         "task_type": "maintenance", "complexity": "small" if mode == "fast" else "bounded",
+        "projection": "lightweight-release" if mode == "release" else "lightweight",
         "files": 1 if mode == "fast" else 3,
         "environment": "local", "deployment_requested": False, "branch": "unversioned",
         "status": "in_progress",
@@ -1539,6 +1540,32 @@ print('VERIFIED PLATFORM SNAPSHOT sha256=' + hashlib.sha256(snapshot.read_bytes(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.chmod(0o644)
         target.write_bytes(data)
+    # The adversarial matrix above can legitimately outlive the gate's bounded
+    # preflight window on slower installed-project runs. Mint a fresh real
+    # preflight/live chain for the unchanged restored candidate rather than
+    # weakening production receipt age validation or replaying stale evidence.
+    refreshed_fingerprint = workflow_candidate_fingerprint(
+        root, json.loads((root / ".agent/config.json").read_text(encoding="utf-8")),
+    )
+    refreshed_preflight = subprocess.run([
+        sys.executable, ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+        "preflight", "--runner", runner_path, "--receipt", preflight_path,
+        "--environment", "local", "--authority", "default",
+        "--candidate-sha256", refreshed_fingerprint,
+    ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if refreshed_preflight.returncode:
+        raise AssertionError("refreshed release preflight failed\n" + refreshed_preflight.stdout)
+    refreshed_gate = subprocess.run([
+        sys.executable, ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+        "run", "--runner", runner_path, "--receipt", live_path,
+        "--integrator-receipt", integrator_receipt_path,
+        "--preflight-receipt", preflight_path,
+    ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if refreshed_gate.returncode:
+        raise AssertionError("refreshed release gate failed\n" + refreshed_gate.stdout)
+    restored_release = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    report = acceptance(root, "release", restored_release, receipt(root, live_path))
+    report_digest = digest(root / report)
     run(root, "submit-gate", "--gate", "acceptance", "--artifact", report)
     run(root, "approve-gate", "--gate", "acceptance", "--source", "user:fixture", "--artifact-sha256", report_digest, expected=1)
     approved_report=json.loads((root/report).read_text(encoding="utf-8"))
@@ -1910,6 +1937,9 @@ print('local approval shape probes OK')
     )
     if ledger_init.returncode:
         raise AssertionError(f"ledger re-init for the lightweight task failed\n{ledger_init.stdout}")
+    light_before_advance = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    if light_before_advance.get("current_node") != 2:
+        raise AssertionError(f"lightweight fixture drifted before projection: {light_before_advance.get('current_node')}")
     run(root, "advance", "--node", "6", "--artifact", light_impl)
     light = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
     if light["accepted_nodes"] != list(range(7)) or light["current_node"] != 7:

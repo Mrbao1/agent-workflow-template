@@ -1,0 +1,30 @@
+{
+  "schema": "agent-skill-policy/v1",
+  "allowed_hosts": [
+    "github.com"
+  ],
+  "allowed_licenses": [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0"
+  ],
+  "minimum_score": 55,
+  "maximum_candidates": 24,
+  "maximum_skill_bytes": 262144,
+  "maximum_license_bytes": 131072,
+  "github_request_budget": 30,
+  "maximum_recommendation_age_hours": 168,
+  "minimum_evolution_samples": 5,
+  "minimum_evolution_success_rate": 0.6,
+  "weights": {
+    "relevance": 0.35,
+    "quality": 0.15,
+    "maintenance": 0.15,
+    "security": 0.2,
+    "trust": 0.1,
+    "license": 0.05
+  }
+}

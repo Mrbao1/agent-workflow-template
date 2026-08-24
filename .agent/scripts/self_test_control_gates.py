@@ -489,7 +489,7 @@ with tempfile.TemporaryDirectory(prefix="workflow-hot-state-") as raw:
 with tempfile.TemporaryDirectory(prefix="fast-route-") as raw:
     root = Path(raw); scripts = root / ".agent/scripts"; state = root / ".agent/state"
     scripts.mkdir(parents=True); state.mkdir(parents=True)
-    for name in ("agentctl.py", "contextctl.py", "contexttx.py", "templatectl.py", "humandecision.py", "workflowctl.py"):
+    for name in ("agentctl.py", "adaptive_common.py", "skillctl.py", "contextctl.py", "contexttx.py", "templatectl.py", "humandecision.py", "workflowctl.py"):
         shutil.copy2(SOURCE / "scripts" / name, scripts / name)
     copy_policy_runtime(root, scripts)
     shutil.copytree(SOURCE / "assets", root / ".agent/assets")

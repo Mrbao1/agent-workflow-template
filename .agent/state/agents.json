@@ -40,25 +40,21 @@
     "human_verification_required": true,
     "signed_adapter": null
   },
-  "epoch": "81db2bd15329e6389850ccab9366104a87e7564f76070974927789026961dcbc",
+  "epoch": "14d2bea3b4413dd1c707001c737ce66ea8123f83e9d228a83b39c40f6868179a",
   "members": [],
   "prepared_dispatches": [],
   "capacity_failures": [],
   "replay_runs": [],
   "token_accounting": {
     "schema": "agent-child-token-accounting/v1",
-    "token_budget": 48000,
+    "token_budget": 96000,
     "settled_tokens": 0
   },
   "task_payload_schema": "agent-task-payload/v2",
-  "last_platform_snapshot": {
-    "path": ".agent/state/evidence/platform-snapshots/5c63096f832e07c4e47e93f193aea30ca6f1ef6422f246604680d6074a0a6be1.json",
-    "sha256": "5c63096f832e07c4e47e93f193aea30ca6f1ef6422f246604680d6074a0a6be1",
-    "bytes": 108
-  },
-  "platform_empty_verified": true,
+  "last_platform_snapshot": null,
+  "platform_empty_verified": false,
   "migration_source": null,
-  "updated_at": "2026-07-31T09:13:09+00:00",
-  "revision": 2,
-  "prev_sha256": "e5f8565c53d2d4c9533d83484170d50fc8c8591f5faf0dada68f24aa3eab9616"
+  "updated_at": "2026-08-24T08:27:10+00:00",
+  "revision": 3,
+  "prev_sha256": "74fd2a685dc0ee6f79bf25e17f6b457c6c60b86059b2236a49ee2ef33e08a721"
 }

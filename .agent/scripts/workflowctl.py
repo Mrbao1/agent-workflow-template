@@ -698,7 +698,19 @@ def update_stage(task: Dict[str, object]) -> None:
 def adapter(task: Dict[str, object]):
     config=load(AGENT_DIR/"config.json"); registry=config.get("acceptance_adapters",{})
     selected=[name for name in task.get("selected_templates",[]) if isinstance(registry,dict) and name in registry]
-    if len(selected)!=1: raise SystemExit("release requires exactly one selected acceptance adapter")
+    if not selected:
+        adaptive=task.get("template_route",{}).get("adaptive_project",{}) if isinstance(task.get("template_route"),dict) else {}
+        digest=adaptive.get("blueprint_sha256") if isinstance(adaptive,dict) else None
+        blueprint=AGENT_DIR/"project/BLUEPRINT.json"; runner=AGENT_DIR/"scripts/blueprintacceptance.py"
+        if not digest or not blueprint.is_file() or blueprint.is_symlink() or not runner.is_file() or runner.is_symlink():
+            raise SystemExit("release requires one legacy adapter or a confirmed blueprint acceptance contract")
+        result=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/blueprintctl.py"),"--root",str(ROOT),"check","--require-confirmed","--expect-design-sha256",digest],
+                              cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30,env=supervised_env())
+        if result.returncode: raise SystemExit("confirmed blueprint acceptance contract is stale")
+        raw=blueprint.read_bytes()
+        return "adaptive-blueprint",{"implemented":True,"runner":str(runner.relative_to(ROOT)),"receipt_schema":"agent-blueprint-acceptance/v2"},{
+            "template_id":"adaptive-blueprint","path":str(blueprint.relative_to(ROOT)),"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw)}
+    if len(selected)!=1: raise SystemExit("release selects multiple legacy acceptance adapters")
     adapter_id=selected[0]; entry=registry[adapter_id]
     if not isinstance(entry,dict) or entry.get("implemented") is not True: raise SystemExit(f"selected acceptance adapter is unavailable: {adapter_id}")
     runner=(ROOT/str(entry.get("runner",""))).resolve()

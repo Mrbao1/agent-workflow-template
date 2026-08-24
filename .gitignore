@@ -8,3 +8,7 @@ __pycache__/
 outputs/
 .idea/
 .agent/state/evidence/
+.agent/project/provider-mutation-journal.json
+**/.provider-stage-*
+**/.provider-quarantine-*
+**/.provider-rollback-*
