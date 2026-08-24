@@ -422,6 +422,14 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
 """.encode()
     (root / ".agent/policies/PROJECT_GUARDRAILS.md").write_bytes(fixture_guardrails)
     config["guardrails_ready"] = True
+    # The generic fresh template intentionally leaves CI/release branch choices
+    # empty; this production fixture supplies its own confirmed branch design.
+    config["branches"] = {"local": ["feature/*"], "test": ["release/*"], "production": ["main"]}
+    config["environments"] = {
+        "local": {"deploy_allowed": False, "deploy_required": False, "human_approval": False},
+        "test": {"deploy_allowed": True, "deploy_required": False, "human_approval": False},
+        "production": {"deploy_allowed": True, "deploy_required": True, "human_approval": True},
+    }
     config["project_initialization"] = {
         "schema": "agent-project-initialization/v1",
         "guardrails_sha256": hashlib.sha256(fixture_guardrails).hexdigest(),

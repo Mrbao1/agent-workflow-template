@@ -56,6 +56,11 @@ def fresh_project(root: Path, *, delivery: bool = False) -> Path:
     if delivery:
         shutil.copy2(DELIVERY_SOURCE, scripts / "deliveryctl.py")
     shutil.copy2(CONFIG_SOURCE, root / ".agent/config.json")
+    if delivery:
+        config_path = root / ".agent/config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["branches"] = {"local": ["feature/*"], "test": ["release/*"], "production": ["main"]}
+        write_json(config_path, config)
     write_json(state / "EVIDENCE_INDEX.json", {
         "schema": "agent-evidence-index/v2", "archives": [], "archive_page": None, "updated_at": None,
     })

@@ -147,7 +147,7 @@ def main() -> int:
         task = json.loads((target / ".agent/state/TASK.json").read_text(encoding="utf-8"))
         agents = json.loads((target / ".agent/state/agents.json").read_text(encoding="utf-8"))
         if (
-            config.get("project") != {"name": "isolation-fixture", "type": "software-project"}
+            config.get("project") != {"name": "isolation-fixture", "type": "general-project"}
             or config.get("guardrails_ready") is not False
             or config.get("project_initialization") is not None
             or task.get("status") != "idle" or task.get("requirements_clarified") is not False
@@ -300,12 +300,38 @@ def main() -> int:
         check_newer = run(sys.executable, str(installer), str(newer), "--check", cwd=polluted, expected=(3,))
         if "TARGET NEWER" not in check_newer.stdout or tree(newer) != newer_before:
             raise SystemExit("--check did not flag a newer target with its distinct exit code")
-        downgraded = run(
-            sys.executable, str(installer), str(newer), "--update", "--allow-downgrade", cwd=polluted,
+        forced = run(
+            sys.executable, str(installer), str(newer), "--update", "--allow-downgrade", cwd=polluted, expected=(2,),
         )
-        if "WARNING" not in downgraded.stdout:
-            raise SystemExit("--allow-downgrade did not print a loud downgrade warning")
-        run(sys.executable, str(installer), str(newer), "--check", cwd=polluted)
+        if "reverse migrations are unsupported" not in forced.stdout or tree(newer) != newer_before:
+            raise SystemExit("--allow-downgrade bypassed the tested reverse-migration boundary")
+
+        # Unknown installed version syntax cannot be ordered safely. Both
+        # read-only checks and updates fail closed without changing any bytes.
+        unknown_version = workspace / "unknown-workflow-version"
+        run(
+            sys.executable, str(installer), str(unknown_version),
+            "--project-name", "unknown-version-fixture", cwd=polluted,
+        )
+        unknown_manifest_path = unknown_version / ".agent/.workflow-manifest.json"
+        for bad_value in ("3.2.1-rc.1", "v99.0.0", "99"):
+            unknown_manifest = json.loads(unknown_manifest_path.read_text(encoding="utf-8"))
+            unknown_manifest["version"] = bad_value
+            unknown_manifest["migration_version"] = 40
+            unknown_manifest_path.write_text(json.dumps(unknown_manifest, indent=2) + "\n", encoding="utf-8")
+            version_before = tree(unknown_version)
+            check_unknown = run(
+                sys.executable, str(installer), str(unknown_version), "--check",
+                cwd=polluted, expected=(3,),
+            )
+            if "TARGET VERSION INVALID" not in check_unknown.stdout or tree(unknown_version) != version_before:
+                raise SystemExit(f"--check did not reject unknown workflow version {bad_value!r} byte-for-byte")
+            update_unknown = run(
+                sys.executable, str(installer), str(unknown_version), "--update",
+                cwd=polluted, expected=(2,),
+            )
+            if "UPDATE REFUSED" not in update_unknown.stdout or tree(unknown_version) != version_before:
+                raise SystemExit(f"--update did not reject unknown workflow version {bad_value!r} byte-for-byte")
 
         # A malformed migration_version fails closed with a clean message and
         # never leaks an uncaught ValueError traceback or mutates the target.
@@ -421,6 +447,25 @@ def main() -> int:
         installer_spec = importlib.util.spec_from_file_location("workflow_installer", installer)
         installer_module = importlib.util.module_from_spec(installer_spec)
         installer_spec.loader.exec_module(installer_module)
+        rebind_fixture = workspace / "route-v39/.agent/state"
+        rebind_fixture.mkdir(parents=True)
+        (rebind_fixture / "TASK.json").write_text("{}\n", encoding="utf-8")
+        real_subprocess_run = installer_module.subprocess.run
+        rebind_calls = []
+        def fake_rebind_run(*args, **kwargs):
+            rebind_calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0] if args else [], 0, "VALID context capsule\n", "")
+        installer_module.subprocess.run = fake_rebind_run
+        try:
+            installer_module.finalize_active_context_binding(rebind_fixture.parent, 39)
+            if len(rebind_calls) != 1 or "migration-40-template-route-rebind" not in rebind_calls[0][0][0][2]:
+                raise SystemExit("v39 to v40 route migration skipped its final context rebind")
+            installer_module.finalize_active_context_binding(rebind_fixture.parent, 40)
+            if len(rebind_calls) != 1:
+                raise SystemExit("current migration unexpectedly rebuilt an unchanged context")
+        finally:
+            installer_module.subprocess.run = real_subprocess_run
+
         real_guard = installer_module.protected_external_adapter
         installer_module.protected_external_adapter = lambda owner, raw: True
         try:

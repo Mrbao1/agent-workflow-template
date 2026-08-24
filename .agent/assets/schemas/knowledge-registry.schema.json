@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-knowledge-registry/v1",
+  "title": "Project knowledge ownership registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "entries"
+  ],
+  "properties": {
+    "schema": {
+      "const": "agent-knowledge-registry/v1"
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "owners",
+          "tags",
+          "source_globs",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "path": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 512
+          },
+          "kind": {
+            "enum": [
+              "requirements",
+              "architecture",
+              "decision",
+              "operation",
+              "acceptance",
+              "governance",
+              "domain",
+              "other"
+            ]
+          },
+          "owners": {
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "tags": {
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "source_globs": {
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "minItems": 0
+          },
+          "status": {
+            "enum": [
+              "active",
+              "deprecated",
+              "superseded"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
