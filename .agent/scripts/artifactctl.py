@@ -104,22 +104,7 @@ def selected_adapter(task: Dict[str, object], errors: List[str]):
     config = load(AGENT / "config.json"); registry = config.get("acceptance_adapters", {})
     if not isinstance(registry, dict): errors.append("acceptance adapter registry is missing"); return None
     selected = [name for name in task.get("selected_templates", []) if name in registry]
-    if not selected:
-        adaptive = task.get("template_route", {}).get("adaptive_project", {}) if isinstance(task.get("template_route"), dict) else {}
-        digest = adaptive.get("blueprint_sha256") if isinstance(adaptive, dict) else None
-        blueprint = AGENT / "project/BLUEPRINT.json"; runner = AGENT / "scripts/blueprintacceptance.py"
-        if not digest or not blueprint.is_file() or blueprint.is_symlink() or not runner.is_file() or runner.is_symlink():
-            errors.append("release requires one legacy adapter or a confirmed blueprint acceptance contract"); return None
-        result = subprocess.run([sys.executable, str(AGENT / "scripts/blueprintctl.py"), "--root", str(ROOT), "check", "--require-confirmed", "--expect-design-sha256", digest],
-                                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=supervised_env())
-        if result.returncode:
-            errors.append("confirmed blueprint acceptance contract is stale"); return None
-        raw = blueprint.read_bytes()
-        return "adaptive-blueprint", {"implemented": True, "runner": str(runner.relative_to(ROOT)), "receipt_schema": "agent-blueprint-acceptance/v2"}, {
-            "template_id": "adaptive-blueprint", "path": str(blueprint.relative_to(ROOT)),
-            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
-        }
-    if len(selected) != 1: errors.append("release selects multiple legacy acceptance adapters"); return None
+    if len(selected) != 1: errors.append("release requires exactly one selected acceptance adapter"); return None
     adapter_id = selected[0]; entry = registry[adapter_id]
     if not isinstance(entry, dict) or entry.get("implemented") is not True: errors.append(f"selected adapter is not implemented: {adapter_id}"); return None
     runner = (ROOT / str(entry.get("runner", ""))).resolve()
@@ -636,9 +621,6 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
     if value.get("status") != "ready_for_human_review" or value.get("human_decision") != "pending":
         errors.append("release node 7 decision state is invalid")
     config = load(AGENT / "config.json")
-    adapter_registry = config.get("acceptance_adapters", {}) if isinstance(config.get("acceptance_adapters"), dict) else {}
-    adaptive_route = task.get("template_route", {}).get("adaptive_project", {}) if isinstance(task.get("template_route"), dict) else {}
-    adaptive_release = not any(item in adapter_registry for item in task.get("selected_templates", [])) and bool(adaptive_route.get("blueprint_sha256"))
     expected_clean_replays = config.get("routing", {}).get("modes", {}).get("release", {}).get("clean_reruns")
     if expected_clean_replays != 1:
         errors.append("release clean replay policy must be exactly one")
@@ -787,17 +769,9 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
                     errors.append("integrator replay window is temporally reversed")
                 for index, record in enumerate(replay_records):
                     path = result_record(record, errors, f"integrator clean replay {index}")
-                    if adaptive_release and path:
-                        adaptive_receipt = load(path)
-                        replay_id = adaptive_receipt.get("receipt_sha256")
-                        if adaptive_receipt.get("schema") != "agent-blueprint-acceptance/v2" or not SHA.fullmatch(str(replay_id or "")):
-                            errors.append(f"integrator clean replay {index} is not an adaptive acceptance receipt")
-                            replay_id = None
-                        replay_ids.append(replay_id)
-                    else:
-                        replay_ids.append(verify_test_receipt(
-                            path, errors, f"integrator clean replay {index}", replay_window_start, replay_window_end,
-                        ) if path else None)
+                    replay_ids.append(verify_test_receipt(
+                        path, errors, f"integrator clean replay {index}", replay_window_start, replay_window_end,
+                    ) if path else None)
                 if len(replay_records) != expected_clean_replays or None in replay_ids or len(set(replay_ids)) != expected_clean_replays:
                     errors.append("integrator clean replay does not match the one-run release policy")
                 if len({item.get("source_path") for item in replay_records}) != expected_clean_replays or len({item.get("sha256") for item in replay_records}) != expected_clean_replays:
@@ -851,21 +825,8 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
         if live.get("schema") != entry.get("receipt_schema"): errors.append("live gate receipt schema differs from adapter registry")
         if entry.get("receipt_schema") == "workflow-release-gate/v4" and live.get("integrator_test_receipt") != integrator_gate_source:
             errors.append("workflow live gate is not bound to the selected integrator's one replay")
-        if adapter_id == "adaptive-blueprint" and (len(selected_members) < 3 or live.get("integrator_id") != str(selected_members[2].get("id"))):
-            errors.append("adaptive live gate is not bound to the selected verified integrator identity")
-        if adapter_id == "adaptive-blueprint" and value.get("live_gate_receipt") != integrator_gate_source:
-            errors.append("adaptive live gate receipt is not the selected integrator's marker-bound result evidence")
-        if adapter_id == "adaptive-blueprint" and live.get("requires_integrator_ledger_binding") is not True:
-            errors.append("adaptive live gate integrator-ledger binding requirement is invalid")
-        verify_command = [sys.executable, str(ROOT / entry["runner"]), "verify", "--runner", str(rendered["path"]), "--receipt", str(value["live_gate_receipt"]["path"])]
-        if adapter_id == "adaptive-blueprint":
-            candidate_sha256 = task.get("node_artifacts", {}).get("6", {}).get("sha256")
-            if not isinstance(candidate_sha256, str) or len(candidate_sha256) != 64:
-                errors.append("adaptive live gate lacks the current implementation candidate digest")
-            else:
-                verify_command += ["--candidate-sha256", candidate_sha256]
         result = subprocess.run(
-            verify_command,
+            [sys.executable, str(ROOT / entry["runner"]), "verify", "--runner", str(rendered["path"]), "--receipt", str(value["live_gate_receipt"]["path"])],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
             env=supervised_env(),
         )

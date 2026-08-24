@@ -29,7 +29,6 @@ import time
 
 
 SELF_TESTS = (
-    ".agent/scripts/self_test_adaptive_workflow.py",
     ".agent/scripts/self_test_budget_context_gates.py",
     ".agent/scripts/self_test_control_gates.py",
     ".agent/scripts/self_test_evidence_retention.py",

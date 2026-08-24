@@ -237,7 +237,7 @@
       "source": "orchestrator-user-message",
       "automatic_gate_trust": false,
       "human_verification_required": true,
-      "allow_current_chat_local_release": true,
+      "allow_current_chat_local_release": false,
       "signed_adapter": null,
       "max_receipt_age_seconds": 900
     },

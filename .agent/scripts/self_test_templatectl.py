@@ -40,8 +40,6 @@ def fixture(root: Path, clarified: bool) -> None:
     (root / ".agent/templates").mkdir(parents=True, exist_ok=True)
     (root / ".agent/state/artifacts").mkdir(parents=True, exist_ok=True)
     shutil.copy2(SOURCE_AGENT / "scripts/templatectl.py", root / ".agent/scripts/templatectl.py")
-    shutil.copy2(SOURCE_AGENT / "scripts/adaptive_common.py", root / ".agent/scripts/adaptive_common.py")
-    shutil.copy2(SOURCE_AGENT / "scripts/skillctl.py", root / ".agent/scripts/skillctl.py")
     shutil.copy2(SOURCE_AGENT / "scripts/contextctl.py", root / ".agent/scripts/contextctl.py")
     shutil.copy2(SOURCE_AGENT / "scripts/contexttx.py", root / ".agent/scripts/contexttx.py")
     shutil.copy2(SOURCE_AGENT / "scripts/agentctl.py", root / ".agent/scripts/agentctl.py")
@@ -263,11 +261,11 @@ def fixture(root: Path, clarified: bool) -> None:
 MODE_BUDGETS = {"fast": 16000, "standard": 48000, "release": 96000}
 
 
-def mode_fixture(root: Path, mode: str, task_type: str, *, sync_context: bool = True) -> None:
+def mode_fixture(root: Path, mode: str, task_type: str) -> None:
     """Clarified fixture over the REAL template manifest for route regressions."""
     (root / ".agent/scripts").mkdir(parents=True, exist_ok=True)
     (root / ".agent/state/artifacts").mkdir(parents=True, exist_ok=True)
-    for script in ("templatectl.py", "adaptive_common.py", "skillctl.py", "blueprintctl.py", "blueprintacceptance.py", "contextctl.py", "contexttx.py", "agentctl.py", "humandecision.py", "workflowctl.py"):
+    for script in ("templatectl.py", "contextctl.py", "contexttx.py", "agentctl.py", "humandecision.py", "workflowctl.py"):
         shutil.copy2(SOURCE_AGENT / "scripts" / script, root / ".agent/scripts" / script)
     shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib", dirs_exist_ok=True)
     shutil.copytree(SOURCE_AGENT / "templates", root / ".agent/templates", dirs_exist_ok=True)
@@ -378,183 +376,10 @@ def mode_fixture(root: Path, mode: str, task_type: str, *, sync_context: bool = 
         },
     }
     write_json(root / ".agent/state/TASK.json", task)
-    if sync_context:
-        context = subprocess.run(
-            [
-                sys.executable, ".agent/scripts/contextctl.py", "sync",
-                "--reason", "fixture", "--summary", f"{mode} {task_type} route fixture",
-                "--source-tokens", "1800",
-            ],
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if context.returncode:
-            raise SystemExit(context.stdout)
-
-
-def canonical_sha256(value: object) -> str:
-    return hashlib.sha256(json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-    ).encode()).hexdigest()
-
-
-def secure_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.chmod(0o700)
-
-
-def secure_json(path: Path, value: object) -> None:
-    secure_directory(path.parent)
-    write_json(path, value)
-    path.chmod(0o600)
-
-
-def adaptive_route_fixture(root: Path, capability_id: str) -> tuple[str, str, Path, dict[str, object]]:
-    """Add one confirmed project capability and one fully verified dynamic Skill."""
-    mode_fixture(root, "release", "governance", sync_context=False)
-
-    config_path = root / ".agent/config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["agent_control"] = {"human_decision_observer": {
-        "source": "orchestrator-user-message",
-        "automatic_gate_trust": False,
-        "human_verification_required": True,
-        "allow_current_chat_local_release": True,
-        "signed_adapter": None,
-        "max_receipt_age_seconds": 900,
-    }}
-    secure_json(config_path, config)
-
-    task_path = root / ".agent/state/TASK.json"
-    task = json.loads(task_path.read_text(encoding="utf-8"))
-    task["decision_policy_version"] = 2
-    secure_json(task_path, task)
-
-    # templatectl imports skillctl, whose default policy lives under assets. The
-    # route fixture intentionally copies that managed policy instead of inventing
-    # a weaker project policy.
-    policy_path = root / ".agent/assets/policies/skill-policy.json"
-    secure_directory(policy_path.parent)
-    shutil.copy2(SOURCE_AGENT / "assets/policies/skill-policy.json", policy_path)
-    policy_path.chmod(0o600)
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-
-    design = {
-        "goals": ["Route a user-confirmed project capability"],
-        "architecture": ["Project capability execution is supplied by a locked dynamic Skill"],
-        "technology_choices": [],
-        "capabilities": [{"id": capability_id, "description": "project-defined release verification"}],
-        "constraints": ["Dynamic Skill bytes remain content-addressed and offline-verifiable"],
-        "acceptance": [{"id": "project-release", "criterion": "The confirmed project release route is selected"}],
-        "commands": [{
-            "id": "project-release-check", "argv": ["python3", "--version"],
-            "stage": "acceptance", "timeout_seconds": 30, "covers": ["project-release"], "environment": ["PATH"],
-        }],
-        "providers": [],
-    }
-    blueprint_sha256 = canonical_sha256(design)
-    source = "user:confirmed arbitrary project capability"
-    blueprint = {
-        "schema": "agent-project-blueprint/v1",
-        "status": "confirmed",
-        "design": design,
-        "suggestions": [],
-        "confirmation": {
-            "source": source,
-            "design_sha256": blueprint_sha256,
-            "confirmed_at": "2026-01-01T00:00:00+00:00",
-            "decision_receipt": {
-                "source": source,
-                "artifact_sha256": blueprint_sha256,
-                "assurance": "explicit-user-message;local-only;not-provider-verified",
-                "routing_profile_sha256": canonical_sha256({
-                    key: task.get(key) for key in (
-                        "task_type", "complexity", "mode", "files", "environment",
-                        "deployment_requested", "branch", "risk_flags",
-                    )
-                }),
-            },
-        },
-    }
-    blueprint_path = root / ".agent/project/BLUEPRINT.json"
-    secure_json(blueprint_path, blueprint)
-
-    skill_id = "fixture-project-release"
-    skill_files = {
-        "LICENSE.txt": b"MIT License\n\nCopyright fixture\n",
-        "SKILL.md": (
-            "---\nname: fixture-project-release\n"
-            "description: Verify the project-defined release capability.\n---\n"
-            f"# {capability_id}\n\nExecute project-defined release verification.\n"
-        ).encode(),
-    }
-    file_records = [
-        {"path": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "mode": "100600"}
-        for name, raw in sorted(skill_files.items())
-    ]
-    bundle_sha256 = canonical_sha256({"files": file_records})
-    for bundle_root in (
-        root / ".agent/project/skill-cas" / bundle_sha256,
-        root / ".agent/project/skills" / skill_id,
-    ):
-        secure_directory(bundle_root)
-        for name, raw in skill_files.items():
-            target = bundle_root / name
-            target.write_bytes(raw)
-            target.chmod(0o600)
-
-    action = {
-        "candidate": skill_id, "candidate_sha256": "b" * 64, "bundle_sha256": bundle_sha256,
-        "approved_capabilities": [capability_id],
-        "candidate_provenance": {"mode": "offline-user-reviewed", "source": "fixture-reviewed-catalog"},
-    }
-    action_sha256 = canonical_sha256(action)
-    skill_source = "user:approved exact fixture Skill bytes"
-    entry = {
-        "id": skill_id,
-        "status": "active",
-        "source": {
-            "host": "github.com", "owner": "fixture", "repository": "fixture-skill",
-            "repository_id": 1, "commit": "a" * 40, "path": "skills/fixture/SKILL.md",
-            "provenance_mode": "offline-user-reviewed", "provenance_source": "fixture-reviewed-catalog",
-        },
-        "license": {"spdx": "MIT", "sha256": file_records[0]["sha256"]},
-        "candidate_sha256": "b" * 64,
-        "recommendation_sha256": "c" * 64,
-        "blueprint_sha256": blueprint_sha256,
-        "score": 100.0,
-        "matched_capabilities": [capability_id],
-        "bundle_sha256": bundle_sha256,
-        "files": file_records,
-        "installed_at": "2026-01-01T00:00:00+00:00",
-        "decision": {
-            "gate": "adaptive-skill-install",
-            "source": skill_source,
-            "action_sha256": action_sha256,
-            "action": action,
-            "receipt": {
-                "source": skill_source,
-                "artifact_sha256": action_sha256,
-                "assurance": "explicit-user-message;local-only;not-provider-verified",
-                "routing_profile_sha256": blueprint["confirmation"]["decision_receipt"]["routing_profile_sha256"],
-            },
-        },
-    }
-    lock = {
-        "schema": "agent-skills-lock/v1",
-        "blueprint_sha256": blueprint_sha256,
-        "policy_sha256": canonical_sha256(policy),
-        "skills": [entry],
-        "lock_sha256": None,
-    }
-    lock["lock_sha256"] = canonical_sha256({key: value for key, value in lock.items() if key != "lock_sha256"})
-    secure_json(root / ".agent/project/skills.lock.json", lock)
     context = subprocess.run(
         [
             sys.executable, ".agent/scripts/contextctl.py", "sync",
-            "--reason", "fixture", "--summary", "adaptive release route fixture",
+            "--reason", "fixture", "--summary", f"{mode} {task_type} route fixture",
             "--source-tokens", "1800",
         ],
         cwd=root,
@@ -564,7 +389,6 @@ def adaptive_route_fixture(root: Path, capability_id: str) -> tuple[str, str, Pa
     )
     if context.returncode:
         raise SystemExit(context.stdout)
-    return blueprint_sha256, str(lock["lock_sha256"]), blueprint_path, lock
 
 
 def main() -> int:
@@ -653,8 +477,7 @@ def main() -> int:
             raise SystemExit(f"unexpected deterministic route: {task['selected_templates']}")
         route_receipt = task.get("template_route", {})
         if (
-            route_receipt.get("schema") != "agent-template-route/v3"
-            or route_receipt.get("adaptive_project") != {"blueprint_sha256": None, "skills_lock_sha256": None, "project_capabilities": []}
+            route_receipt.get("schema") != "agent-template-route/v2"
             or route_receipt.get("task_type") != task.get("task_type")
             or route_receipt.get("projection") != "lightweight-release"
             or not route_receipt.get("sha256")
@@ -1241,80 +1064,6 @@ def main() -> int:
             raise SystemExit(f"standard lightweight route regressed: {task['selected_templates']}")
         if task.get("next_action") != "render routed artifacts and complete projected nodes 2-6":
             raise SystemExit("standard lightweight route left a stale reroute next_action")
-
-    # Existing domain capability IDs are project choices, not compatibility
-    # built-ins. Each must fail closed without a confirmed blueprint.
-    domain_capabilities = ("frontend", "backend", "ios", "docker")
-    with tempfile.TemporaryDirectory(prefix="templatectl-domain-no-blueprint-") as raw:
-        root = Path(raw)
-        mode_fixture(root, "standard", "feature")
-        for capability_id in domain_capabilities:
-            require_failure(
-                root, f"domain-capability-without-blueprint-{capability_id}",
-                "route", "--capability", capability_id,
-            )
-
-    # A confirmed blueprint alone is insufficient: the active Skill bytes must
-    # still match the verified lock for every pre-existing domain capability.
-    for capability_id in domain_capabilities:
-        with tempfile.TemporaryDirectory(prefix=f"templatectl-domain-unverified-{capability_id}-") as raw:
-            root = Path(raw)
-            adaptive_route_fixture(root, capability_id)
-            active_skill = root / ".agent/project/skills/fixture-project-release/SKILL.md"
-            active_skill.unlink()
-            require_failure(
-                root, f"domain-capability-with-unverified-skill-{capability_id}",
-                "route", "--capability", capability_id,
-            )
-
-    # A confirmed blueprint may introduce any stable project capability ID. Its
-    # release route is authorized by the blueprint acceptance contract and a
-    # verified dynamic Skill, not by the legacy acceptance-adapter registry.
-    with tempfile.TemporaryDirectory(prefix="templatectl-adaptive-route-") as raw:
-        root = Path(raw)
-        capability_id = "project-defined-release-47"
-        blueprint_sha256, lock_sha256, blueprint_path, lock = adaptive_route_fixture(root, capability_id)
-        routed = invoke(root, "route", "--capability", capability_id)
-        if routed.returncode:
-            raise SystemExit(f"confirmed arbitrary capability did not route:\n{routed.stdout}")
-        task_path = root / ".agent/state/TASK.json"
-        task = json.loads(task_path.read_text(encoding="utf-8"))
-        adaptive = task.get("template_route", {}).get("adaptive_project")
-        if (
-            task.get("template_route", {}).get("schema") != "agent-template-route/v3"
-            or adaptive != {
-                "blueprint_sha256": blueprint_sha256,
-                "skills_lock_sha256": lock_sha256,
-                "project_capabilities": [capability_id],
-            }
-            or any(item.startswith("acceptance-") for item in task.get("selected_capabilities", []))
-        ):
-            raise AssertionError(f"adaptive release route lost blueprint/Skill binding: {task.get('template_route')}")
-
-        adapter_probe = subprocess.run([
-            sys.executable, "-c",
-            "import json,sys;sys.path.insert(0,'.agent/scripts');import workflowctl;"
-            "task=json.load(open('.agent/state/TASK.json'));print(workflowctl.adapter(task)[0])",
-        ], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if adapter_probe.returncode or adapter_probe.stdout.strip() != "adaptive-blueprint":
-            raise AssertionError(f"release gate did not select generic blueprint acceptance: {adapter_probe.stdout}")
-
-        confirmed_blueprint = json.loads(blueprint_path.read_text(encoding="utf-8"))
-        reopened = {**confirmed_blueprint, "status": "draft", "confirmation": None}
-        secure_json(blueprint_path, reopened)
-        require_failure(
-            root, "reopened-blueprint", "route", "--capability", capability_id,
-        )
-        secure_json(blueprint_path, confirmed_blueprint)
-
-        lock_path = root / ".agent/project/skills.lock.json"
-        drifted_lock = json.loads(json.dumps(lock))
-        drifted_lock["skills"][0]["score"] = 99.0
-        secure_json(lock_path, drifted_lock)
-        require_failure(
-            root, "dynamic-skill-lock-drift", "route", "--capability", capability_id,
-        )
-        secure_json(lock_path, lock)
 
     print("TEMPLATECTL SELF-TEST PASSED")
     return 0

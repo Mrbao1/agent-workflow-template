@@ -4,15 +4,8 @@
 from pathlib import Path
 import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 
-VERSION="3.2.0"
-MIGRATION_VERSION=40
-CANONICAL_ACCEPTANCE_ADAPTERS={
-    "acceptance-workflow":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"workflow-release-gate/v4"},
-    "acceptance-web-docker":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_live_release_gate.py","receipt_schema":"acceptance-live-gate/v2"},
-    "acceptance-api":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"local-command-release-gate/v1"},
-    "acceptance-cli":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"local-command-release-gate/v1"},
-    "acceptance-ios":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"local-command-release-gate/v1"},
-}
+VERSION="3.1.48"
+MIGRATION_VERSION=39
 MANAGED=("INDEX.md","scripts","skills","templates","workflows","assets","capabilities")
 MANAGED_FILES=("knowledge/INDEX.md",)
 FRESH_STATE_RELATIVE=Path("assets")/"fresh-state"/"v1"
@@ -177,16 +170,15 @@ def canonical_sha256(value):
 
 def version_triplet(value):
     if not isinstance(value,str): return None
-    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",value) is None: return None
     parts=value.split(".")
+    if len(parts)!=3 or any(not part.isdigit() for part in parts): return None
     return tuple(int(part) for part in parts)
 
 
 def version_relation(installed,current):
-    """Compare strict numeric versions and reject unknown installed syntax."""
+    """Three-way semantic comparison; unparseable versions keep legacy equality semantics."""
     left,right=version_triplet(installed),version_triplet(current)
-    if left is None: return "invalid_installed"
-    if right is None: raise RuntimeError("template workflow version is invalid")
+    if left is None or right is None: return "same" if installed==current else "target_older"
     if left>right: return "target_newer"
     if left<right: return "target_older"
     return "same"
@@ -1115,19 +1107,19 @@ def migrate_active_loaded_references(destination,prior_install,prior_migration):
 def finalize_active_context_binding(destination,prior_migration):
     """Bind the capsule to the final post-migration task invariant."""
     task=json.loads((destination/"state/TASK.json").read_text(encoding="utf-8"))
-    if prior_migration>=MIGRATION_VERSION: return
+    if prior_migration>=39: return
     # Earlier migration steps were individually validated before they changed
     # canonical task state.  Rebuild one ordinary verified checkpoint only
     # after every state migration has settled, preserving its facts and risks.
     reason=(
         "migration-34-final-state-rebind"
         if prior_migration<34
-        else ("migration-39-budget-resume-rebind" if prior_migration<39 else "migration-40-template-route-rebind")
+        else "migration-39-budget-resume-rebind"
     )
     source=(
         "installer-verified-context-efficiency-migration"
         if prior_migration<34
-        else ("installer-verified-budget-resume-migration" if prior_migration<39 else "installer-verified-template-route-migration")
+        else "installer-verified-budget-resume-migration"
     )
     probe=f"""
 import argparse,hashlib,json,sys
@@ -1656,18 +1648,27 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
     if prior_migration<24:
         config["context_transport"]=defaults["context_transport"]
     adapters=config.setdefault("acceptance_adapters",{})
-    if not isinstance(adapters,dict):
-        raise RuntimeError("project acceptance adapter registry must be an object")
-    # Technology adapters are optional compatibility entries. A release may use
-    # the generic user-confirmed blueprint acceptance contract instead.
-    for name,current in adapters.items():
-        if not isinstance(name,str) or not name or not isinstance(current,dict) or set(current)!={"implemented","runner","receipt_schema"}:
-            raise RuntimeError(f"project acceptance adapter is invalid: {name}")
-        if not isinstance(current.get("implemented"),bool) or not isinstance(current.get("runner"),str) or not current["runner"] or not isinstance(current.get("receipt_schema"),str) or not current["receipt_schema"]:
-            raise RuntimeError(f"project acceptance adapter implementation contract is invalid: {name}")
-        canonical = CANONICAL_ACCEPTANCE_ADAPTERS.get(name)
-        if canonical is None or current != canonical:
-            raise RuntimeError(f"project acceptance adapter is not a canonical digest-managed built-in: {name}")
+    expected_workflow=defaults["acceptance_adapters"]["acceptance-workflow"]
+    expected_web=defaults["acceptance_adapters"]["acceptance-web-docker"]
+    legacy_workflow={
+        "implemented":True,
+        "runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+        "receipt_schema":"workflow-release-gate/v3",
+    }
+    legacy_web={
+        "implemented":True,
+        "runner":".agent/skills/run-full-chain-acceptance/scripts/run_live_release_gate.py",
+        "receipt_schema":"acceptance-live-gate/v1",
+    }
+    if prior_migration<25:
+        if adapters.get("acceptance-workflow") not in (legacy_workflow,expected_workflow):
+            raise RuntimeError("project workflow acceptance adapter differs from the known migration-22/25 contracts")
+        if adapters.get("acceptance-web-docker") not in (legacy_web,expected_web):
+            raise RuntimeError("project Web/Docker acceptance adapter differs from the known migration-22/25 contracts")
+        adapters["acceptance-workflow"]=expected_workflow
+        adapters["acceptance-web-docker"]=expected_web
+    elif adapters.get("acceptance-workflow")!=expected_workflow or adapters.get("acceptance-web-docker")!=expected_web:
+        raise RuntimeError("project acceptance adapters differ from the migration-25 contract")
     validate_retention_policy(config)
     validate_context_transport_policy(config)
     config.setdefault("agent_control",{}).pop("interrupt_after_unchanged_checks",None)
@@ -1689,25 +1690,6 @@ def migrate_private(source,destination,agent_platform_snapshot=None,project_root
     atomic_json(config_path,config)
     validate_project_guardrails(destination)
     task=json.loads(task_path.read_text(encoding="utf-8")); task_defaults=json.loads((seed/"state/TASK.json").read_text(encoding="utf-8"))
-    if prior_migration<40 and task.get("status") not in {"idle",None}:
-        route=task.get("template_route")
-        if route is None:
-            pass  # Very old active tasks remain explicitly unrouted until a reviewed reroute.
-        elif not isinstance(route,dict):
-            raise RuntimeError("active task migration-40 requires a valid template route or null")
-        elif route.get("schema")=="agent-template-route/v2":
-            expected={"schema","task_type","projection","mode","capabilities","templates","requirement_contract_sha256","manifest_sha256","sha256"}
-            if set(route)!=expected or route.get("sha256")!=canonical_sha256({key:route[key] for key in route if key!="sha256"}):
-                raise RuntimeError("active task migration-40 requires an intact v2 route receipt")
-            old_route_sha=route["sha256"]
-            migrated={**route,"schema":"agent-template-route/v3","adaptive_project":{"blueprint_sha256":None,"skills_lock_sha256":None,"project_capabilities":[]},"sha256":None}
-            migrated["sha256"]=canonical_sha256({key:migrated[key] for key in migrated if key!="sha256"})
-            task["template_route"]=migrated
-            for record in task.get("rendered_artifacts",[]):
-                if isinstance(record,dict) and record.get("route_sha256")==old_route_sha:
-                    record["route_sha256"]=migrated["sha256"]
-        elif route.get("schema")!="agent-template-route/v3":
-            raise RuntimeError("active task migration-40 supports only v2/v3 route receipts")
     if task.get("status") not in {"idle",None}:
         required={"deployment_requested","current_node","accepted_nodes","node_artifacts","pending_gate_artifacts","metrics","budget_state","usage_receipts","selected_capabilities","template_route","rendered_artifacts"}
         if not required.issubset(task): raise RuntimeError("active task needs an explicit state migration before workflow update")
@@ -1974,20 +1956,16 @@ def execute(args,source_root,target):
         return 2
     wanted,plugin_wanted,wanted_entry,entry_digest=source_contract(source_root)
     installed=manifest(manifest_path,required=True)
-    relation=version_relation(installed.get("version"),VERSION)
-    if relation=="invalid_installed":
-        reason=f"installed workflow version {installed.get('version')!r} is not strict numeric N.N.N"
-        if args.check:
-            print(f"TARGET VERSION INVALID: {reason}; install a template that recognizes this version"); return 3
-        print(f"UPDATE REFUSED: {reason}; unknown versions cannot be safely upgraded or downgraded"); return 2
-    if relation=="target_newer" or installed_migration_version(installed)>MIGRATION_VERSION:
+    if version_relation(installed.get("version"),VERSION)=="target_newer" or installed_migration_version(installed)>MIGRATION_VERSION:
         reason=(
             f"installed workflow {installed.get('version')} (migration {installed.get('migration_version')}) "
             f"is newer than template {VERSION} (migration {MIGRATION_VERSION})"
         )
         if args.check:
             print(f"TARGET NEWER: {reason}; a newer template is required"); return 3
-        print(f"UPDATE REFUSED: {reason}; reverse migrations are unsupported; restore a complete older snapshot instead"); return 2
+        if not args.allow_downgrade:
+            print(f"UPDATE REFUSED: {reason}; a newer template is required (or pass --allow-downgrade to force a downgrade)"); return 2
+        print(f"WARNING: --allow-downgrade forces a downgrade: {reason}")
     writes,removes,conflicts=plan_agent_update(wanted,installed,destination)
     agents_write,agents_conflicts=plan_bootstrap(target/"AGENTS.md","AGENTS.md")
     claude_write,claude_conflicts=plan_bootstrap(target/"CLAUDE.md","CLAUDE.md")
@@ -2025,7 +2003,7 @@ def execute(args,source_root,target):
 
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument("target"); parser.add_argument("--project-name","--name",dest="project_name"); parser.add_argument("--project-type","--type",dest="project_type",default="general-project"); parser.add_argument("--agent-platform-snapshot"); parser.add_argument("--human-decision-adapter"); parser.add_argument("--provider-preflight-adapter"); parser.add_argument("--allow-current-chat-local-release",action="store_true"); parser.add_argument("--allow-downgrade",action="store_true"); parser.add_argument("--guardrails-file")
+    parser=argparse.ArgumentParser(); parser.add_argument("target"); parser.add_argument("--project-name","--name",dest="project_name"); parser.add_argument("--project-type","--type",dest="project_type",default="software-project"); parser.add_argument("--agent-platform-snapshot"); parser.add_argument("--human-decision-adapter"); parser.add_argument("--provider-preflight-adapter"); parser.add_argument("--allow-current-chat-local-release",action="store_true"); parser.add_argument("--allow-downgrade",action="store_true"); parser.add_argument("--guardrails-file")
     mode=parser.add_mutually_exclusive_group(); mode.add_argument("--check",action="store_true"); mode.add_argument("--update",action="store_true"); mode.add_argument("--adopt",action="store_true"); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
     if args.guardrails_file and (args.check or args.update or args.adopt):
         parser.error("--guardrails-file is valid only for a new install; installed projects use agentctl.py project-init")

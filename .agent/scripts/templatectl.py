@@ -15,8 +15,6 @@ import tempfile
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import contexttx
-from adaptive_common import AdaptiveError, load_blueprint
-from skillctl import load_lock, load_policy
 from workflowlib.state import task_projection
 
 
@@ -51,18 +49,6 @@ CAPABILITY_DEPENDENCIES = {
 }
 CI_PROVIDER_CAPABILITIES = {"ci-provider-github": "github"}
 CONTEXT_TRANSPORT_CAPABILITY = "context-transport-pxpipe"
-GENERIC_COMPATIBILITY_CAPABILITIES = frozenset({
-    "core",
-    "delivery",
-    "multi-agent",
-    "ci-provider-github",
-    "context-transport-pxpipe",
-    "acceptance-web-docker",
-    "acceptance-api",
-    "acceptance-cli",
-    "acceptance-ios",
-    "acceptance-workflow",
-})
 NODE_ACCEPTANCE_RELEASE_VARS = {
     "release_review_chain",
     "release_scenario_receipt_sha256",
@@ -253,10 +239,7 @@ def enforce_budget(action: str) -> None:
 
 
 def normalize_capabilities(raw: Iterable[str]) -> List[str]:
-    supplied = [str(value) for value in raw if str(value)]
-    if any(re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", item) is None for item in supplied):
-        raise SystemExit("capabilities must use stable lowercase IDs")
-    capabilities = {"core", *supplied}
+    capabilities = {"core", *(str(value) for value in raw if str(value))}
     changed = True
     while changed:
         changed = False
@@ -267,60 +250,16 @@ def normalize_capabilities(raw: Iterable[str]) -> List[str]:
     return sorted(capabilities)
 
 
-def generic_compatibility_capabilities() -> set[str]:
-    """Return only stack-neutral control and explicit legacy adapter IDs."""
-    return set(GENERIC_COMPATIBILITY_CAPABILITIES)
-
-
-def adaptive_route_binding(task: Dict[str, object], capabilities: List[str]) -> Dict[str, object]:
-    compatibility = generic_compatibility_capabilities()
-    project_capabilities = sorted(set(capabilities) - compatibility)
-    static_acceptance = [item for item in capabilities if item.startswith(ACCEPTANCE_PREFIX) and item in compatibility]
-    needs_blueprint = bool(project_capabilities) or (task.get("mode") == "release" and not static_acceptance)
-    if not needs_blueprint:
-        return {"blueprint_sha256": None, "skills_lock_sha256": None, "project_capabilities": []}
-    try:
-        blueprint = load_blueprint(ROOT, require_confirmed=True)
-        configured = {item["id"] for item in blueprint["design"]["capabilities"]}
-        unknown = set(project_capabilities) - configured
-        if unknown:
-            raise SystemExit(f"project capabilities are absent from the confirmed blueprint: {sorted(unknown)}")
-        policy = load_policy(ROOT)
-        lock = load_lock(ROOT, blueprint, policy, required=bool(project_capabilities))
-        if lock["skills"] and (lock["blueprint_sha256"] != blueprint["confirmation"]["design_sha256"] or lock["policy_sha256"] != object_sha256(policy)):
-            raise SystemExit("dynamic Skill lock does not bind the current blueprint and policy")
-    except AdaptiveError as error:
-        raise SystemExit(f"adaptive project route is invalid: {error.code}: {error}") from error
-    if project_capabilities:
-        active_coverage = {
-            capability for skill in lock["skills"] if skill["status"] == "active"
-            for capability in skill["matched_capabilities"]
-        }
-        uncovered = set(project_capabilities) - active_coverage
-        if uncovered:
-            raise SystemExit(f"project capabilities lack an active verified Skill: {sorted(uncovered)}")
-    return {
-        "blueprint_sha256": blueprint["confirmation"]["design_sha256"],
-        "skills_lock_sha256": lock["lock_sha256"] if lock["skills"] else None,
-        "project_capabilities": project_capabilities,
-    }
-
-
 def verify_ci_provider(capabilities: List[str]) -> None:
     selected = [item for item in capabilities if item in CI_PROVIDER_CAPABILITIES]
     if len(selected) > 1:
         raise SystemExit("exactly one CI provider capability may be selected")
 
 
-def verify_acceptance_capability(task: Dict[str, object], capabilities: List[str], adaptive: Dict[str, object]) -> None:
-    acceptance = [
-        item for item in capabilities
-        if item.startswith(ACCEPTANCE_PREFIX) and item in generic_compatibility_capabilities()
-    ]
-    if task.get("mode") == "release" and len(acceptance) != 1 and adaptive.get("blueprint_sha256") is None:
-        raise SystemExit("release mode must select one legacy adapter or a confirmed blueprint acceptance contract")
-    if len(acceptance) > 1:
-        raise SystemExit("at most one legacy acceptance adapter may be selected")
+def verify_acceptance_capability(task: Dict[str, object], capabilities: List[str]) -> None:
+    acceptance = [item for item in capabilities if item.startswith(ACCEPTANCE_PREFIX)]
+    if task.get("mode") == "release" and len(acceptance) != 1:
+        raise SystemExit("release mode must select exactly one acceptance adapter capability")
     registry = load(CONFIG_PATH).get("acceptance_adapters", {})
     if not isinstance(registry, dict):
         registry = {}
@@ -605,9 +544,9 @@ def expected_route(task: Dict[str, object], capabilities: List[str]) -> List[str
     return ordered
 
 
-def route_receipt(task: Dict[str, object], capabilities: List[str], selected: List[str], manifest_sha256: str, adaptive: Dict[str, object]) -> Dict[str, object]:
+def route_receipt(task: Dict[str, object], capabilities: List[str], selected: List[str], manifest_sha256: str) -> Dict[str, object]:
     base: Dict[str, object] = {
-        "schema": "agent-template-route/v3",
+        "schema": "agent-template-route/v2",
         "mode": task.get("mode"),
         "task_type": task.get("task_type"),
         "projection": task_projection(str(task.get("task_type")), str(task.get("mode"))),
@@ -615,7 +554,6 @@ def route_receipt(task: Dict[str, object], capabilities: List[str], selected: Li
         "templates": selected,
         "requirement_contract_sha256": task.get("requirement_contract_sha256"),
         "manifest_sha256": manifest_sha256,
-        "adaptive_project": adaptive,
     }
     return {**base, "sha256": object_sha256(base)}
 
@@ -659,7 +597,6 @@ def command_route(args: argparse.Namespace) -> int:
     _, manifest_sha256 = manifest_data()
     capabilities = normalize_capabilities(args.capability or [])
     verify_ci_provider(capabilities)
-    adaptive = adaptive_route_binding(task, capabilities)
     if CONTEXT_TRANSPORT_CAPABILITY in capabilities:
         if context_transport_policy().get("enabled") is not True:
             raise SystemExit("pxpipe plugin capability is disabled; availability is not installation or user opt-in")
@@ -667,9 +604,9 @@ def command_route(args: argparse.Namespace) -> int:
     prior = task.get("selected_capabilities", [])
     action = "reroute-existing" if isinstance(prior, list) and set(capabilities).issubset(set(prior)) else "route-templates"
     enforce_budget(action)
-    verify_acceptance_capability(task, capabilities, adaptive)
+    verify_acceptance_capability(task, capabilities)
     selected = expected_route(task, capabilities)
-    receipt = route_receipt(task, capabilities, selected, manifest_sha256, adaptive)
+    receipt = route_receipt(task, capabilities, selected, manifest_sha256)
     previous_records = task.get("rendered_artifacts", [])
     records = [
         record for record in previous_records
@@ -806,17 +743,15 @@ def template_state_errors(task: Dict[str, object], require_rendered: bool = True
     if capabilities != normalized:
         errors.append("selected_capabilities are not normalized or dependency-complete")
     try:
-        adaptive = adaptive_route_binding(task, normalized)
-        verify_acceptance_capability(task, normalized, adaptive)
+        verify_acceptance_capability(task, normalized)
         expected = expected_route(task, normalized)
     except SystemExit as error:
         errors.append(str(error))
         expected = []
-        adaptive = {"blueprint_sha256": None, "skills_lock_sha256": None, "project_capabilities": []}
     selected = task.get("selected_templates")
     if selected != expected:
         errors.append("selected_templates differ from the deterministic manifest route")
-    expected_receipt = route_receipt(task, normalized, expected, manifest_sha256, adaptive)
+    expected_receipt = route_receipt(task, normalized, expected, manifest_sha256)
     if task.get("template_route") != expected_receipt:
         errors.append("template route receipt is missing, stale or not hash-bound")
     records = task.get("rendered_artifacts")
@@ -894,7 +829,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     route = sub.add_parser("route")
-    route.add_argument("--capability", action="append")
+    route.add_argument(
+        "--capability", action="append",
+        choices=("frontend", "backend", "ios", "docker", "ci-provider-github", "delivery", "multi-agent",
+                 "context-transport-pxpipe", "acceptance-web-docker", "acceptance-api", "acceptance-cli",
+                 "acceptance-ios", "acceptance-workflow"),
+    )
     render = sub.add_parser("render")
     render.add_argument("--id", required=True)
     render.add_argument("--output", required=True)
