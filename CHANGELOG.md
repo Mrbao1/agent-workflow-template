@@ -5,6 +5,13 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-08-29
+
+### Fixed
+
+- Same-migration patch updates now validate an existing active context before mutation and rebind its checkpoint after managed policy bytes change, so a v4.0.0 active task remains valid after updating to v4.0.1.
+- Candidate-evidence CI no longer depends on separately managed protected-authority variables: GitHub no longer duplicates the complete matrix for an equivalent tag push, serializes all three contexts within eight bounded OS/toolchain/shard jobs, and caps parallelism at four; GitLab uses the verified online `hk-cluster-devops-cicd` Linux/amd64 shared Runner in two sharded jobs instead of scheduling 24 jobs per ref against unavailable untagged and host-specific Runner pools. Missing external authority remains unavailable/pending rather than being fabricated, and generated release verification still fails closed without its authenticated provider receipt.
+
 ## [4.0.0] - 2026-08-25
 
 ### Added
@@ -95,5 +102,6 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 - Removed stale runtime evidence, generated reports, IDE metadata, and the obsolete
   remediation plan from the release tree.
 
-[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.1...HEAD
+[4.0.1]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/Mrbao1/agent-workflow-template/releases/tag/v4.0.0

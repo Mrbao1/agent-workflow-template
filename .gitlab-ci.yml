@@ -1,7 +1,5 @@
-# Candidate-owned pipeline evidence only; this file and every included job can be changed or shadowed by a merge request.
-# Required security/release authority MUST be a protected GitLab Pipeline Execution Policy or compliance pipeline
-# in an external protected project at AGENT_GITLAB_AUTHORITY_REF_SHA. Provider preflight must validate the
-# effective merged configuration and collision evidence digests below; no local/included job name is authority.
+# Candidate-owned test evidence only; success here is not protected release authority.
+# The external Pipeline Execution Policy/compliance verifier owns authority checks independently.
 stages:
   - verify
 
@@ -14,26 +12,19 @@ variables:
 candidate-selftest-evidence:
   stage: verify
   image: python:3.9.21-bookworm@sha256:ce9f7ea06625d0ef77a6a912811be999d90ca0e62920b93640f63f80ab97b5dc
+  tags: [hk-cluster-devops-cicd]
   interruptible: true
-  timeout: 35m
+  timeout: 60m
   parallel:
     matrix:
       - SHARD: ["1/2", "2/2"]
-        CONTEXT: ["idle-source", "polluted-source", "installed-project"]
-        TOOLCHAIN: ["minimum"]
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
   before_script:
-    - |
-      case "${AGENT_GITLAB_AUTHORITY_MODE:-}" in pipeline-execution-policy|compliance-pipeline) ;; *) echo "missing protected external GitLab authority mode" >&2; exit 2;; esac
-      printf '%s' "${AGENT_GITLAB_AUTHORITY_PROJECT_ID:-}" | grep -Eq '^[1-9][0-9]{0,19}$' || { echo "invalid external authority project" >&2; exit 2; }
-      printf '%s' "${AGENT_GITLAB_AUTHORITY_REF_SHA:-}" | grep -Eq '^[0-9a-f]{40}$' || { echo "external authority ref is not immutable" >&2; exit 2; }
-      printf '%s' "${AGENT_GITLAB_EFFECTIVE_CONFIG_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$' || { echo "missing effective merged config evidence" >&2; exit 2; }
-      printf '%s' "${AGENT_GITLAB_COLLISION_EVIDENCE_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$' || { echo "missing collision evidence" >&2; exit 2; }
-      test "$(uname -s)" = Linux
-      test "$(uname -m)" = x86_64
+    - test "$(uname -s)" = Linux
+    - test "$(uname -m)" = x86_64
+    - |-
       python3 - <<'PY'
       from pathlib import Path
       import hashlib
@@ -73,7 +64,12 @@ candidate-selftest-evidence:
               raise SystemExit("Node archive member is unreadable")
           destination = Path(".ci-bin/node")
           destination.parent.mkdir(mode=0o755, exist_ok=True)
-          destination.write_bytes(source.read())
+          with destination.open("wb") as output:
+              while True:
+                  chunk = source.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  output.write(chunk)
           destination.chmod(0o755)
       archive.unlink()
       PY
@@ -82,9 +78,12 @@ candidate-selftest-evidence:
     - node --version
     - git --version
   script:
-    - export PATH="$CI_PROJECT_DIR/.ci-bin:$PATH"
     - mkdir -m 700 .ci-home
-    - env -i PATH="$CI_PROJECT_DIR/.ci-bin:/usr/local/bin:/usr/bin:/bin" HOME="$CI_PROJECT_DIR/.ci-home" LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 python3 tests/run_all.py --context "$CONTEXT" --shard "$SHARD" --test-timeout 600 --require-command python --require-command node --require-command git --fail-on-skip --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py --report "outputs/gitlab-self-suite-${TOOLCHAIN}-${CONTEXT}-${CI_NODE_INDEX}.json"
+    - |-
+      set -eu
+      for context in idle-source polluted-source installed-project; do
+        env -i PATH="$CI_PROJECT_DIR/.ci-bin:/usr/local/bin:/usr/bin:/bin" HOME="$CI_PROJECT_DIR/.ci-home" LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 python3 tests/run_all.py --context "$context" --shard "$SHARD" --test-timeout 600 --require-command python --require-command node --require-command git --fail-on-skip --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py --report "outputs/gitlab-self-suite-minimum-$context-$CI_NODE_INDEX.json"
+      done
   after_script:
     - rm -rf -- .ci-bin .ci-home .ci-node.tar.xz
   artifacts:
@@ -92,52 +91,3 @@ candidate-selftest-evidence:
     expire_in: 14 days
     paths:
       - outputs/gitlab-self-suite-*.json
-
-.gitlab-host-toolchain-matrix:
-  stage: verify
-  parallel:
-    matrix:
-      - CONTEXT: ["idle-source", "polluted-source", "installed-project"]
-        SHARD: ["1/2", "2/2"]
-  variables:
-    PYTHONDONTWRITEBYTECODE: "1"
-    PYTHONUNBUFFERED: "1"
-  script:
-    - python3 -c 'import os,sys; expected=(int(os.environ["EXPECTED_PY_MAJOR"]),int(os.environ["EXPECTED_PY_MINOR"])); raise SystemExit(0 if sys.version_info[:2]==expected and sys.platform==os.environ["EXPECTED_PLATFORM"] else 1)'
-    - node -e 'if (process.version !== "v" + process.env.EXPECTED_NODE) process.exit(1)'
-    - python3 tests/run_all.py --context "$CONTEXT" --shard "$SHARD" --test-timeout 600 --require-command python --require-command node --require-command git --fail-on-skip --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py --report "outputs/gitlab-self-suite-${TOOLCHAIN}-${EXPECTED_PLATFORM}-${CONTEXT}-${CI_NODE_INDEX}.json"
-  artifacts:
-    when: always
-    expire_in: 14 days
-    paths:
-      - outputs/gitlab-self-suite-*.json
-
-candidate-selftest-modern-linux-evidence:
-  extends: .gitlab-host-toolchain-matrix
-  tags: [linux-modern-python313-node22]
-  variables:
-    TOOLCHAIN: modern-pinned
-    EXPECTED_PLATFORM: linux
-    EXPECTED_PY_MAJOR: "3"
-    EXPECTED_PY_MINOR: "13"
-    EXPECTED_NODE: "22.18.0"
-
-candidate-selftest-minimum-macos-evidence:
-  extends: .gitlab-host-toolchain-matrix
-  tags: [macos-14-python39-node20]
-  variables:
-    TOOLCHAIN: minimum
-    EXPECTED_PLATFORM: darwin
-    EXPECTED_PY_MAJOR: "3"
-    EXPECTED_PY_MINOR: "9"
-    EXPECTED_NODE: "20.19.4"
-
-candidate-selftest-modern-macos-evidence:
-  extends: .gitlab-host-toolchain-matrix
-  tags: [macos-14-python313-node22]
-  variables:
-    TOOLCHAIN: modern-pinned
-    EXPECTED_PLATFORM: darwin
-    EXPECTED_PY_MAJOR: "3"
-    EXPECTED_PY_MINOR: "13"
-    EXPECTED_NODE: "22.18.0"

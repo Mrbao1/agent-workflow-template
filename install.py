@@ -79,7 +79,7 @@ def assert_namespace_binding(target=None):
         if not stat.S_ISDIR(current.st_mode) or inode_identity(current)!=BOUND_TARGET_IDENTITY:
             raise RuntimeError("installer target root was replaced during the transaction")
 
-VERSION="4.0.0"
+VERSION="4.0.1"
 MIGRATION_VERSION=42
 CANONICAL_ACCEPTANCE_ADAPTERS={
     "acceptance-workflow":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"workflow-release-gate/v4"},
@@ -626,7 +626,7 @@ RELEASED_MANIFEST_METADATA={
     "agent-workflow-install/v1":{("3.1.40",32)},
     "agent-workflow-install/v3":{("3.1.41",34)},
     "agent-workflow-install/v4":{("3.1.42",35),("3.1.43",36),("3.1.46",38),("3.1.48",39),("3.2.0",40)},
-    "agent-workflow-install/v5":{(VERSION,MIGRATION_VERSION)},
+    "agent-workflow-install/v5":{("4.0.0",42),(VERSION,MIGRATION_VERSION)},
 }
 
 
@@ -2996,16 +2996,13 @@ def finalize_active_context_binding(source,destination,prior_migration,force=Fal
     # Earlier migration steps were individually validated before they changed
     # canonical task state.  Rebuild one ordinary verified checkpoint only
     # after every state migration has settled, preserving its facts and risks.
-    reason=(
-        "migration-34-final-state-rebind"
-        if prior_migration<34
-        else ("migration-39-budget-resume-rebind" if prior_migration<39 else ("migration-40-template-route-rebind" if prior_migration<40 else ("migration-41-provider-authority-rebind" if prior_migration<41 else "migration-42-scheduler-replay-rebind")))
-    )
-    transition_source=(
-        "installer-verified-context-efficiency-migration"
-        if prior_migration<34
-        else ("installer-verified-budget-resume-migration" if prior_migration<39 else ("installer-verified-template-route-migration" if prior_migration<40 else ("installer-verified-provider-authority-migration" if prior_migration<41 else "installer-verified-scheduler-replay-migration")))
-    )
+    same_migration_rebind=force and prior_migration>=MIGRATION_VERSION
+    reason=("release-managed-policy-rebind" if same_migration_rebind else (
+        "migration-34-final-state-rebind" if prior_migration<34
+        else ("migration-39-budget-resume-rebind" if prior_migration<39 else ("migration-40-template-route-rebind" if prior_migration<40 else ("migration-41-provider-authority-rebind" if prior_migration<41 else "migration-42-scheduler-replay-rebind")))))
+    transition_source=("installer-verified-release-policy-rebind" if same_migration_rebind else (
+        "installer-verified-context-efficiency-migration" if prior_migration<34
+        else ("installer-verified-budget-resume-migration" if prior_migration<39 else ("installer-verified-template-route-migration" if prior_migration<40 else ("installer-verified-provider-authority-migration" if prior_migration<41 else "installer-verified-scheduler-replay-migration")))))
     probe=f"""
 import argparse,hashlib,json,os,sys
 sys.path.insert(0,os.environ['AGENT_WORKFLOW_TRUSTED_SCRIPTS'])
@@ -3979,7 +3976,7 @@ def retire_verified_pxpipe_policy(destination,config,prior_install):
     return record
 
 
-def migrate_private(source,destination,plugin_provenance,project_root=None,idle_reseed=True,retire_pxpipe=False):
+def migrate_private(source,destination,plugin_provenance,project_root=None,idle_reseed=True,retire_pxpipe=False,policy_rebind=False):
     prior_install=manifest(destination/".workflow-manifest.json",required=True)
     prior_migration=installed_migration_version(prior_install)
     seed=fresh_state_seed(source)
@@ -4301,8 +4298,9 @@ def migrate_private(source,destination,plugin_provenance,project_root=None,idle_
     migrate_active_hot_state(source,destination,prior_migration)
     migrate_active_template_state(source,destination,prior_migration)
     migrate_active_loaded_references(destination,prior_install,prior_migration)
-    finalize_active_context_binding(source,destination,prior_migration,force=authority_revoked or activation_rebound)
-    if prior_migration<MIGRATION_VERSION or authority_revoked or activation_rebound:
+    rebind_context=authority_revoked or activation_rebound or policy_rebind
+    finalize_active_context_binding(source,destination,prior_migration,force=rebind_context)
+    if prior_migration<MIGRATION_VERSION or rebind_context:
         refresh_migrated_stage_index(source,destination)
     task=json.loads(read_installer_text(task_path,label="task state"))
     agents_path=destination/"state/agents.json"; agents_state=json.loads(read_installer_text(agents_path,label="agent ledger state"))
@@ -4402,7 +4400,7 @@ def validate_migration_feasibility(source,destination,installed,args,retire_pxpi
         candidate=project/".agent"; copy_private_tree(destination,candidate)
         write_managed(source,candidate,writes,removes)
         apply_file_modes(candidate,wanted_modes); apply_managed_directory_modes(candidate); apply_agent_root_mode(candidate)
-        migrate_private(source,candidate,plugin_provenance,project_root=project,idle_reseed=bool(writes or removes),retire_pxpipe=retire_pxpipe)
+        migrate_private(source,candidate,plugin_provenance,project_root=project,idle_reseed=bool(writes or removes),retire_pxpipe=retire_pxpipe,policy_rebind=bool(writes or removes))
 
 
 def validate_fresh_install_feasibility(source_root,target,args,guardrails_data,wanted,wanted_modes,plugin_wanted,entry_digest,plugin_provenance,agents_snapshot,claude_snapshot):
@@ -4738,11 +4736,12 @@ def execute(args,source_root,target):
         if writes or removes or directory_mode_drift or remove_legacy_plugin or marketplace_rewrite is not None or agents_write or claude_write or legacy_skill_v1_present(destination) or installed.get("version")!=VERSION or installed.get("migration_version")!=MIGRATION_VERSION or not manifest_matches_source:
             print(f"UPDATE AVAILABLE: writes={len(writes)} removes={len(removes)+int(remove_legacy_plugin)+int(marketplace_rewrite is not None)} bootstrap={int(agents_write or claude_write)} version={installed.get('version')}->{VERSION}"); return 1
         print(f"WORKFLOW CURRENT: {VERSION}"); return 0
+    if ((installed_migration_version(installed)<34 or installed_migration_version(installed)>=MIGRATION_VERSION)
+            and not legacy_skill_v1_present(destination)):
+        validate_legacy_active_context(source,destination)
     if args.dry_run:
         validate_migration_feasibility(source,destination,installed,args,retire_pxpipe=retire_pxpipe)
         print(f"DRY RUN update: writes={len(writes)} removes={len(removes)+int(remove_legacy_plugin)+int(marketplace_rewrite is not None)} directory_modes={len(directory_mode_drift)}"); return 0
-    if installed_migration_version(installed)<34:
-        validate_legacy_active_context(source,destination)
     retirement_receipt=None
     if retire_pxpipe:
         # Global user state is retired and durably receipted before the local
@@ -4767,7 +4766,7 @@ def execute(args,source_root,target):
         copy_private_tree(destination,candidate); apply_agent_root_mode(candidate)
         candidate_agents=stage_bootstrap(target,candidate_parent,"AGENTS.md",agents_trusted,snapshot=agents_snapshot)
         candidate_claude=stage_bootstrap(target,candidate_parent,"CLAUDE.md",claude_trusted,snapshot=claude_snapshot)
-        write_managed(source,candidate,writes,removes,removal_snapshots=removal_snapshots); apply_file_modes(candidate,wanted_modes); apply_managed_directory_modes(candidate); migrate_private(source,candidate,plugin_provenance,project_root=target,idle_reseed=bool(writes or removes),retire_pxpipe=retire_pxpipe)
+        write_managed(source,candidate,writes,removes,removal_snapshots=removal_snapshots); apply_file_modes(candidate,wanted_modes); apply_managed_directory_modes(candidate); migrate_private(source,candidate,plugin_provenance,project_root=target,idle_reseed=bool(writes or removes),retire_pxpipe=retire_pxpipe,policy_rebind=bool(writes or removes))
         atomic_json(candidate/".workflow-manifest.json",install_manifest(wanted,wanted_modes,plugin_wanted,entry_digest,plugin_provenance,sha(candidate_agents),sha(candidate_claude)))
         validate_candidate(candidate,wanted,wanted_modes,plugin_wanted,entry_digest,plugin_provenance,candidate_agents,candidate_claude)
         replacements=[(candidate,destination)]

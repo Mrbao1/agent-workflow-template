@@ -618,6 +618,55 @@ def main() -> int:
         if "provider-signed human decision receipt" not in no_archive_receipt.stdout or tree(model_fixture)!=active_before:
             raise SystemExit(f"active rollover without provider receipt failed incorrectly: {no_archive_receipt.stdout!r} mutated={tree(model_fixture)!=active_before}")
 
+        # A same-migration patch that changes managed policy bytes must first
+        # validate the existing active capsule and then rebind it to the final bytes.
+        patch_upgrade=workspace/"active-v400-policy-upgrade"
+        shutil.copytree(target,patch_upgrade,symlinks=True)
+        subprocess.run(["git","init","-q"],cwd=patch_upgrade,check=True)
+        subprocess.run(["git","checkout","-q","-b","fix/active-patch-upgrade"],cwd=patch_upgrade,check=True)
+        old_script=patch_upgrade/".agent/scripts/self_test_plugin_install_lifecycle.py"
+        old_bytes=old_script.read_bytes().replace(b'manifest.get("version")!="4.0.1"',b'manifest.get("version")!="4.0.0"')
+        if old_bytes==old_script.read_bytes(): raise SystemExit("active patch fixture did not downgrade one managed policy file")
+        old_script.write_bytes(old_bytes)
+        old_manifest_path=patch_upgrade/".agent/.workflow-manifest.json"
+        old_manifest=json.loads(old_manifest_path.read_text(encoding="utf-8"))
+        old_manifest["version"]="4.0.0"
+        old_manifest["agent_files"]["scripts/self_test_plugin_install_lifecycle.py"]=hashlib.sha256(old_bytes).hexdigest()
+        bind_v5_manifest_metadata(old_manifest)
+        old_manifest_path.write_text(json.dumps(old_manifest,indent=2)+"\n",encoding="utf-8")
+        fixture_rebind="""import sys
+sys.path.insert(0,'.agent/scripts')
+import contextctl
+context=contextctl.load_json(contextctl.CONTEXT_PATH)
+task=contextctl.load_json(contextctl.TASK_PATH)
+context['policy_bundle_sha256']=contextctl.policy_bundle_sha256(task)
+context['integrity']['content_sha256']='0'*64
+context['integrity']['content_sha256']=contextctl.content_sha256(context)
+contextctl.atomic_json(contextctl.CONTEXT_PATH,context)
+raise SystemExit(contextctl.validate_context(quiet=True))
+"""
+        run(sys.executable,"-I","-B","-c",fixture_rebind,cwd=patch_upgrade,env=no_bytecode)
+        run(sys.executable,".agent/scripts/agentctl.py","start","--model","vendor-alpha/model.patch","--title","active patch upgrade",cwd=patch_upgrade,env=no_bytecode)
+        before_patch_context=json.loads((patch_upgrade/".agent/state/CONTEXT.json").read_text(encoding="utf-8"))
+        drifted_patch=workspace/"active-v400-policy-upgrade-drifted"
+        shutil.copytree(patch_upgrade,drifted_patch,symlinks=True)
+        drifted_context_path=drifted_patch/".agent/state/CONTEXT.json"
+        drifted_context=json.loads(drifted_context_path.read_text(encoding="utf-8"))
+        drifted_context["phase_summary"]="tampered before same-migration patch update"
+        drifted_context_path.write_text(json.dumps(drifted_context,indent=2)+"\n",encoding="utf-8")
+        drifted_before=tree(drifted_patch)
+        refused_patch=run(sys.executable,str(installer),str(drifted_patch),"--update",cwd=polluted,expected=(1,))
+        if "active context has drift or corruption" not in refused_patch.stdout or tree(drifted_patch)!=drifted_before:
+            raise SystemExit("same-migration patch update did not prevalidate active context byte-for-byte")
+        run(sys.executable,str(installer),str(patch_upgrade),"--update",cwd=polluted)
+        run(sys.executable,".agent/scripts/contextctl.py","check","--quiet",cwd=patch_upgrade,env=no_bytecode)
+        run(sys.executable,str(installer),str(patch_upgrade),"--check",cwd=polluted)
+        after_patch_context=json.loads((patch_upgrade/".agent/state/CONTEXT.json").read_text(encoding="utf-8"))
+        if (after_patch_context.get("checkpoint",{}).get("sequence",0)<=before_patch_context.get("checkpoint",{}).get("sequence",0)
+                or after_patch_context.get("checkpoint",{}).get("reason")!="release-managed-policy-rebind"
+                or after_patch_context.get("policy_bundle_sha256")==before_patch_context.get("policy_bundle_sha256")):
+            raise SystemExit("active v4.0.0 patch update did not rebind the final managed policy bundle")
+
         # A durable commit marker is never interpreted as permission to undo
         # later drift. Recovery fails closed and preserves both bytes and journal.
         committed_fixture = workspace / "committed-project-init-drift"
@@ -1045,7 +1094,7 @@ def main() -> int:
         bound_manifest_path = bound_metadata / ".agent/.workflow-manifest.json"
         baseline_manifest = bound_manifest_path.read_bytes()
         for field, bad_value, expected_text in (
-            ("version", "4.0.1", "schema/version/migration combination is not a supported release"),
+            ("version", "4.0.2", "schema/version/migration combination is not a supported release"),
             ("migration_version", 41, "schema/version/migration combination is not a supported release"),
             ("schema", "agent-workflow-install/v6", "invalid workflow install manifest"),
         ):
@@ -1059,7 +1108,7 @@ def main() -> int:
                 if expected_text not in refused.stdout or tree(bound_metadata) != metadata_before:
                     raise SystemExit(f"v5 {field} tamper was not rejected byte-for-byte: {refused.stdout}")
             bound_manifest_path.write_bytes(baseline_manifest)
-        for field, bad_value in (("version", "4.0.1"), ("migration_version", 41)):
+        for field, bad_value in (("version", "4.0.2"), ("migration_version", 41)):
             candidate_manifest = json.loads(baseline_manifest)
             candidate_manifest[field] = bad_value
             bind_v5_manifest_metadata(candidate_manifest)
@@ -1806,9 +1855,13 @@ def main() -> int:
             installer_module.finalize_active_context_binding(polluted / ".agent", rebind_fixture.parent, 41)
             if len(rebind_calls) != 2 or "migration-42-scheduler-replay-rebind" not in " ".join(rebind_calls[1][0][0]):
                 raise SystemExit("v41 to v42 scheduler-replay migration skipped its final context rebind")
-            installer_module.finalize_active_context_binding(polluted / ".agent", rebind_fixture.parent, 42)
-            if len(rebind_calls) != 2:
+            installer_module.finalize_active_context_binding(polluted/".agent",rebind_fixture.parent,42)
+            if len(rebind_calls)!=2:
                 raise SystemExit("current migration unexpectedly rebuilt an unchanged context")
+            installer_module.finalize_active_context_binding(polluted/".agent",rebind_fixture.parent,42,force=True)
+            forced=" ".join(rebind_calls[2][0][0]) if len(rebind_calls)==3 else ""
+            if "release-managed-policy-rebind" not in forced or "installer-verified-release-policy-rebind" not in forced:
+                raise SystemExit("same-migration managed policy update skipped its final context rebind")
         finally:
             installer_module.run_installer_command = real_subprocess_run
 

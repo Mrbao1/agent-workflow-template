@@ -12,10 +12,12 @@ The checked-in, candidate-owned GitHub evidence matrix exercises the Cartesian p
 Every combination runs both shards across `idle-source`, `polluted-source`, and `installed-project`. Skips fail except the exact audited Docker-not-applicable self-test. This workflow is useful evidence only: a protected immutable external or protected-default-branch verifier must authenticate the candidate bytes and effective matrix before its independently named required check can authorize a release.
 
 Canonical GitLab CI runs both full-suite shards on a Linux/amd64 runner. It pins the
-Python 3.9.21 image by platform manifest digest and verifies the Node.js 20.19.4 archive
+Python 3.9.21 image by immutable multi-platform index digest and verifies the Node.js 20.19.4 archive
 against its published SHA-256 before extracting only the bounded `node` executable.
-The GitLab project must provide an untagged Linux/amd64 runner; runner availability is a
-protected project setting, not a stack default copied into adopter projects.
+This template repository's canonical GitLab project uses its verified tagged Linux/amd64
+shared pool, `hk-cluster-devops-cicd`; that tag is a deployment fact for this repository, not a
+stack default copied into adopter projects. Generated project CI uses only the runner selection
+confirmed in that project's Blueprint.
 
 The installer currently requires a POSIX host because it uses advisory file locking.
 Use Git, Python, and Node executables available on PATH; no package installation is
