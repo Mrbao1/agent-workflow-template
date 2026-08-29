@@ -348,7 +348,11 @@ def lifecycle_case():
                 if published.isdigit(): break
                 time.sleep(.01)
             assert published.isdigit(), "daemon fixture did not publish a PID"
-            daemon_pid=int(published); process.wait(timeout=2)
+            daemon_pid=int(published)
+            # Darwin deliberately exercises the already-reaped fail-closed path;
+            # Linux leaves the leader unreaped so subreaper cleanup stays bound.
+            if sys.platform.startswith("darwin"):
+                process.wait(timeout=2)
             code,timed_out,leak,residual,uncertain=blueprintacceptance.monitor_and_cleanup(
                 process,5,token,supported)
         if sys.platform.startswith("darwin"):

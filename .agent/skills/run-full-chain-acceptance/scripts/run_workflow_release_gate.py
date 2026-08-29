@@ -193,6 +193,10 @@ def execute(argv: List[str], timeout: int, token: str, profile: Dict[str, object
     started = now()
     environment={key:os.environ[key] for key in SAFE_COMMAND_ENVIRONMENT if key in os.environ}
     environment.setdefault("PATH",os.defpath); environment.setdefault("LANG","C"); environment.setdefault("LC_ALL","C")
+    # Python capability probes must remain read-only with respect to candidate
+    # bytes; otherwise a fresh checkout gains import caches after fingerprinting.
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
     environment["AGENT_FRESH_STATE_TOKEN"] = token
     environment["AGENT_EXECUTION_ENVIRONMENT"] = str(profile["environment"])
     environment["AGENT_EXECUTION_AUTHORITY"] = str(profile["authority"])

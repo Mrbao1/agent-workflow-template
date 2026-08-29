@@ -60,9 +60,9 @@
   "skill_activation": {
     "schema": "agent-task-skill-activation/v2",
     "path": ".agent/state/SKILL_ACTIVATION.json",
-    "sha256": "46797afda099396fa0eb5c32d8b86364481a4a39388eaa735da44535c463c742",
-    "bytes": 1381858,
-    "activation_sha256": "00ee7e447dc5e0042d343ab1d7ed0a72949da796d86d8de85f9d833c7b08e390",
+    "sha256": "0d6c21a1f75e81a9c90c4bec585089b094415d3c1f6689846bd0cb8a778f872e",
+    "bytes": 1382194,
+    "activation_sha256": "d84ab29ae4b3d79960bd4ccb2d5ceb2ad2058deeba39e6d7041f191fc9dcf8d2",
     "lock_sha256": null,
     "skill_ids": [],
     "builtin_skill_ids": [

@@ -115,6 +115,7 @@ RELEASED_PXPIPE_HELPER_SETS=(
  {"scripts/uninstall-codex-default.sh":"0f793ab6f3ee97942c4866bf1631ea929a2ee7512fe0bc39c4218110adc1f8e3","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
  {"scripts/uninstall-codex-default.sh":"30023f6db457710f4b7939946d384a1180c895ec28c65d7a7ca1aa7f7d468717","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
  {"scripts/uninstall-codex-default.sh":"221633419fa486d2ff6fe6ec934a299e6e6e3debfce79b0632a5242e564a3924","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
+ {"scripts/uninstall-codex-default.sh":"076a89041f46a0d1afbf8f620ca0bae468c1517a18e781f395584e51d23fe578","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
 )
 BOOTSTRAP_START="<!-- agent-workflow-bootstrap:start -->"
 BOOTSTRAP_END="<!-- agent-workflow-bootstrap:end -->"
@@ -3354,11 +3355,16 @@ def installer_signal_launch_session(process,known,requested,snapshot):
     if not members: return True
     try:
         if any(os.getsid(pid)!=process.pid for pid in members): return False
-    except (ProcessLookupError,OSError,PermissionError): return False
+    except ProcessLookupError:
+        # A short-lived member may exit between the two identity snapshots.
+        # The immediate exact-set check below accepts disappearance only; it
+        # still rejects every new or PID-reused group member.
+        pass
+    except (OSError,PermissionError): return False
     immediate=installer_process_snapshot()
     current={pid:identity for pid,(_parent,group,identity,state) in immediate.items()
              if group==process.pid and not state.startswith("Z")}
-    if current!=members: return False
+    if any(members.get(pid)!=identity for pid,identity in current.items()): return False
     try:
         if any(os.getsid(pid)!=process.pid for pid in current): return False
     except (ProcessLookupError,OSError,PermissionError): return False

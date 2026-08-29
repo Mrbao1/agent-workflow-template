@@ -216,17 +216,35 @@ matches_file() {
   safe_regular_file "$1" && safe_regular_file "$2" && /usr/bin/cmp -s -- "$1" "$2"
 }
 
+config_restore_probe() {
+  local target="$1" key="$2" pre="$ROLLBACK_DIR/$2" post="$ROLLBACK_DIR/post-$2" target_kind pre_kind post_kind
+  if [[ ! -e "$target" && ! -L "$target" ]]; then target_kind=missing
+  elif safe_regular_file "$target"; then target_kind=safe
+  else target_kind=unsafe; fi
+  if [[ ! -e "$pre" && ! -L "$pre" ]]; then pre_kind=missing
+  elif safe_regular_file "$pre"; then pre_kind=safe
+  else pre_kind=unsafe; fi
+  if [[ ! -e "$post" && ! -L "$post" ]]; then post_kind=missing
+  elif safe_regular_file "$post"; then post_kind=safe
+  else post_kind=unsafe; fi
+  echo "Config restore preflight mismatch: key=$key target=$target_kind pre=$pre_kind post=$post_kind pre_absent=$([[ -f "$pre.absent" ]] && echo yes || echo no) post_absent=$([[ -f "$post.absent" ]] && echo yes || echo no) target_matches_pre=$([[ "$target_kind" == safe && "$pre_kind" == safe ]] && /usr/bin/cmp -s -- "$target" "$pre" && echo yes || echo no) target_matches_post=$([[ "$target_kind" == safe && "$post_kind" == safe ]] && /usr/bin/cmp -s -- "$target" "$post" && echo yes || echo no)" >&2
+}
+
 preflight_config_restore() {
   local target="$1" key="$2" pre post
   pre="$ROLLBACK_DIR/$key"; post="$ROLLBACK_DIR/post-$key"
   if [[ -f "$pre.absent" ]]; then
     [[ ! -e "$target" && ! -L "$target" ]] && return 0
-    [[ -f "$post" && ! -L "$target" ]] && matches_file "$target" "$post"
-    return
+    [[ -f "$post" && ! -L "$target" ]] && matches_file "$target" "$post" && return 0
+    config_restore_probe "$target" "$key"; return 1
   fi
   matches_file "$target" "$pre" && return 0
-  if [[ -f "$post.absent" ]]; then [[ ! -e "$target" && ! -L "$target" ]]; return; fi
-  [[ -f "$post" ]] && matches_file "$target" "$post"
+  if [[ -f "$post.absent" ]]; then
+    [[ ! -e "$target" && ! -L "$target" ]] && return 0
+    config_restore_probe "$target" "$key"; return 1
+  fi
+  [[ -f "$post" ]] && matches_file "$target" "$post" && return 0
+  config_restore_probe "$target" "$key"; return 1
 }
 
 restore_config_path() {

@@ -374,10 +374,8 @@ class RunnerHardeningTests(unittest.TestCase):
             deadline = time.monotonic() + 3
             alive = True
             while alive and time.monotonic() < deadline:
-                try:
-                    os.kill(child_pid, 0)
-                except ProcessLookupError:
-                    alive = False
+                observed = RUNNER.process_snapshot().get(child_pid)
+                alive = observed is not None and not observed[3].startswith("Z")
                 if alive:
                     time.sleep(0.05)
             self.assertFalse(alive, f"timed-out descendant {child_pid} survived cleanup")
