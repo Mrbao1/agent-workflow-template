@@ -1,11 +1,11 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "4804c8f718350575240a3de8679b2a64294fd3c7bfb7144a1599aded7bda0dee",
+  "policy_bundle_sha256": "2fa289c0589d7aeffa52b206634183be1f624e50dc015247b5db4468285c3d4c",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "84f6db8ec9c22815f1ac55e58532d1bebb39c3072f541b872ddd767bff6159ae",
+  "task_invariant_sha256": "64e0f559cc454c2e39178696cd72638821cbb7209076ca168d99f3653372b9e9",
   "requirement_contract_sha256": "unapproved-draft",
   "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
@@ -27,7 +27,7 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "84f6db8ec9c22815f1ac55e58532d1bebb39c3072f541b872ddd767bff6159ae"
+    "task_invariant_sha256": "64e0f559cc454c2e39178696cd72638821cbb7209076ca168d99f3653372b9e9"
   },
   "checkpoint": {
     "sequence": 1,
@@ -43,7 +43,7 @@
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
     "checkpoint_sequence": 1,
-    "task_invariant_sha256": "84f6db8ec9c22815f1ac55e58532d1bebb39c3072f541b872ddd767bff6159ae",
+    "task_invariant_sha256": "64e0f559cc454c2e39178696cd72638821cbb7209076ca168d99f3653372b9e9",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
@@ -87,6 +87,6 @@
     "status": "verified",
     "verified_at": "2026-08-24T21:50:23+00:00",
     "source": "template-uninitialized",
-    "content_sha256": "614caf7cb5a4518ea9bd0aed9f66f6a23b83501755469e2c84ff9d3e6417f6da"
+    "content_sha256": "e14c3ed6adf40af75e1868c648e448702a56ebfec4c041ea8b227928f92c3f95"
   }
 }

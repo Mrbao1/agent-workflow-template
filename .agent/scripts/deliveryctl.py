@@ -182,7 +182,9 @@ def production_provider_target(task: Dict[str, object]) -> Dict[str, object]:
         or not all(str(value.get(key, "")).strip() for key in (
             "provider", "repository", "default_branch", "test_environment", "production_environment",
         ))
-        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(value.get("repository", "")))
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){1,15}", str(value.get("repository", "")))
+        or len(str(value.get("repository", "")).encode("utf-8")) > 512
+        or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", str(value.get("provider", "")))
         or not branch_allowed(str(value.get("default_branch", "")), "production")
         or not isinstance(checks, list) or not checks
         or len(set(checks)) != len(checks)
@@ -279,13 +281,16 @@ def provider_receipt_file(raw: str):
 def valid_required_check_authority(item: object, provider: object) -> bool:
     if not isinstance(item, dict):
         return False
+    provider_id = str(provider)
+    actor_id_pattern = (r"[1-9][0-9]{0,19}" if provider_id in {"github", "gitlab"}
+                        else r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,255}")
     producer = item.get("producer_identity")
     authority = item.get("external_authority")
     if (not isinstance(producer, dict)
             or set(producer) != {"identity_type", "subject", "issuer", "provider_actor_id"}
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{2,255}", str(producer.get("subject", "")))
             or not re.fullmatch(r"https://[^\s]+", str(producer.get("issuer", "")))
-            or not re.fullmatch(r"[1-9][0-9]{0,19}", str(producer.get("provider_actor_id", "")))
+            or not re.fullmatch(actor_id_pattern, str(producer.get("provider_actor_id", "")))
             or not isinstance(authority, dict)
             or set(authority) != {"kind", "authority_id", "immutable_ref", "evidence_sha256"}
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{2,127}", str(authority.get("authority_id", "")))
@@ -305,7 +310,10 @@ def valid_required_check_authority(item: object, provider: object) -> bool:
             str(authority.get("immutable_ref", "")),
         ) if authority.get("kind") in {"gitlab-pipeline-execution-policy", "gitlab-compliance-pipeline"} else None
         return producer.get("identity_type") in {"gitlab-user", "gitlab-service-account"} and immutable is not None
-    return False
+    return (re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", provider_id) is not None
+            and re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", str(producer.get("identity_type", ""))) is not None
+            and authority.get("kind") == "generic-protected-policy"
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{7,255}", str(authority.get("immutable_ref", ""))) is not None)
 
 
 def parse_provider_preflight(

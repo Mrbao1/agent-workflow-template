@@ -297,24 +297,29 @@ with tempfile.TemporaryDirectory(prefix="provider-authority-proof-") as raw:
     })
 
     def authority_environment(provider: str) -> dict:
+        generic = provider not in {"github", "gitlab"}
+        project_id = "project:550e8400-e29b-41d4-a716-446655440000" if generic else "71"
+        authority_kind = ("github-external-workflow" if provider == "github" else
+                          "gitlab-pipeline-execution-policy" if provider == "gitlab" else
+                          "generic-protected-policy")
+        immutable_ref = ("security/authority/.github/workflows/verify.yml@" + "a" * 40
+                         if provider == "github" else "policy/release-authority@" + "a" * 40
+                         if provider == "gitlab" else "policy:release:revision:550e8400-e29b-41d4-a716-446655440000")
+        actor_id = "actor:7f0d45de-5ac1-4d40-bf20-fc61c72f7687" if generic else "88"
         receipt = {
             "schema": "agent-provider-authority-proof/v3", "receipt_id": "control-proof-123",
             "candidate_revision":"d"*40,"candidate_tree":"e"*40,
             "authority": "provider-authenticated-protected-adapter", "provider": provider,
-            "project_id": "71", "repository_host": "code.example", "repository": "neutral/repository",
-            "authority_kind": ("github-external-workflow" if provider == "github" else "gitlab-pipeline-execution-policy"),
-            "immutable_authority_ref": (
-                "security/authority/.github/workflows/verify.yml@" + "a" * 40
-                if provider == "github" else "policy/release-authority@" + "a" * 40
-            ),
+            "project_id": project_id, "repository_host": "code.example", "repository": "neutral/repository",
+            "authority_kind": authority_kind, "immutable_authority_ref": immutable_ref,
             "effective_config_sha256": "b" * 64, "effective_config_bytes": 4096,
             "collision_result": {"status": "clear", "evidence_sha256": "c" * 64},
-            "producer_identity": {"subject": "provider/security-authority", "issuer": "https://provider.example", "provider_actor_id": "88"},
+            "producer_identity": {"subject": "provider/security-authority", "issuer": "https://provider.example", "provider_actor_id": actor_id},
             "observed_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         }
         return {
             "AGENT_PROVIDER_AUTHORITY_RECEIPT_JSON": json.dumps(receipt, sort_keys=True, separators=(",", ":")),
-            "AGENT_PROVIDER_PROJECT_ID": "71", "AGENT_PROVIDER_REPOSITORY_HOST": "code.example", "AGENT_PROVIDER_REPOSITORY": "neutral/repository",
+            "AGENT_PROVIDER_PROJECT_ID": project_id, "AGENT_PROVIDER_REPOSITORY_HOST": "code.example", "AGENT_PROVIDER_REPOSITORY": "neutral/repository",
         }
 
     original_adapter = PROVIDERCTL._provider_authority_adapter
@@ -334,6 +339,7 @@ with tempfile.TemporaryDirectory(prefix="provider-authority-proof-") as raw:
         for provider, validator in (
             ("github", PROVIDERCTL.validate_github_external_authority_environment),
             ("gitlab", PROVIDERCTL.validate_gitlab_external_authority_environment),
+            ("gitea-self-hosted", lambda environment, *, root: PROVIDERCTL.validate_generic_external_authority_environment(environment, "gitea-self-hosted", root=root)),
         ):
             environment = authority_environment(provider)
             validator(environment, root=root)

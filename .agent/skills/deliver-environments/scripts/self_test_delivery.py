@@ -16,6 +16,27 @@ AGENT_SOURCE = Path(__file__).resolve().parents[3]
 DELIVERY_SOURCE = AGENT_SOURCE / "scripts/deliveryctl.py"
 HUMAN_DECISION_SOURCE = AGENT_SOURCE / "scripts/humandecision.py"
 SCHEMA_VALIDATION_SOURCE = AGENT_SOURCE / "scripts/schema_validation.py"
+sys.path.insert(0, str(AGENT_SOURCE / "scripts"))
+import deliveryctl as DELIVERY_MODULE
+
+
+GENERIC_AUTHORITY_FIXTURE = {
+    "producer_identity": {
+        "identity_type": "protected-oidc", "subject": "provider/security-authority",
+        "issuer": "https://provider.example", "provider_actor_id": "actor:7f0d45de-5ac1-4d40-bf20-fc61c72f7687",
+    },
+    "external_authority": {
+        "kind": "generic-protected-policy", "authority_id": "required-check-generic",
+        "immutable_ref": "policy:release:revision:550e8400-e29b-41d4-a716-446655440000",
+        "evidence_sha256": "a" * 64,
+    },
+}
+if not DELIVERY_MODULE.valid_required_check_authority(GENERIC_AUTHORITY_FIXTURE, "gitea-self-hosted"):
+    raise AssertionError("opaque generic protected authority was rejected")
+malformed_generic = json.loads(json.dumps(GENERIC_AUTHORITY_FIXTURE))
+malformed_generic["producer_identity"]["provider_actor_id"] = "actor with whitespace"
+if DELIVERY_MODULE.valid_required_check_authority(malformed_generic, "gitea-self-hosted"):
+    raise AssertionError("malformed generic provider actor became authority")
 
 
 def invoke(root: Path, *args: str, expected: int = 0, provider_harness: bool = False, requirement_harness: bool = False) -> subprocess.CompletedProcess:

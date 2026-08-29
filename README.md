@@ -200,6 +200,8 @@ GitLab 默认生成 `.gitlab/agent-workflow.yml`，**不会拥有或替换项目
 
 生成的 GitHub/GitLab workflow **只产生 candidate evidence，不能单独充当 protected required check**：候选分支可以修改自己的 workflow 或覆盖 GitLab include 中的 job。GitHub 必须把不可变外部 workflow/action 或 protected default-branch verifier 配成 required check；GitLab 必须由候选仓库外的 Pipeline Execution Policy/compliance pipeline 提供 authority，并向 verify 注入受保护的 authority mode、project ID、40 位 ref SHA、effective merged-config digest 与 collision-scan digest。任何缺失、候选 root 自填、reserved job collision 或可变 ref 都失败。带 OIDC 的 artifact publisher 只消费同次未授权 job 生成并校验的 exact archive/receipt，且不得 checkout 或执行候选命令/inline script。模板仓库自身的 root GitHub/GitLab self-test 只产生 candidate evidence：它不消费或伪造这些外部 authority 值，也不因 authority 尚未部署而在 checkout 前复制失败；authority 的缺失必须由仓库外 verifier 报告为 unavailable/pending。
 
+非 GitHub/GitLab provider 使用同一个受保护 adapter 协议与 `generic-protected-policy`，但不会把 provider 自己的不可变 policy/version 或 actor/project identity 强制解释成 Git SHA 或十进制 ID。UUID、URN 和其他有界 opaque identity 可以原样认证；adapter 仍必须从 provider 只读 API 证明其不可变语义，并把 receipt 绑定当前 Git candidate revision/tree、effective config digest、collision evidence、issuer 与精确 provider/repository。caller 自报的 opaque 字符串不产生 authority。
+
 生成内容包括：
 
 - 用户设计、范围、验收、知识、安全和回滚字段；

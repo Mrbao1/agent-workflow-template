@@ -6,4 +6,4 @@ AI inference never closes a missing field. Small implementation detail can remai
 
 Output one current requirement contract. Replace drafts; do not preserve interview transcripts.
 
-Decision assurance is route-sensitive. Local, non-deploy fast/standard work may record an explicit current-chat user decision with disclosed non-provider assurance. A project may explicitly enable the same boundary for local, reversible and non-external release-mode implementation. Test, production, deploy, irreversible and external-impact routes require a provider-signed receipt. A local record must never be promoted into protected authority.
+Decision assurance is fail-closed for every route. Current-chat answers are requirement inputs only: after explicit user approval, a provider-owned protected adapter must sign the exact prospective decision request before any fast, standard, release, local, test, production, deploy, reversible or irreversible transition becomes authoritative. Adapterless/local/current-chat records remain advisory archive data and can never be promoted into protected authority; there is no local or reversible release exception.

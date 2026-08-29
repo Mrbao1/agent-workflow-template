@@ -1369,8 +1369,9 @@ def _validate_external_authority(environment, provider, *, root=None, required_p
     collision = value.get("collision_result") if isinstance(value, dict) else None
     producer = value.get("producer_identity") if isinstance(value, dict) else None
     kinds = ({"github-external-workflow", "github-ruleset"} if provider == "github" else ({"gitlab-pipeline-execution-policy", "gitlab-compliance-pipeline"} if provider=="gitlab" else {"generic-protected-policy"}))
-    immutable_pattern = (r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}" if provider == "github" else (r"[A-Za-z0-9_.:/+-]+@[0-9a-f]{40}" if provider=="gitlab" else r"[A-Za-z0-9_.:/@+-]+@[0-9a-f]{40}(?:[0-9a-f]{24})?"))
+    immutable_pattern = (r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}" if provider == "github" else (r"[A-Za-z0-9_.:/+-]+@[0-9a-f]{40}" if provider=="gitlab" else r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{7,255}"))
     project_id_pattern=r"[1-9][0-9]{0,19}" if provider in {"github","gitlab"} else r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+    actor_id_pattern=r"[1-9][0-9]{0,19}" if provider in {"github","gitlab"} else r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,255}"
     if (not isinstance(value, dict) or set(value) != PROVIDER_AUTHORITY_FIELDS
             or value.get("schema") != "agent-provider-authority-proof/v3"
             or value.get("candidate_revision") != candidate_identity["candidate_revision"]
@@ -1394,7 +1395,7 @@ def _validate_external_authority(environment, provider, *, root=None, required_p
             or not isinstance(producer, dict) or set(producer) != {"subject", "issuer", "provider_actor_id"}
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{2,255}", str(producer.get("subject", "")))
             or not re.fullmatch(r"https://[^\s]+", str(producer.get("issuer", "")))
-            or not re.fullmatch(r"[1-9][0-9]{0,19}", str(producer.get("provider_actor_id", "")))):
+            or not re.fullmatch(actor_id_pattern, str(producer.get("provider_actor_id", "")))):
         raise AdaptiveError("PROVIDER_EXTERNAL_AUTHORITY_UNVERIFIED", "provider proof does not bind project, immutable authority, config bytes, collision result and producer")
     try:
         observed = dt.datetime.fromisoformat(str(value.get("observed_at", "")).replace("Z", "+00:00"))
