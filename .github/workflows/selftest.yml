@@ -63,12 +63,12 @@ jobs:
         run: |
           set -euo pipefail
           export SELECTED_NODE="$(command -v node)"
-          export SELECTED_PYTHON="$(python -c 'from pathlib import Path; import sys; print(Path(sys.executable).resolve(strict=True))')"
-          export SELECTED_PYTHON_ROOT="$(python -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve(strict=True))')"
+          export SELECTED_PYTHON="$(python -I -B -c 'from pathlib import Path; import sys; print(Path(sys.executable).resolve(strict=True))')"
+          export SELECTED_PYTHON_ROOT="$(python -I -B -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve(strict=True))')"
           export SELECTED_UID="$(id -u)"
           export TRUSTED_TOOL_ROOT="$HOME/.agent-ci-tools"
           export TRUSTED_NODE="$TRUSTED_TOOL_ROOT/node"
-          python - <<'PY'
+          python -I -B - <<'PY'
           from pathlib import Path
           import hashlib
           import os

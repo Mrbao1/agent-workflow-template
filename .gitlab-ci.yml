@@ -27,7 +27,7 @@ candidate-selftest-evidence:
     - test "$(uname -s)" = Linux
     - test "$(uname -m)" = x86_64
     - |-
-      python3 - <<'PY'
+      /usr/local/bin/python3 -I -B - <<'PY'
       from pathlib import Path
       import hashlib
       import io
@@ -206,7 +206,7 @@ candidate-selftest-evidence:
           os.chown(target, ci_uid, ci_gid)
       PY
     - export PATH="/opt/agent-ci-tools:$PATH"
-    - python3 --version
+    - /usr/local/bin/python3 -I -B --version
     - node --version
     - lsof -v
     - git --version
@@ -214,7 +214,7 @@ candidate-selftest-evidence:
     - |-
       set -eu
       for context in idle-source polluted-source installed-project; do
-      python3 - "$context" "$SHARD" "$CI_NODE_INDEX" <<'PY'
+      /usr/local/bin/python3 -I -B - "$context" "$SHARD" "$CI_NODE_INDEX" <<'PY'
       import os
       from pathlib import Path
       import sys
