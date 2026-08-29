@@ -1284,20 +1284,29 @@ def host_runner_peer(
     )
 
 
+_PROJECT_PROCESS_OBSERVER_FAILURE = "not-run"
+
+
 def project_processes() -> Optional[List[Dict[str, object]]]:
     """Snapshot project-cwd processes and exclude only the live-derived caller chain."""
+    global _PROJECT_PROCESS_OBSERVER_FAILURE
+    _PROJECT_PROCESS_OBSERVER_FAILURE = "unknown"
     root = AGENT_DIR.parent.resolve()
     executable = lsof_executable()
     if executable is None:
+        _PROJECT_PROCESS_OBSERVER_FAILURE = "trusted-lsof-unavailable"
         return None
     try:
         probe=run_bounded_trusted_observer(
             [executable,"-n","-d","cwd","-FpcRgn"],timeout=15,
             output_limit=MAX_CONTROL_COMMAND_OUTPUT_BYTES,
         )
-    except (OSError,subprocess.TimeoutExpired): return None
+    except (OSError,subprocess.TimeoutExpired) as error:
+        _PROJECT_PROCESS_OBSERVER_FAILURE = "lsof-launch-" + type(error).__name__
+        return None
     output=probe.stdout
     if probe.returncode not in {0,1}:
+        _PROJECT_PROCESS_OBSERVER_FAILURE = f"lsof-exit-{probe.returncode}"
         return None
     records: Dict[int, Dict[str, object]] = {}
     observed_pid: Optional[int] = None
@@ -1332,23 +1341,32 @@ def project_processes() -> Optional[List[Dict[str, object]]]:
             continue
         snapshot = process_snapshot(pid)
         if snapshot is None:
-            status, _ = native_process_identity(pid)
-            if status == "gone":
+            status, native = native_process_identity(pid)
+            if status == "gone" or (status == "ok" and isinstance(native, dict)
+                                     and str(native.get("state", "")).startswith(("Z", "X"))):
                 # lsof can retain a process that exited while its output was
-                # being assembled. Only that proven transient is discardable.
+                # being assembled. Only kernel-confirmed gone/zombie records
+                # are discardable; opaque identities still fail closed.
                 continue
+            _PROJECT_PROCESS_OBSERVER_FAILURE = "native-process-identity-unavailable"
             return None
+        if str(snapshot.get("state", "")).startswith(("Z", "X")):
+            continue
         if raw.get("ppid") != snapshot.get("ppid") or raw.get("pgid") != snapshot.get("pgid"):
+            _PROJECT_PROCESS_OBSERVER_FAILURE = "lsof-native-parent-or-group-drift"
             return None
         if host_runner_peer(snapshot, ancestor_identities):
             continue
         try:
             same_cwd = Path(str(snapshot["cwd"])).resolve() == Path(cwd).resolve()
         except OSError:
+            _PROJECT_PROCESS_OBSERVER_FAILURE = "native-cwd-unresolved"
             return None
         if not same_cwd:
+            _PROJECT_PROCESS_OBSERVER_FAILURE = "lsof-native-cwd-drift"
             return None
         snapshots.append(snapshot)
+    _PROJECT_PROCESS_OBSERVER_FAILURE = "none"
     return snapshots
 
 
@@ -1513,7 +1531,7 @@ def capture_runtime_baseline(source: str, *, confirm_existing: bool = False) -> 
         raise SystemExit("runtime baseline source must be agentctl:start or user:<decision>")
     observed = stable_project_processes()
     if observed is None:
-        raise SystemExit("cannot inspect project process baseline; lsof is required")
+        raise SystemExit("cannot inspect project process baseline: " + _PROJECT_PROCESS_OBSERVER_FAILURE)
     with locked_runtime() as runtime:
         if any(runtime.get(key) for key in ("processes", "docker_projects", "ports")):
             raise SystemExit("cannot capture a runtime baseline while registered resources remain")
