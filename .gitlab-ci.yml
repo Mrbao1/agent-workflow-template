@@ -38,12 +38,12 @@ candidate-selftest-evidence:
 
       version = os.environ["NODE_VERSION"]
       expected = os.environ["NODE_LINUX_X64_SHA256"]
-      archive = Path(".ci-node.tar.xz")
+      archive = bytearray()
       url = f"https://nodejs.org/dist/v{version}/node-v{version}-linux-x64.tar.xz"
       digest = hashlib.sha256()
       maximum_archive_bytes = 128 * 1024 * 1024
       downloaded = 0
-      with urllib.request.urlopen(url, timeout=30) as response, archive.open("wb") as output:
+      with urllib.request.urlopen(url, timeout=30) as response:
           declared = response.headers.get("Content-Length")
           if declared is not None and (not declared.isdigit() or int(declared) > maximum_archive_bytes):
               raise SystemExit("Node archive Content-Length is invalid or exceeds its bound")
@@ -55,11 +55,11 @@ candidate-selftest-evidence:
               if downloaded > maximum_archive_bytes:
                   raise SystemExit("Node archive exceeds its bounded download size")
               digest.update(chunk)
-              output.write(chunk)
+              archive.extend(chunk)
       if digest.hexdigest() != expected:
           raise SystemExit("Node archive SHA-256 mismatch")
       member_name = f"node-v{version}-linux-x64/bin/node"
-      with tarfile.open(archive, "r:xz") as bundle:
+      with tarfile.open(fileobj=io.BytesIO(bytes(archive)), mode="r:xz") as bundle:
           member = bundle.getmember(member_name)
           if not member.isfile() or member.size <= 0 or member.size > 256 * 1024 * 1024:
               raise SystemExit("Node archive member is invalid")
@@ -82,7 +82,6 @@ candidate-selftest-evidence:
                       break
                   output.write(chunk)
           destination.chmod(0o755)
-      archive.unlink()
       lsof_version = os.environ["LSOF_DEB_VERSION"]
       lsof_expected = os.environ["LSOF_DEB_AMD64_SHA256"]
       lsof_url = f"https://deb.debian.org/debian/pool/main/l/lsof/lsof_{lsof_version}_amd64.deb"
@@ -244,7 +243,7 @@ candidate-selftest-evidence:
       PY
       done
   after_script:
-    - rm -rf -- /opt/agent-ci-tools .ci-home .ci-node.tar.xz
+    - rm -rf -- /opt/agent-ci-tools .ci-home
   artifacts:
     when: always
     expire_in: 14 days

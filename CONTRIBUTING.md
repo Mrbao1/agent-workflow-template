@@ -13,7 +13,7 @@ Every combination runs both shards across `idle-source`, `polluted-source`, and 
 
 Canonical GitLab CI runs both full-suite shards on a Linux/amd64 runner. It pins the
 Python 3.9.21 image by immutable multi-platform index digest, verifies the Node.js 20.19.4 archive
-against its published SHA-256, and verifies Debian lsof 4.95.0-1 against its indexed SHA-256 before extracting only the bounded `node` and `lsof` executables into a root-owned `/opt` path. It then transfers the bounded, symlink-free checkout to a dedicated unprivileged CI account before executing candidate bytes.
+against its published SHA-256 entirely in bounded memory before extracting only the trusted member, and verifies Debian lsof 4.95.0-1 against its indexed SHA-256 before extracting only the bounded `node` and `lsof` executables into a root-owned `/opt` path. It then transfers the bounded, symlink-free checkout to a dedicated unprivileged CI account before executing candidate bytes.
 This template repository's canonical GitLab project uses its verified tagged Linux/amd64
 shared pool, `hk-cluster-devops-cicd`; that tag is a deployment fact for this repository, not a
 stack default copied into adopter projects. Generated project CI uses only the runner selection
