@@ -24,6 +24,14 @@ for name in PXPIPE_TEST_MODE PXPIPE_LIFECYCLE_TEST_ROOT PXPIPE_LAUNCHCTL_BIN PXP
   if declare -p "$name" >/dev/null 2>&1; then echo "$name override is unavailable in production status." >&2; exit 1; fi
 done
 [[ "$LAUNCH_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,126}[A-Za-z0-9]$ ]] || { echo "PXPIPE launch label is invalid." >&2; exit 1; }
+stat_owner_mode() {
+  local target="$1"
+  if [[ "$(/usr/bin/uname -s)" == "Darwin" ]]; then
+    /usr/bin/stat -f '%u %Lp' "$target"
+  else
+    /usr/bin/stat -c '%u %a' "$target"
+  fi
+}
 SCRIPT_DIR="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 NODE_BIN="${PXPIPE_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
@@ -35,7 +43,7 @@ if [[ "${PXPIPE_TEST_MODE:-0}" != "1" ]]; then
   [[ "$NODE_BIN" == /* && ! -L "$NODE_BIN" ]] || { echo "Production Node.js must be one canonical non-symlink executable." >&2; exit 1; }
   protected_component="$NODE_BIN"
   while :; do
-    read -r component_owner component_mode < <(/usr/bin/stat -f '%u %Lp' "$protected_component")
+    read -r component_owner component_mode < <(stat_owner_mode "$protected_component")
     [[ "$component_owner" == "0" && ! -L "$protected_component" ]] || { echo "Production Node.js path must be root-owned and symlink-free: $protected_component" >&2; exit 1; }
     (( (8#$component_mode & 8#22) == 0 )) || { echo "Production Node.js path is group/other writable: $protected_component" >&2; exit 1; }
     [[ "$protected_component" == "/" ]] && break

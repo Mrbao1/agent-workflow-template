@@ -54,6 +54,23 @@ if ! [[ "$PXPIPE_PORT" =~ ^[0-9]+$ ]] || (( PXPIPE_PORT < 1024 || PXPIPE_PORT > 
   exit 1
 fi
 
+stat_owner_mode() {
+  local target="$1"
+  if [[ "$(/usr/bin/uname -s)" == "Darwin" ]]; then
+    /usr/bin/stat -f '%u %Lp' "$target"
+  else
+    /usr/bin/stat -c '%u %a' "$target"
+  fi
+}
+stat_links_owner_mode() {
+  local target="$1"
+  if [[ "$(/usr/bin/uname -s)" == "Darwin" ]]; then
+    /usr/bin/stat -f '%l %u %Lp' "$target"
+  else
+    /usr/bin/stat -c '%h %u %a' "$target"
+  fi
+}
+
 NODE_BIN="${PXPIPE_NODE_BIN:-}"
 if [[ -z "$NODE_BIN" ]]; then
   if ! NODE_BIN="$(command -v node 2>/dev/null)"; then NODE_BIN=""; fi
@@ -67,7 +84,7 @@ if [[ "${PXPIPE_TEST_MODE:-0}" != "1" ]]; then
   [[ "$NODE_BIN" == /* && ! -L "$NODE_BIN" ]] || { echo "Production Node.js must be one canonical non-symlink executable." >&2; exit 1; }
   protected_component="$NODE_BIN"
   while :; do
-    read -r component_owner component_mode < <(/usr/bin/stat -f '%u %Lp' "$protected_component")
+    read -r component_owner component_mode < <(stat_owner_mode "$protected_component")
     [[ "$component_owner" == "0" && ! -L "$protected_component" ]] || { echo "Production Node.js path must be root-owned and symlink-free: $protected_component" >&2; exit 1; }
     (( (8#$component_mode & 8#22) == 0 )) || { echo "Production Node.js path is group/other writable: $protected_component" >&2; exit 1; }
     [[ "$protected_component" == "/" ]] && break
@@ -410,7 +427,7 @@ fi
 } >"$PLIST_TEMP"
 chmod 600 "$PLIST_TEMP"
 if [[ "$prior_plist_present" == "1" ]]; then
-  read -r prior_links prior_owner prior_mode < <(/usr/bin/stat -f '%l %u %Lp' "$PLIST_PATH")
+  read -r prior_links prior_owner prior_mode < <(stat_links_owner_mode "$PLIST_PATH")
   [[ -f "$PLIST_PATH" && ! -L "$PLIST_PATH" && "$prior_links" == "1" && "$prior_owner" == "$($ID_BIN -u)" ]] || { echo "Prior plist identity changed before replacement." >&2; exit 1; }
   (( (8#$prior_mode & 8#22) == 0 )) || { echo "Prior plist permissions changed before replacement." >&2; exit 1; }
   PLIST_TRANSACTION="$(/usr/bin/mktemp "$PXPIPE_STATE_DIR/.codex-default.plist-transaction.XXXXXXXX")"

@@ -5,6 +5,14 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 
 ## [Unreleased]
 
+## [4.0.3] - 2026-08-29
+
+### Fixed
+
+- Corrected the second layer of failures exposed only after v4.0.2 reached the live runners: GitHub now bounds, identity-checks, and removes group/other write bits from the resolved setup-selected Python owner chain and runtime tree before the exact staged re-exec; GitLab installs a hash-pinned bounded Debian `lsof` executable for fail-closed process observation.
+- Made the quarantined pxpipe Codex lifecycle fixtures select BSD or GNU `stat` metadata formats from the observed kernel, and moved executable-trust unit fixtures from shared `/tmp` to the current OS account's real home.
+- Preserved immutable v4.0.2 refs and added v4.0.2/42 to the installer's released-manifest compatibility window.
+
 ## [4.0.2] - 2026-08-29
 
 ### Fixed
@@ -109,7 +117,8 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 - Removed stale runtime evidence, generated reports, IDE metadata, and the obsolete
   remediation plan from the release tree.
 
-[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.2...HEAD
+[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.3...HEAD
+[4.0.3]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.2...v4.0.3
 [4.0.2]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.1...v4.0.2
 [4.0.1]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/Mrbao1/agent-workflow-template/releases/tag/v4.0.0

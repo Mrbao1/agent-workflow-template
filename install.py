@@ -79,7 +79,7 @@ def assert_namespace_binding(target=None):
         if not stat.S_ISDIR(current.st_mode) or inode_identity(current)!=BOUND_TARGET_IDENTITY:
             raise RuntimeError("installer target root was replaced during the transaction")
 
-VERSION="4.0.2"
+VERSION="4.0.3"
 MIGRATION_VERSION=42
 CANONICAL_ACCEPTANCE_ADAPTERS={
     "acceptance-workflow":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"workflow-release-gate/v4"},
@@ -112,6 +112,7 @@ GLOBAL_PXPIPE_HELPERS=("scripts/uninstall-codex-default.sh","scripts/codex-defau
 RELEASED_PXPIPE_HELPER_SETS=(
  {"scripts/uninstall-codex-default.sh":"25762254d1bdb216d9fa502a5c45a96bed58d9226f4faf199a17a6cd56fcd9f9","scripts/codex-default-config.mjs":"8f2914b972bcb796213ee747ec74855dea83455a13aab3276d8f16eef3bb8f0a"},
  {"scripts/uninstall-codex-default.sh":"3c8d8e9fae692adb5df3ef63663b9367f216ecbbfb7628d5104f543f741d9375","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
+ {"scripts/uninstall-codex-default.sh":"0f793ab6f3ee97942c4866bf1631ea929a2ee7512fe0bc39c4218110adc1f8e3","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
 )
 BOOTSTRAP_START="<!-- agent-workflow-bootstrap:start -->"
 BOOTSTRAP_END="<!-- agent-workflow-bootstrap:end -->"
@@ -626,7 +627,7 @@ RELEASED_MANIFEST_METADATA={
     "agent-workflow-install/v1":{("3.1.40",32)},
     "agent-workflow-install/v3":{("3.1.41",34)},
     "agent-workflow-install/v4":{("3.1.42",35),("3.1.43",36),("3.1.46",38),("3.1.48",39),("3.2.0",40)},
-    "agent-workflow-install/v5":{("4.0.0",42),("4.0.1",42),(VERSION,MIGRATION_VERSION)},
+    "agent-workflow-install/v5":{("4.0.0",42),("4.0.1",42),("4.0.2",42),(VERSION,MIGRATION_VERSION)},
 }
 
 

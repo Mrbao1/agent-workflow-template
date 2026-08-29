@@ -12,7 +12,7 @@
   "source_lockfile": null,
   "source_lockfile_sha256": null,
   "esbuild_main_sha256": null,
-  "plugin_tree_sha256": "de08c9d0c17a7a2075de7ae7534e5fb975ee050dba996508ad22dbe374541999",
+  "plugin_tree_sha256": "85a6e37196d6173b9883c78991b7ac40e7f26bafc15c6a7e18cc71af1e08836f",
   "runtime_bundle": null,
   "runtime_bundle_sha256": null,
   "proxy_bundle": null,
@@ -20,8 +20,8 @@
   "provider_assets": {
     "scripts/codex-default-config.mjs": "593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483",
     "scripts/codex-pxpipe.sh": "b000ed911aac54ea79a882926561b1e6ac90187167271f6260cca767c1c9169b",
-    "scripts/install-codex-default.sh": "308dce40ece475f2d889cd080c19164e88659b8863f64b5deecadb13e5f2d9f0",
-    "scripts/status-codex-default.sh": "a9a67c25a64f5a88240e734648d4b748954fe39a6352687ae827cd7df9465ce1",
-    "scripts/uninstall-codex-default.sh": "3c8d8e9fae692adb5df3ef63663b9367f216ecbbfb7628d5104f543f741d9375"
+    "scripts/install-codex-default.sh": "79c8c5cd4f7ae748293394f4962def13c6aff6f55b5c8985a6b9d6f3110b0a45",
+    "scripts/status-codex-default.sh": "e6456bff843377b6f11c51a4b56a7b9dda87893a5c421cd3a9df6967b6441107",
+    "scripts/uninstall-codex-default.sh": "0f793ab6f3ee97942c4866bf1631ea929a2ee7512fe0bc39c4218110adc1f8e3"
   }
 }

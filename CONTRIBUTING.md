@@ -9,11 +9,11 @@ The checked-in, candidate-owned GitHub evidence matrix exercises the Cartesian p
 - macOS 14 ARM64 with the latest published Python 3.9 ARM64 toolcache build, 3.9.13, and Node.js 20.19.4
 - macOS 14 with Python 3.13.5 and Node.js 22.18.0
 
-Every combination runs both shards across `idle-source`, `polluted-source`, and `installed-project`. Skips fail except the exact audited Docker-not-applicable self-test. This workflow is useful evidence only: a protected immutable external or protected-default-branch verifier must authenticate the candidate bytes and effective matrix before its independently named required check can authorize a release.
+Every combination runs both shards across `idle-source`, `polluted-source`, and `installed-project`. The setup-selected Node executable is copied beneath an owner-only account-home path, while the resolved setup-selected Python executable owner chain and bounded runtime tree are identity-checked and stripped of group/other write bits before the exact staged re-exec. Skips fail except the exact audited Docker-not-applicable self-test. This workflow is useful evidence only: a protected immutable external or protected-default-branch verifier must authenticate the candidate bytes and effective matrix before its independently named required check can authorize a release.
 
 Canonical GitLab CI runs both full-suite shards on a Linux/amd64 runner. It pins the
-Python 3.9.21 image by immutable multi-platform index digest and verifies the Node.js 20.19.4 archive
-against its published SHA-256 before extracting only the bounded `node` executable.
+Python 3.9.21 image by immutable multi-platform index digest, verifies the Node.js 20.19.4 archive
+against its published SHA-256, and verifies Debian lsof 4.95.0-1 against its indexed SHA-256 before extracting only the bounded `node` and `lsof` executables into a root-owned `/opt` path.
 This template repository's canonical GitLab project uses its verified tagged Linux/amd64
 shared pool, `hk-cluster-devops-cicd`; that tag is a deployment fact for this repository, not a
 stack default copied into adopter projects. Generated project CI uses only the runner selection

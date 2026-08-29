@@ -9,6 +9,7 @@ import importlib.util
 import inspect
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -32,6 +33,10 @@ RUNNER_PATH = ROOT / "tests/run_all.py"
 SPEC = importlib.util.spec_from_file_location("self_suite_runner", RUNNER_PATH)
 RUNNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNNER)
+
+
+def trusted_fixture_parent() -> Path:
+    return Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
 
 
 class RunnerHardeningTests(unittest.TestCase):
@@ -261,7 +266,7 @@ class RunnerHardeningTests(unittest.TestCase):
     def test_ci_selected_path_precedes_system_default_tool(self):
         original_path=RUNNER.ORIGINAL_TOOL_PATH
         try:
-            with tempfile.TemporaryDirectory() as raw:
+            with tempfile.TemporaryDirectory(prefix="ci-tool-selection-",dir=trusted_fixture_parent()) as raw:
                 root=Path(raw); selected=root/"selected"; fallback=root/"fallback"; selected.mkdir(); fallback.mkdir()
                 for directory,body in ((selected,"selected"),(fallback,"fallback")):
                     tool=directory/"node"; tool.write_text(f"#!/bin/sh\nprintf '{body}\n'\n",encoding="utf-8"); tool.chmod(0o700)
@@ -284,7 +289,7 @@ class RunnerHardeningTests(unittest.TestCase):
     def test_mutable_tool_replacement_after_preflight_is_rejected(self):
         original=(RUNNER.TOOL_SEALS,RUNNER.TRUSTED_TOOL_NAMES,RUNNER.ORIGINAL_TOOL_PATH)
         try:
-            with tempfile.TemporaryDirectory() as raw:
+            with tempfile.TemporaryDirectory(prefix="ci-tool-mutation-",dir=trusted_fixture_parent()) as raw:
                 root=Path(raw); tools_dir=root/"bin"; tools_dir.mkdir(); tool=tools_dir/"mutable-tool"
                 tool.write_text("#!/bin/sh\nprintf 'sealed-tool\n'\n",encoding="utf-8"); tool.chmod(0o700)
                 RUNNER.TOOL_SEALS=None; RUNNER.TRUSTED_TOOL_NAMES=("mutable-tool",); RUNNER.ORIGINAL_TOOL_PATH=str(tools_dir)
@@ -489,19 +494,27 @@ class WorkflowHardeningTests(unittest.TestCase):
         self.assertIn('python-version: "3.13.5"',text)
         self.assertIn('node-version: "20.19.4"',text)
         self.assertIn('node-version: "22.18.0"',text)
-        self.assertIn("$HOME/.agent-ci-tools/node",text)
+        self.assertIn("/usr/bin/sudo -n /usr/bin/env",text)
+        self.assertIn("selected Python path exceeds its bound",text)
+        self.assertIn("selected Python owner chain exceeds its depth bound",text)
+        self.assertIn("selected Python owner chain has an unsafe identity",text)
+        self.assertIn("selected Python runtime exceeds its entry bound",text)
+        self.assertIn("selected Python runtime exceeds its byte bound",text)
+        self.assertIn("selected Python runtime contains an external or broken symlink",text)
+        self.assertIn("AGENT_CI_PYTHON",text)
         self.assertIn("trusted Node copy digest mismatch",text)
         for context in RUNNER.ALL_CONTEXTS:
             self.assertIn(context, text)
         self.assertIn("--context", text)
         self.assertIn("--require-command node",text)
+        self.assertIn("--require-command lsof",text)
         self.assertIn("--require-command git",text)
         self.assertNotIn("--require-command python",text)
         self.assertIn("os: [ubuntu-24.04, macos-14]",text)
         self.assertIn("runs-on: ${{ matrix.os }}",text)
         self.assertIn("toolchain: [minimum, modern-pinned]",text)
         self.assertNotIn("context: [idle-source, polluted-source, installed-project]",text)
-        self.assertEqual(text.count("python tests/run_all.py"),1)
+        self.assertEqual(text.count('"$AGENT_CI_PYTHON" tests/run_all.py'),1)
         self.assertIn("--fail-on-skip", text)
         self.assertIn("--allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py", text)
         self.assertNotIn("toolchain: [minimum, current]", text)
@@ -512,9 +525,13 @@ class WorkflowHardeningTests(unittest.TestCase):
         text=(ROOT/".gitlab-ci.yml").read_text(encoding="utf-8")
         self.assertRegex(text,r"image: python:3\.9\.21-bookworm@sha256:[0-9a-f]{64}")
         self.assertRegex(text,r'NODE_LINUX_X64_SHA256: "[0-9a-f]{64}"')
+        self.assertIn('LSOF_DEB_VERSION: "4.95.0-1"',text)
+        self.assertIn('LSOF_DEB_AMD64_SHA256: "e4b15cf8d0b9051cf7957e7ab29a67ca7d21f42ea1b2b7dad1b52e65d02d1408"',text)
         self.assertIn("tags: [hk-cluster-devops-cicd]",text)
         self.assertIn("maximum_archive_bytes = 128 * 1024 * 1024",text)
         self.assertIn("downloaded > maximum_archive_bytes",text)
+        self.assertIn("maximum_lsof_package_bytes = 2 * 1024 * 1024",text)
+        self.assertIn('bundle.getmember("./usr/bin/lsof")',text)
         self.assertNotIn("source.read()",text)
         self.assertIn('SHARD: ["1/2", "2/2"]',text)
         self.assertIn("for context in idle-source polluted-source installed-project",text)
@@ -524,7 +541,7 @@ class WorkflowHardeningTests(unittest.TestCase):
         self.assertNotIn("candidate-selftest-modern-macos-evidence",text)
         self.assertNotIn("CI_COMMIT_TAG",text)
         self.assertNotIn("AGENT_GITLAB_AUTHORITY_MODE",text)
-        self.assertIn("--require-command python --require-command node --require-command git",text)
+        self.assertIn("--require-command python --require-command node --require-command lsof --require-command git",text)
         self.assertIn("git --version",text)
         self.assertIn('trusted_root = Path("/opt/agent-ci-tools")',text)
         self.assertIn('PATH="/opt/agent-ci-tools:/usr/local/bin:/usr/bin:/bin"',text)
@@ -537,6 +554,20 @@ class WorkflowHardeningTests(unittest.TestCase):
         self.assertIn("parallel:\n    matrix:", text)
         self.assertIn("when: always", text)
         self.assertNotIn(":latest", text)
+
+    def test_quarantined_pxpipe_stat_metadata_is_bsd_and_gnu_portable(self):
+        scripts=[ROOT/"plugins/pxpipe-context/scripts"/name for name in (
+            "install-codex-default.sh","uninstall-codex-default.sh","status-codex-default.sh")]
+        for script in scripts:
+            text=script.read_text(encoding="utf-8")
+            self.assertIn("stat_owner_mode()",text,script.name)
+            self.assertIn("/usr/bin/stat -f '%u %Lp'",text,script.name)
+            self.assertIn("/usr/bin/stat -c '%u %a'",text,script.name)
+        for script in scripts[:2]:
+            text=script.read_text(encoding="utf-8")
+            self.assertIn("stat_links_owner_mode()",text,script.name)
+            self.assertIn("/usr/bin/stat -f '%l %u %Lp'",text,script.name)
+            self.assertIn("/usr/bin/stat -c '%h %u %a'",text,script.name)
 
     def test_github_workflows_use_confirmed_authority_and_pinned_actions(self):
         template_dir=ROOT/".agent/assets/templates/ci-cd"

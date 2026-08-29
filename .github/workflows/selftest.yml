@@ -58,13 +58,16 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Stage selected Node.js in owner-only tool path
+      - name: Stage selected toolchains in owner-controlled paths
         shell: bash
         run: |
           set -euo pipefail
-          selected_node="$(command -v node)"
-          export SELECTED_NODE="$selected_node"
-          export TRUSTED_NODE="$HOME/.agent-ci-tools/node"
+          export SELECTED_NODE="$(command -v node)"
+          export SELECTED_PYTHON="$(python -c 'from pathlib import Path; import sys; print(Path(sys.executable).resolve(strict=True))')"
+          export SELECTED_PYTHON_ROOT="$(python -c 'from pathlib import Path; import sys; print(Path(sys.base_prefix).resolve(strict=True))')"
+          export SELECTED_UID="$(id -u)"
+          export TRUSTED_TOOL_ROOT="$HOME/.agent-ci-tools"
+          export TRUSTED_NODE="$TRUSTED_TOOL_ROOT/node"
           python - <<'PY'
           from pathlib import Path
           import hashlib
@@ -74,10 +77,8 @@ jobs:
 
           source = Path(os.environ["SELECTED_NODE"]).resolve(strict=True)
           destination = Path(os.environ["TRUSTED_NODE"])
-          destination.parent.mkdir(mode=0o700, exist_ok=True)
+          destination.parent.mkdir(mode=0o700, exist_ok=False)
           destination.parent.chmod(0o700)
-          if destination.exists() or destination.is_symlink():
-              raise SystemExit("trusted Node destination already exists")
           shutil.copyfile(source, destination)
           destination.chmod(0o500)
           def digest(path):
@@ -91,21 +92,86 @@ jobs:
           if not stat.S_ISREG(destination.lstat().st_mode):
               raise SystemExit("trusted Node copy is not regular")
           PY
-          printf '%s\n' "$HOME/.agent-ci-tools" >> "$GITHUB_PATH"
+          /usr/bin/sudo -n /usr/bin/env SELECTED_PYTHON="$SELECTED_PYTHON" SELECTED_PYTHON_ROOT="$SELECTED_PYTHON_ROOT" SELECTED_UID="$SELECTED_UID" "$SELECTED_PYTHON" -I -B - <<'PY'
+          from pathlib import Path
+          import os
+          import stat
+
+          target = Path(os.environ["SELECTED_PYTHON"]).resolve(strict=True)
+          runtime_root = Path(os.environ["SELECTED_PYTHON_ROOT"]).resolve(strict=True)
+          try:
+              target.relative_to(runtime_root)
+          except ValueError:
+              raise SystemExit("selected Python executable escapes its runtime root")
+          if max(len(os.fsencode(target)), len(os.fsencode(runtime_root))) > 4096:
+              raise SystemExit("selected Python path exceeds its bound")
+          current = Path(runtime_root.anchor)
+          components = [current]
+          for part in runtime_root.parts[1:]:
+              current = current / part
+              components.append(current)
+          if len(components) > 64:
+              raise SystemExit("selected Python owner chain exceeds its depth bound")
+          allowed_owners = {0, int(os.environ["SELECTED_UID"])}
+          for component in components:
+              metadata = os.lstat(component)
+              if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid not in allowed_owners:
+                  raise SystemExit("selected Python owner chain has an unsafe identity")
+              if metadata.st_mode & 0o022:
+                  os.chmod(component, stat.S_IMODE(metadata.st_mode) & ~0o022)
+          entries = 0
+          total_bytes = 0
+          pending = [runtime_root]
+          while pending:
+              directory = pending.pop()
+              with os.scandir(directory) as children:
+                  for child in children:
+                      entries += 1
+                      if entries > 100000:
+                          raise SystemExit("selected Python runtime exceeds its entry bound")
+                      path = Path(child.path)
+                      metadata = child.stat(follow_symlinks=False)
+                      if metadata.st_uid not in allowed_owners:
+                          raise SystemExit("selected Python runtime has an unsafe owner")
+                      if stat.S_ISLNK(metadata.st_mode):
+                          try:
+                              path.resolve(strict=True).relative_to(runtime_root)
+                          except (OSError, ValueError):
+                              raise SystemExit("selected Python runtime contains an external or broken symlink")
+                      elif stat.S_ISREG(metadata.st_mode):
+                          total_bytes += metadata.st_size
+                          if total_bytes > 2 * 1024 * 1024 * 1024:
+                              raise SystemExit("selected Python runtime exceeds its byte bound")
+                          if metadata.st_mode & 0o022:
+                              os.chmod(path, stat.S_IMODE(metadata.st_mode) & ~0o022)
+                      elif stat.S_ISDIR(metadata.st_mode):
+                          if metadata.st_mode & 0o022:
+                              os.chmod(path, stat.S_IMODE(metadata.st_mode) & ~0o022)
+                          pending.append(path)
+                      else:
+                          raise SystemExit("selected Python runtime contains an unsupported entry")
+          final = os.lstat(target)
+          if not stat.S_ISREG(final.st_mode) or not final.st_mode & 0o111:
+              raise SystemExit("selected Python target is not executable and regular")
+          PY
+          "$SELECTED_PYTHON" --version
+          printf 'AGENT_CI_PYTHON=%s\n' "$SELECTED_PYTHON" >> "$GITHUB_ENV"
+          printf '%s\n' "$TRUSTED_TOOL_ROOT" >> "$GITHUB_PATH"
       - name: Show pinned toolchain
         run: |
-          python --version
+          "$AGENT_CI_PYTHON" --version
           node --version
       - name: Run all contexts in isolated shard
         shell: bash
         run: |
           set -euo pipefail
           for context in idle-source polluted-source installed-project; do
-            python tests/run_all.py \
+            "$AGENT_CI_PYTHON" tests/run_all.py \
               --context "$context" \
               --shard "${{ matrix.shard }}" \
               --test-timeout 600 \
               --require-command node \
+              --require-command lsof \
               --require-command git \
               --fail-on-skip \
               --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py \
