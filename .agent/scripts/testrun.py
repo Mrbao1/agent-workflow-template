@@ -1172,6 +1172,16 @@ def terminate_process_tree(process,known,grace=1.0,launch_token=None):
     snapshot=process_snapshot()
     if snapshot is None: uncertain=True
     elif not signal_known(known,signal.SIGKILL,snapshot): uncertain=True
+    kill_deadline=time.monotonic()+2
+    while time.monotonic()<kill_deadline:
+        snapshot=process_snapshot()
+        if snapshot is None:
+            uncertain=True; break
+        discover_descendants(root_pid,known,snapshot)
+        group_live=(not leader_reaped and any(group==process.pid and not state.startswith("Z")
+            for _pid,(_parent,group,_identity,state) in snapshot.items()))
+        if not live_known(known,snapshot) and not group_live: break
+        time.sleep(0.05)
     if not leader_reaped:
         try: process.wait(timeout=2)
         except subprocess.TimeoutExpired:
