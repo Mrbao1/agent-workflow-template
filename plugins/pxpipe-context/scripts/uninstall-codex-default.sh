@@ -342,41 +342,43 @@ cleanup_committed() {
   journal_op remove
 }
 
+recovery_step_failed() { echo "Recovery step failed: $1 (exit $2)." >&2; }
 recover_uninstall() {
-  local phase loaded
-  phase="$(journal_op field phase)" || return 1
+  local phase loaded step_status
+  phase="$(journal_op field phase)" || { step_status=$?; recovery_step_failed "read phase" "$step_status"; return "$step_status"; }
   if [[ "$phase" == "committed" ]]; then cleanup_committed; return; fi
-  journal_op update recovering || return 1
-  loaded="$(journal_op field service_was_loaded)" || return 1
+  journal_op update recovering || { step_status=$?; recovery_step_failed "mark recovering" "$step_status"; return "$step_status"; }
+  loaded="$(journal_op field service_was_loaded)" || { step_status=$?; recovery_step_failed "read service state" "$step_status"; return "$step_status"; }
   if [[ "$loaded" == "true" ]]; then
     service_was_loaded=1
-    SERVICE_PID="$(journal_op field service_pid)" || return 1
-    SERVICE_PGID="$(journal_op field service_pgid)" || return 1
-    SERVICE_LISTENERS="$(journal_op field service_listeners)" || return 1
+    SERVICE_PID="$(journal_op field service_pid)" || { step_status=$?; recovery_step_failed "read service pid" "$step_status"; return "$step_status"; }
+    SERVICE_PGID="$(journal_op field service_pgid)" || { step_status=$?; recovery_step_failed "read service group" "$step_status"; return "$step_status"; }
+    SERVICE_LISTENERS="$(journal_op field service_listeners)" || { step_status=$?; recovery_step_failed "read service listeners" "$step_status"; return "$step_status"; }
   fi
-  verify_install_ownership recover || return 1
-  preflight_config_restore "$CONFIG_PATH" config || return 1
-  preflight_config_restore "$CONFIG_STATE" state || return 1
-  preflight_config_restore "$CONFIG_BACKUP" backup || return 1
-  if service_loaded; then stop_service || return 1
-  elif [[ "$service_was_loaded" == "1" ]]; then wait_service_disappearance || return 1
-  else prove_service_absent || return 1; fi
+  verify_install_ownership recover || { step_status=$?; recovery_step_failed "verify staged ownership" "$step_status"; return "$step_status"; }
+  preflight_config_restore "$CONFIG_PATH" config || { step_status=$?; recovery_step_failed "preflight config" "$step_status"; return "$step_status"; }
+  preflight_config_restore "$CONFIG_STATE" state || { step_status=$?; recovery_step_failed "preflight state" "$step_status"; return "$step_status"; }
+  preflight_config_restore "$CONFIG_BACKUP" backup || { step_status=$?; recovery_step_failed "preflight backup" "$step_status"; return "$step_status"; }
+  if service_loaded; then stop_service || { step_status=$?; recovery_step_failed "stop service" "$step_status"; return "$step_status"; }
+  elif [[ "$service_was_loaded" == "1" ]]; then wait_service_disappearance || { step_status=$?; recovery_step_failed "wait for service" "$step_status"; return "$step_status"; }
+  else prove_service_absent || { step_status=$?; recovery_step_failed "prove service absent" "$step_status"; return "$step_status"; }; fi
   if [[ -e "$PLIST_STAGED" && -e "$PLIST_PATH" && ! -e "$PRIOR_PRESENT_STAGED" && ! -e "$PLIST_ORIGINAL" ]]; then
-    safe_regular_file "$PLIST_PATH" || return 1; mv -- "$PLIST_PATH" "$PRIOR_PRESENT_STAGED" || return 1
+    safe_regular_file "$PLIST_PATH" || { step_status=$?; recovery_step_failed "verify prior plist" "$step_status"; return "$step_status"; }
+    mv -- "$PLIST_PATH" "$PRIOR_PRESENT_STAGED" || { step_status=$?; recovery_step_failed "restage prior plist" "$step_status"; return "$step_status"; }
   fi
-  restore_staged_artifact "$TOKEN_STAGED" "$DASHBOARD_TOKEN_FILE" || return 1
-  restore_staged_artifact "$PLIST_STAGED" "$PLIST_PATH" || return 1
-  restore_staged_artifact "$OWNERSHIP_STAGED" "$INSTALL_OWNERSHIP" || return 1
-  restore_staged_artifact "$PRIOR_PRESENT_STAGED" "$PLIST_ORIGINAL" || return 1
-  restore_staged_artifact "$PRIOR_ABSENT_STAGED" "$PLIST_ORIGIN_ABSENT" || return 1
-  restore_config_path "$CONFIG_PATH" config || return 1
-  restore_config_path "$CONFIG_STATE" state || return 1
-  restore_config_path "$CONFIG_BACKUP" backup || return 1
-  verify_install_ownership check || return 1
-  if [[ "$loaded" == "true" ]]; then bootstrap_and_prove "$PLIST_PATH" || return $?
-  else prove_service_absent || return 1; fi
-  journal_op cleanup || return 1
-  journal_op remove
+  restore_staged_artifact "$TOKEN_STAGED" "$DASHBOARD_TOKEN_FILE" || { step_status=$?; recovery_step_failed "restore token" "$step_status"; return "$step_status"; }
+  restore_staged_artifact "$PLIST_STAGED" "$PLIST_PATH" || { step_status=$?; recovery_step_failed "restore managed plist" "$step_status"; return "$step_status"; }
+  restore_staged_artifact "$OWNERSHIP_STAGED" "$INSTALL_OWNERSHIP" || { step_status=$?; recovery_step_failed "restore ownership" "$step_status"; return "$step_status"; }
+  restore_staged_artifact "$PRIOR_PRESENT_STAGED" "$PLIST_ORIGINAL" || { step_status=$?; recovery_step_failed "restore prior plist" "$step_status"; return "$step_status"; }
+  restore_staged_artifact "$PRIOR_ABSENT_STAGED" "$PLIST_ORIGIN_ABSENT" || { step_status=$?; recovery_step_failed "restore prior-absent marker" "$step_status"; return "$step_status"; }
+  restore_config_path "$CONFIG_PATH" config || { step_status=$?; recovery_step_failed "restore config" "$step_status"; return "$step_status"; }
+  restore_config_path "$CONFIG_STATE" state || { step_status=$?; recovery_step_failed "restore state" "$step_status"; return "$step_status"; }
+  restore_config_path "$CONFIG_BACKUP" backup || { step_status=$?; recovery_step_failed "restore backup" "$step_status"; return "$step_status"; }
+  verify_install_ownership check || { step_status=$?; recovery_step_failed "verify restored ownership" "$step_status"; return "$step_status"; }
+  if [[ "$loaded" == "true" ]]; then bootstrap_and_prove "$PLIST_PATH" || { step_status=$?; recovery_step_failed "restart service" "$step_status"; return "$step_status"; }
+  else prove_service_absent || { step_status=$?; recovery_step_failed "verify service remains absent" "$step_status"; return "$step_status"; }; fi
+  journal_op cleanup || { step_status=$?; recovery_step_failed "clean journal artifacts" "$step_status"; return "$step_status"; }
+  journal_op remove || { step_status=$?; recovery_step_failed "remove journal" "$step_status"; return "$step_status"; }
 }
 
 transaction_active=0

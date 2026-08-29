@@ -1410,6 +1410,20 @@ print(json.dumps(proof,sort_keys=True,separators=(',',':')))
         ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if preflight.returncode:
             raise AssertionError("workflow release preflight refresh failed\n" + preflight.stdout)
+        receipt_value = json.loads((root / integrator_receipt_path).read_text(encoding="utf-8"))
+        post_preflight_fingerprint = workflow_candidate_fingerprint(
+            root, json.loads((root / ".agent/config.json").read_text(encoding="utf-8")),
+        )
+        if (set(receipt_value) != {"schema", "run_id", "candidate_sha256", "runner", "cases"}
+                or receipt_value.get("schema") != "agent-test-receipt/v3"
+                or receipt_value.get("candidate_sha256") != post_preflight_fingerprint):
+            raise AssertionError("workflow integrator receipt mismatch before gate: " + json.dumps({
+                "keys": sorted(receipt_value), "schema": receipt_value.get("schema"),
+                "receipt_candidate": receipt_value.get("candidate_sha256"),
+                "preflight_candidate": candidate_sha256,
+                "post_preflight_candidate": post_preflight_fingerprint,
+                "path": integrator_receipt_path,
+            }, sort_keys=True))
         gate = subprocess.run([
             sys.executable, ".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
             "run", "--runner", runner_path, "--receipt", live_path,

@@ -26,6 +26,17 @@ def write_json(path,value):
 
 
 def alive(pid):
+    if sys.platform.startswith("linux"):
+        try:
+            raw=(Path("/proc")/str(pid)/"stat").read_bytes()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
+        else:
+            close=raw.rfind(b")")
+            if close >= 0 and raw[close+2:close+3] in {b"Z",b"X"}:
+                return False
     try: os.kill(pid,0); return True
     except ProcessLookupError: return False
     except PermissionError: return True

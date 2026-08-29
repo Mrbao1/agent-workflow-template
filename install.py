@@ -114,6 +114,7 @@ RELEASED_PXPIPE_HELPER_SETS=(
  {"scripts/uninstall-codex-default.sh":"3c8d8e9fae692adb5df3ef63663b9367f216ecbbfb7628d5104f543f741d9375","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
  {"scripts/uninstall-codex-default.sh":"0f793ab6f3ee97942c4866bf1631ea929a2ee7512fe0bc39c4218110adc1f8e3","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
  {"scripts/uninstall-codex-default.sh":"30023f6db457710f4b7939946d384a1180c895ec28c65d7a7ca1aa7f7d468717","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
+ {"scripts/uninstall-codex-default.sh":"221633419fa486d2ff6fe6ec934a299e6e6e3debfce79b0632a5242e564a3924","scripts/codex-default-config.mjs":"593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483"},
 )
 BOOTSTRAP_START="<!-- agent-workflow-bootstrap:start -->"
 BOOTSTRAP_END="<!-- agent-workflow-bootstrap:end -->"

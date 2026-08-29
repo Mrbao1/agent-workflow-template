@@ -332,8 +332,10 @@ def protected_path_indirection(path: Path) -> bool:
             metadata = current.lstat()
         except OSError:
             return False
-        if (metadata.st_uid == current_uid or stat.S_IMODE(metadata.st_mode) & 0o022
-                or os.access(current, os.W_OK)):
+        if metadata.st_uid == current_uid:
+            return False
+        if (not stat.S_ISLNK(metadata.st_mode)
+                and (stat.S_IMODE(metadata.st_mode) & 0o022 or os.access(current, os.W_OK))):
             return False
     return True
 
@@ -406,7 +408,7 @@ def validate_adapter_launcher(path: Path) -> None:
         if interpreter.name=="env":
             if len(parts)!=2 or re.fullmatch(r"[A-Za-z0-9._+-]+",parts[1]) is None:
                 raise SystemExit("provider adapter env shebang is not a bounded interpreter lookup")
-            lookup=next((candidate for candidate in (Path("/usr/local/bin")/parts[1],Path("/usr/bin")/parts[1],Path("/bin")/parts[1]) if candidate.is_file()),None)
+            lookup=next((candidate for candidate in (Path("/usr/bin")/parts[1],Path("/usr/local/bin")/parts[1],Path("/bin")/parts[1]) if candidate.is_file()),None)
             if lookup is None: raise SystemExit("provider adapter env interpreter is unavailable on the sealed PATH")
             try: canonical=lookup.resolve(strict=True)
             except OSError as error: raise SystemExit("provider adapter interpreter is unavailable") from error
@@ -627,7 +629,7 @@ def run_adapter(adapter: Path, arguments, *, required_operations, timeout: int, 
                 os.write(descriptor,receipt_raw); os.fsync(descriptor)
             finally: os.close(descriptor)
             command=[str(adapter),*arguments,receipt_option,str(receipt_path)]
-        environment={"PATH":"/usr/local/bin:/usr/bin:/bin","HOME":str(home),"TMPDIR":str(home),"LANG":"C","LC_ALL":"C","TZ":"UTC"}
+        environment={"PATH":"/usr/bin:/usr/local/bin:/bin","HOME":str(home),"TMPDIR":str(home),"LANG":"C","LC_ALL":"C","TZ":"UTC"}
         process=None; output_stream=None; known={}
         try:
             if signal.getsignal(signal.SIGCHLD) is not signal.SIG_DFL:
