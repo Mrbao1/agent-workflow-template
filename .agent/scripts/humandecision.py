@@ -320,6 +320,24 @@ def protected_path_chain(path: Path) -> bool:
     return True
 
 
+def protected_path_indirection(path: Path) -> bool:
+    """Allow an interpreter lookup symlink only when every lexical component is OS-protected."""
+    if not hasattr(os, "geteuid") or not path.is_absolute():
+        return False
+    current_uid = os.geteuid()
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return False
+        if (metadata.st_uid == current_uid or stat.S_IMODE(metadata.st_mode) & 0o022
+                or os.access(current, os.W_OK)):
+            return False
+    return True
+
+
 def verify_adapter_metadata(path: Path, required_operations) -> None:
     metadata_path = Path(str(path) + ADAPTER_METADATA_SUFFIX)
     try:
@@ -388,9 +406,13 @@ def validate_adapter_launcher(path: Path) -> None:
         if interpreter.name=="env":
             if len(parts)!=2 or re.fullmatch(r"[A-Za-z0-9._+-]+",parts[1]) is None:
                 raise SystemExit("provider adapter env shebang is not a bounded interpreter lookup")
-            resolved=next((candidate for candidate in (Path("/usr/local/bin")/parts[1],Path("/usr/bin")/parts[1],Path("/bin")/parts[1]) if candidate.is_file()),None)
-            if resolved is None: raise SystemExit("provider adapter env interpreter is unavailable on the sealed PATH")
-            interpreter=resolved
+            lookup=next((candidate for candidate in (Path("/usr/local/bin")/parts[1],Path("/usr/bin")/parts[1],Path("/bin")/parts[1]) if candidate.is_file()),None)
+            if lookup is None: raise SystemExit("provider adapter env interpreter is unavailable on the sealed PATH")
+            try: canonical=lookup.resolve(strict=True)
+            except OSError as error: raise SystemExit("provider adapter interpreter is unavailable") from error
+            if not protected_path_indirection(lookup) or not protected_path_chain(canonical):
+                raise SystemExit("provider adapter interpreter must be OS-protected and non-agent-writable")
+            interpreter=canonical
         elif len(parts)!=1:
             raise SystemExit("provider adapter shebang arguments are not allowed")
         try: canonical=interpreter.resolve(strict=True)

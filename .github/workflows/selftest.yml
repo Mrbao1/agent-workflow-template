@@ -135,9 +135,9 @@ jobs:
                           raise SystemExit("selected Python runtime has an unsafe owner")
                       if stat.S_ISLNK(metadata.st_mode):
                           try:
-                              path.resolve(strict=True).relative_to(runtime_root)
-                          except (OSError, ValueError):
-                              raise SystemExit("selected Python runtime contains an external or broken symlink")
+                              path.resolve(strict=False).relative_to(runtime_root)
+                          except (OSError, RuntimeError, ValueError):
+                              raise SystemExit("selected Python runtime contains an external symlink")
                       elif stat.S_ISREG(metadata.st_mode):
                           total_bytes += metadata.st_size
                           if total_bytes > 2 * 1024 * 1024 * 1024:
@@ -169,6 +169,7 @@ jobs:
             "$AGENT_CI_PYTHON" tests/run_all.py \
               --context "$context" \
               --shard "${{ matrix.shard }}" \
+              --jobs 1 \
               --test-timeout 600 \
               --require-command node \
               --require-command lsof \

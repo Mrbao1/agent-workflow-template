@@ -1371,6 +1371,13 @@ print(json.dumps(proof,sort_keys=True,separators=(',',':')))
     # its candidate SHA is distinct from the review payload and must already
     # match the candidate the workflow release gate will verify.
     completed_ledger(root, node6_path=impl)
+    settled_candidate = workflow_candidate_fingerprint(
+        root, json.loads((root / ".agent/config.json").read_text(encoding="utf-8")),
+    )
+    # Some fresh filesystems materialize previously absent governed directory
+    # topology during the first ledger fixture pass. Rebuild the disposable
+    # evidence only after that topology settles, then require exact stability.
+    completed_ledger(root, node6_path=impl)
     ledger = json.loads((root / ".agent/state/agents.json").read_text(encoding="utf-8"))
     integrator = next(item for item in ledger["members"] if item["role_type"] == "integrator")
     replay_records = [
@@ -1384,6 +1391,11 @@ print(json.dumps(proof,sort_keys=True,separators=(',',':')))
     fingerprint = workflow_candidate_fingerprint(
         root, json.loads((root / ".agent/config.json").read_text(encoding="utf-8")),
     )
+    if fingerprint != settled_candidate:
+        raise AssertionError(
+            "workflow candidate changed after its settled ledger rebuild: "
+            + json.dumps({"settled": settled_candidate, "current": fingerprint}, sort_keys=True)
+        )
     signed_candidate_records = workflow_candidate_records(root)
     live_path = ".agent/state/evidence/workflow-live.json"
     def refresh_release_gate(candidate_sha256: str) -> None:

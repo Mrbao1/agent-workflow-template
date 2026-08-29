@@ -143,6 +143,67 @@ candidate-selftest-evidence:
                       break
                   output.write(chunk)
           lsof_destination.chmod(0o755)
+      ci_uid = 10001
+      ci_gid = 10001
+      ci_name = "agent-ci"
+      import grp
+      import pwd
+      for lookup, value, label in (
+          (pwd.getpwnam, ci_name, "user name"), (pwd.getpwuid, ci_uid, "user id"),
+          (grp.getgrnam, ci_name, "group name"), (grp.getgrgid, ci_gid, "group id"),
+      ):
+          try:
+              lookup(value)
+          except KeyError:
+              continue
+          raise SystemExit(f"dedicated CI {label} is already allocated")
+      def append_account(path, line):
+          before = os.lstat(path)
+          if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                  or before.st_mode & 0o022 or before.st_size > 1024 * 1024):
+              raise SystemExit(f"unsafe account database: {path}")
+          flags = os.O_WRONLY | os.O_APPEND | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+          descriptor = os.open(path, flags)
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                  raise SystemExit(f"account database changed while opening: {path}")
+              os.write(descriptor, line.encode("ascii"))
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+      append_account("/etc/group", f"{ci_name}:x:{ci_gid}:\n")
+      append_account("/etc/passwd", f"{ci_name}:x:{ci_uid}:{ci_gid}:Agent CI:/home/{ci_name}:/bin/sh\n")
+      home = Path("/home") / ci_name
+      home.mkdir(mode=0o700)
+      os.chown(home, ci_uid, ci_gid)
+      project = Path(os.environ["CI_PROJECT_DIR"]).resolve(strict=True)
+      entries = 0
+      total_bytes = 0
+      pending = [project]
+      ownership_targets = [project]
+      while pending:
+          directory = pending.pop()
+          with os.scandir(directory) as children:
+              for child in children:
+                  entries += 1
+                  if entries > 100000:
+                      raise SystemExit("CI checkout exceeds its ownership entry bound")
+                  path = Path(child.path)
+                  metadata = child.stat(follow_symlinks=False)
+                  if stat.S_ISLNK(metadata.st_mode):
+                      raise SystemExit("CI checkout contains an unsupported symlink")
+                  if stat.S_ISREG(metadata.st_mode):
+                      total_bytes += metadata.st_size
+                      if total_bytes > 2 * 1024 * 1024 * 1024:
+                          raise SystemExit("CI checkout exceeds its ownership byte bound")
+                  elif stat.S_ISDIR(metadata.st_mode):
+                      pending.append(path)
+                  else:
+                      raise SystemExit("CI checkout contains an unsupported entry")
+                  ownership_targets.append(path)
+      for target in reversed(ownership_targets):
+          os.chown(target, ci_uid, ci_gid)
       PY
     - export PATH="/opt/agent-ci-tools:$PATH"
     - python3 --version
@@ -150,11 +211,37 @@ candidate-selftest-evidence:
     - lsof -v
     - git --version
   script:
-    - mkdir -m 700 .ci-home
     - |-
       set -eu
       for context in idle-source polluted-source installed-project; do
-        env -i PATH="/opt/agent-ci-tools:/usr/local/bin:/usr/bin:/bin" HOME="$CI_PROJECT_DIR/.ci-home" LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 python3 tests/run_all.py --context "$context" --shard "$SHARD" --test-timeout 600 --require-command python --require-command node --require-command lsof --require-command git --fail-on-skip --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py --report "outputs/gitlab-self-suite-minimum-$context-$CI_NODE_INDEX.json"
+      python3 - "$context" "$SHARD" "$CI_NODE_INDEX" <<'PY'
+      import os
+      from pathlib import Path
+      import sys
+
+      context, shard, node_index = sys.argv[1:]
+      project = Path.cwd().resolve(strict=True)
+      interpreter = str(Path(sys.executable).resolve(strict=True))
+      command = [
+          interpreter, "tests/run_all.py", "--context", context, "--shard", shard,
+          "--jobs", "1", "--test-timeout", "600",
+          "--require-command", "python", "--require-command", "node",
+          "--require-command", "lsof", "--require-command", "git", "--fail-on-skip",
+          "--allow-skip", ".agent/skills/manage-local-runtime/scripts/self_test_docker_http.py",
+          "--report", f"outputs/gitlab-self-suite-minimum-{context}-{node_index}.json",
+      ]
+      environment = {
+          "PATH": "/opt/agent-ci-tools:/usr/local/bin:/usr/bin:/bin",
+          "HOME": "/home/agent-ci", "USER": "agent-ci", "LOGNAME": "agent-ci",
+          "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC",
+          "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
+      }
+      os.setgroups([])
+      os.setgid(10001)
+      os.setuid(10001)
+      os.chdir(project)
+      os.execve(interpreter, command, environment)
+      PY
       done
   after_script:
     - rm -rf -- /opt/agent-ci-tools .ci-home .ci-node.tar.xz

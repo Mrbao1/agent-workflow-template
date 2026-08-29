@@ -12,7 +12,7 @@
   "source_lockfile": null,
   "source_lockfile_sha256": null,
   "esbuild_main_sha256": null,
-  "plugin_tree_sha256": "85a6e37196d6173b9883c78991b7ac40e7f26bafc15c6a7e18cc71af1e08836f",
+  "plugin_tree_sha256": "285c8efae8f00113689241772f7cb318d3aebb2b33933d37184dcc721760aa6c",
   "runtime_bundle": null,
   "runtime_bundle_sha256": null,
   "proxy_bundle": null,
@@ -22,6 +22,6 @@
     "scripts/codex-pxpipe.sh": "b000ed911aac54ea79a882926561b1e6ac90187167271f6260cca767c1c9169b",
     "scripts/install-codex-default.sh": "79c8c5cd4f7ae748293394f4962def13c6aff6f55b5c8985a6b9d6f3110b0a45",
     "scripts/status-codex-default.sh": "e6456bff843377b6f11c51a4b56a7b9dda87893a5c421cd3a9df6967b6441107",
-    "scripts/uninstall-codex-default.sh": "0f793ab6f3ee97942c4866bf1631ea929a2ee7512fe0bc39c4218110adc1f8e3"
+    "scripts/uninstall-codex-default.sh": "30023f6db457710f4b7939946d384a1180c895ec28c65d7a7ca1aa7f7d468717"
   }
 }

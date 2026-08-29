@@ -187,11 +187,18 @@ NODE
 }
 
 safe_regular_file() {
-  local target="$1" links owner mode
+  local target="$1" expected_owner
   [[ -f "$target" && ! -L "$target" ]] || return 1
-  read -r links owner mode < <(stat_links_owner_mode "$target") || return 1
-  [[ "$links" == "1" && "$owner" == "$($ID_BIN -u)" ]] || return 1
-  (( (8#$mode & 8#22) == 0 ))
+  expected_owner="$($ID_BIN -u)" || return 1
+  "$NODE_BIN" - "$target" "$expected_owner" <<'NODE'
+const fs = require("node:fs");
+const [target, expectedOwner] = process.argv.slice(2);
+try {
+  const observed = fs.lstatSync(target);
+  if (!observed.isFile() || observed.isSymbolicLink() || observed.nlink !== 1
+      || String(observed.uid) !== expectedOwner || (observed.mode & 0o022) !== 0) process.exit(1);
+} catch { process.exit(1); }
+NODE
 }
 
 capture_config_path() {
