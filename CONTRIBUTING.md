@@ -5,9 +5,9 @@
 The checked-in, candidate-owned GitHub evidence matrix exercises the Cartesian product of both toolchain pairs on both hosts:
 
 - Ubuntu 24.04 with Python 3.9.21 and Node.js 20.19.4
-- Ubuntu 24.04 with Python 3.13.5 and Node.js 22.18.0
+- Ubuntu 24.04 with Python 3.14.0 and Node.js 22.18.0
 - macOS 14 ARM64 with the latest published Python 3.9 ARM64 toolcache build, 3.9.13, and Node.js 20.19.4
-- macOS 14 with Python 3.13.5 and Node.js 22.18.0
+- macOS 14 with Python 3.14.0 and Node.js 22.18.0
 
 Every combination runs both shards across `idle-source`, `polluted-source`, and `installed-project`; tests inside each shard are serial so identity-scoped process observers never compete with sibling tests. The setup-selected Node executable is copied beneath an owner-only account-home path, while every privileged Python bootstrap uses isolated/no-bytecode mode and the resolved setup-selected Python executable owner chain and bounded runtime tree are identity-checked and stripped of group/other write bits before the exact staged re-exec. Skips fail except the exact audited Docker-not-applicable self-test. This workflow is useful evidence only: a protected immutable external or protected-default-branch verifier must authenticate the candidate bytes and effective matrix before its independently named required check can authorize a release.
 
@@ -20,8 +20,10 @@ stack default copied into adopter projects. Generated project CI uses only the r
 confirmed in that project's Blueprint.
 
 The installer currently requires a POSIX host because it uses advisory file locking.
-Use Git, Python, and Node executables available on PATH; no package installation is
-required for the repository's standard self-suite.
+Use Git, Python, and Node executables available on PATH. Task startup and the standard
+self-suite also require an OS-admin-installed `lsof` whose canonical executable and full
+parent chain are root-owned and not group/other-writable; user-managed shadows are rejected.
+The repository never invokes a host package manager implicitly.
 
 ## Development workflow
 

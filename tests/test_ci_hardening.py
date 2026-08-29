@@ -489,7 +489,7 @@ class WorkflowHardeningTests(unittest.TestCase):
         self.assertIn("for context in idle-source polluted-source installed-project",text)
         self.assertIn('python-version: "3.9.21"',text)
         self.assertIn('python-version: "3.9.13"',text)
-        self.assertIn('python-version: "3.13.5"',text)
+        self.assertIn('python-version: "3.14.0"',text)
         self.assertIn('node-version: "20.19.4"',text)
         self.assertIn('node-version: "22.18.0"',text)
         self.assertIn("/usr/bin/sudo -n /usr/bin/env",text)

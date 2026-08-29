@@ -39,11 +39,11 @@ jobs:
             node-version: "20.19.4"
           - os: ubuntu-24.04
             toolchain: modern-pinned
-            python-version: "3.13.5"
+            python-version: "3.14.0"
             node-version: "22.18.0"
           - os: macos-14
             toolchain: modern-pinned
-            python-version: "3.13.5"
+            python-version: "3.14.0"
             node-version: "22.18.0"
     steps:
       - name: Check out repository

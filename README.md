@@ -28,8 +28,9 @@
 
 | 边界 | 支持状态 |
 |---|---|
-| Python | CPython 3.9–3.13；只使用标准库 |
+| Python | CPython 3.9 或更高版本；只使用标准库，证据矩阵固定验证 3.9 下限与当前 3.14 |
 | 操作系统 | Linux、macOS；依赖 POSIX `fcntl`、进程组、文件 mode 和原子 rename |
+| 进程观察器 | 系统管理员安装的 `lsof`；解析后的可执行文件及完整父链必须由 root 持有且不可由 group/other 写（macOS 使用系统自带版本） |
 | Windows | 原生 Windows 不支持并在前置检查中失败；WSL2 按 Linux 语义使用 |
 | Provider / Git host | 保持空值或记录任意用户确认的 provider；GitHub/GitLab 仅是内置生成器，不是封闭枚举 |
 | 技术栈/模型 | 无默认语言、框架、云、数据库或模型；以用户/host 已确认配置为准 |
@@ -39,7 +40,10 @@
 
 ## 安装
 
+首次安装前必须确认受信 `lsof` 可用；Linux 最小镜像通常需要由系统管理员通过发行版包管理器安装，用户目录中的副本会被拒绝。模板不会隐式安装或提权安装宿主软件。`agentctl.py start` 会在任务创建前 fail closed，而不是在缺少可靠进程观察能力时继续。
+
 ```bash
+command -v lsof
 python3 install.py /path/to/project --project-name my-project
 cd /path/to/project
 
