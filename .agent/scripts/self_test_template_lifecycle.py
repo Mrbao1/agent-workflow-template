@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -15,11 +16,18 @@ from typing import Optional
 
 def run(*command: str, cwd: Optional[Path] = None, expected: int = 0) -> subprocess.CompletedProcess:
     command=list(command)
-    if len(command)>=2 and command[1].endswith("install.py") and "--project-name" in command and not any(item in {"--check","--update","--adopt"} for item in command) and "--human-decision-adapter" not in command:
-        command.extend(["--human-decision-adapter","/usr/bin/true"])
+    caller_line=sys._getframe(1).f_lineno
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"]="1"
+    fixture_root = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
+    provider_site = fixture_root / ".test-provider-site"
+    if provider_site.is_dir():
+        inherited = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = str(provider_site) + (os.pathsep + inherited if inherited else "")
     result = subprocess.run(
         command,
         cwd=cwd,
+        env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -28,13 +36,65 @@ def run(*command: str, cwd: Optional[Path] = None, expected: int = 0) -> subproc
     if result.returncode != expected:
         raise SystemExit(
             f"unexpected exit {result.returncode}, expected {expected} "
-            f"(cwd={cwd or Path.cwd()}): {' '.join(command)}\n{result.stdout}"
+            f"(fixture call line {caller_line}, cwd={cwd or Path.cwd()}): {' '.join(command)}\n{result.stdout}"
         )
     return result
 
 
+def install_test_provider_verifier(root: Path) -> None:
+    """Install a process-scoped provider simulator in one disposable project."""
+    site = root / ".test-provider-site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "import hashlib,json,sys\nfrom pathlib import Path\n"
+        "sys.path.insert(0,str(Path.cwd()/'.agent/scripts'))\n"
+        "import humandecision\n"
+        "def _verify(root,config,task,*,gate,artifact_sha256,source,receipt,require_fresh=True):\n"
+        " path=(Path(root)/receipt).resolve();raw=path.read_bytes()\n"
+        " if json.loads(raw)!={'test_provider_receipt':True}: raise SystemExit('test provider rejected receipt')\n"
+        " return {'schema':'agent-human-decision-receipt/v1','path':str(path.relative_to(Path(root).resolve())),'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw),'decision_id':'template-lifecycle-provider','authority':'provider-signed-user-message','adapter_path':'/test/provider/decision-adapter','adapter_sha256':'b'*64}\n"
+        "def _reverify(root,config,task,*,gate,artifact_sha256,source,record):\n"
+        " try: return isinstance(record,dict) and record==_verify(root,config,task,gate=gate,artifact_sha256=artifact_sha256,source=source,receipt=record.get('path',''),require_fresh=False)\n"
+        " except BaseException: return False\n"
+        "humandecision.verify=_verify\nhumandecision.reverify=_reverify\n",
+        encoding="utf-8",
+    )
+
+
+def write_test_provider_receipt(root: Path, name: str) -> Path:
+    path = root / ".agent/state" / name
+    path.write_text('{"test_provider_receipt":true}\n', encoding="utf-8")
+    return path
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+
+
+def released_legacy_manifest(current: dict[str, object],schema: str,version: str,migration: int) -> dict[str, object]:
+    """Build one exact released v1/v3/v4 predecessor from a current v5 manifest."""
+    agent_files=dict(current["agent_files"])
+    if schema=="agent-workflow-install/v1":
+        return {"schema":schema,"version":version,"migration_version":migration,"files":agent_files,
+                "source_tree_sha256":hashlib.sha256(json.dumps(agent_files,sort_keys=True,separators=(",",":")).encode()).hexdigest()}
+    if schema not in {"agent-workflow-install/v3","agent-workflow-install/v4"}:
+        raise AssertionError(f"unsupported legacy fixture schema: {schema}")
+    value={
+        "schema":schema,"version":version,"migration_version":migration,"agent_files":agent_files,
+        "repo_plugin_files":{},"marketplace_entry":{"name":"pxpipe-context","sha256":"0"*64},
+        "agents_bootstrap":dict(current["agents_bootstrap"]),
+    }
+    payload={"agent_files":agent_files,"repo_plugin_files":{},"marketplace_entry_sha256":"0"*64,
+             "agents_bootstrap_sha256":value["agents_bootstrap"]["sha256"]}
+    if schema=="agent-workflow-install/v4":
+        value["claude_bootstrap"]=dict(current["claude_bootstrap"])
+        payload["claude_bootstrap_sha256"]=value["claude_bootstrap"]["sha256"]
+    value["source_tree_sha256"]=canonical_sha256(payload)
+    return value
 
 
 def receipt(root: Path, path: Path) -> dict[str, object]:
@@ -121,6 +181,7 @@ def activate_migration22_hot_state(target: Path) -> None:
     agent = target / ".agent"; state = agent / "state"
     config_path = agent / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["agent_control"]["default_model"] = "vendor-x/reasoning.model+2026"
     config["context"]["max_rollback_entries"] = 8
     config["context"].pop("max_failure_entries", None)
     config["context"].pop("max_failure_archive_depth", None)
@@ -138,6 +199,10 @@ def activate_migration22_hot_state(target: Path) -> None:
 
     contract = "# Requirement Contract\n\n- Human decisions: user:migration-fixture\n- Clarified: true\n"
     (state / "REQUIREMENT_CONTRACT.md").write_text(contract, encoding="utf-8")
+    agents_path = state / "agents.json"
+    agents = json.loads(agents_path.read_text(encoding="utf-8"))
+    agents["default_model"] = "vendor-x/reasoning.model+2026"
+    agents_path.write_text(json.dumps(agents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     task_path = state / "TASK.json"; task = json.loads(task_path.read_text(encoding="utf-8"))
     task.update({
         "title": "migration 22 active hot-state fixture",
@@ -184,9 +249,11 @@ def activate_migration22_hot_state(target: Path) -> None:
     )
     (state / "EVIDENCE_INDEX.json").unlink(missing_ok=True)
     manifest_path = agent / ".workflow-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["version"] = "3.1.25"; manifest["migration_version"] = 22
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    manifest = released_legacy_manifest(
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+        "agent-workflow-install/v1","3.1.40",32,
+    )
+    manifest_path.write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
 
 
 def main() -> int:
@@ -200,6 +267,17 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="workflow-template-test-") as raw:
         workspace = Path(raw)
+
+        def initialize_migration_fixture(project: Path, label: str) -> None:
+            guardrails=project/f"{label}-guardrails.md"
+            guardrails.write_text("# Project Guardrails\n\n## Required project facts\n\n"
+                "- Product and users: Disposable workflow migration fixture.\n"
+                "- Technology and architecture: Python controls and local JSON state.\n"
+                "- Writable and read-only areas: The fixture is writable; external paths are read-only.\n"
+                "- Security, privacy, compliance and performance red lines: No credentials or external effects.\n"
+                "- Build, test and lint commands: Run the template lifecycle self-test.\n"
+                "- Deployment authority and rollback owner: No deployment; the fixture owner rolls back.\n",encoding="utf-8")
+            run(sys.executable,".agent/scripts/agentctl.py","project-init","--guardrails-file",guardrails.name,cwd=project)
 
         # Positive fresh install and transactional managed update.
         target = workspace / "project"
@@ -281,10 +359,10 @@ def main() -> int:
                 "source": "orchestrator-user-message", "automatic_gate_trust": False,
                 "human_verification_required": True,
                 "allow_current_chat_local_release": False,
-                "signed_adapter": "/usr/bin/true",
+                "signed_adapter": None,
                 "max_receipt_age_seconds": 900,
             }
-            or fresh_task.get("decision_policy_version") != 2
+            or fresh_task.get("decision_policy_version") != 1
             or fresh_task.get("task_archive") is not None
             or fresh_agents.get("platform_observer") != fresh_config.get("platform_observer")
             or fresh_agents.get("platform_empty_verified") is not False
@@ -326,9 +404,17 @@ def main() -> int:
                 sys.executable, ".agent/scripts/agentctl.py", "project-init",
                 "--guardrails-file", guardrails.name, cwd=fast_target,
             )
-            run(sys.executable, ".agent/scripts/agentctl.py", "bootstrap-check", cwd=fast_target)
+            bootstrap = run(
+                sys.executable, ".agent/scripts/agentctl.py", "bootstrap-check",
+                cwd=fast_target, expected=2,
+            )
+            if (
+                "BOOTSTRAP NOT READY: provider-owned human-decision adapter is not configured" not in bootstrap.stdout
+                or "AUTHORITATIVE GATES BLOCKED" not in bootstrap.stdout
+            ):
+                raise SystemExit(f"adapterless initialized project overclaimed authority:\n{bootstrap.stdout}")
             run(
-                sys.executable, ".agent/scripts/agentctl.py", "start",
+                sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
                 "--title", f"{name} bounded fast fixture",
                 "--mode", requested_mode,
                 "--environment", "local",
@@ -353,6 +439,10 @@ def main() -> int:
             run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=fast_target)
             run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=fast_target)
             if approve:
+                install_test_provider_verifier(fast_target)
+                requirement_receipt = write_test_provider_receipt(
+                    fast_target, "test-fast-requirement-receipt.json",
+                )
                 contract_path = fast_target / ".agent/state/REQUIREMENT_CONTRACT.md"
                 contract_path.write_text(
                     "# Requirement Contract\n\n"
@@ -375,6 +465,7 @@ def main() -> int:
                 run(
                     sys.executable, ".agent/scripts/agentctl.py", "approve-requirements",
                     "--source", "user:template-lifecycle-fast",
+                    "--human-decision-receipt", str(requirement_receipt.relative_to(fast_target)),
                     cwd=fast_target,
                 )
                 approved_task = json.loads((fast_target / ".agent/state/TASK.json").read_text(encoding="utf-8"))
@@ -443,8 +534,9 @@ def main() -> int:
                     render("fast-projection", ".agent/state/artifacts/01-fast-projection.json", {
                         "requirement_contract_sha256": routed_task["requirement_contract_sha256"],
                         "scope_summary": "real installed fast lifecycle",
-                        "change_receipts": changes,
-                        "check_receipts": checks,
+                        "change_receipts":changes,
+                        "candidate_snapshot_receipts":[{**item,"mode":420} for item in changes],
+                        "check_receipts":checks,
                         "cleanup_receipt": cleanup,
                         "exclusions": [],
                     })
@@ -453,8 +545,9 @@ def main() -> int:
                         "requirement_contract_sha256": routed_task["requirement_contract_sha256"],
                         "mode_appropriate_implementer_agent_id": None,
                         "projection": [2, 3, 4, 5, 6],
-                        "change_receipts": changes,
-                        "check_receipts": checks,
+                        "change_receipts":changes,
+                        "candidate_snapshot_receipts":[{**item,"mode":420} for item in changes],
+                        "check_receipts":checks,
                         "cleanup_receipt": cleanup,
                         "scope_summary": "real installed fast lifecycle",
                     })
@@ -582,6 +675,10 @@ def main() -> int:
                         raise SystemExit(
                             "terminal completion did not fail closed on an unresolved risk"
                         )
+                    # The negative completion and concurrent lifecycle load may
+                    # consume the bounded observation window. Re-observe the
+                    # still-empty platform immediately before authorization.
+                    final_snapshot = empty_platform_snapshot(final_snapshot)
                     run(
                         sys.executable, ".agent/scripts/workflowctl.py", "complete-task",
                         "--retrospective", ".agent/state/artifacts/08-retrospective.md",
@@ -716,7 +813,7 @@ def main() -> int:
                     ).read_bytes()
                     before_rollover_context = post_turn_context_path.read_bytes()
                     blocked_rollover = run(
-                        sys.executable, ".agent/scripts/agentctl.py", "start",
+                        sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
                         "--title", "blocked compact rollover",
                         "--mode", "fast", "--environment", "local",
                         "--task-type", "maintenance", "--complexity", "tiny",
@@ -732,17 +829,33 @@ def main() -> int:
                         raise SystemExit(
                             "compact rollover did not fail before replacing task/context state"
                         )
-                    # Migration 39 rewrites pre-fix active/accepted capsules
-                    # with the effective resume state while preserving the
-                    # monotonic estimate and durable terminal provenance.
+                    # Migration 39 preserves the monotonic budget estimate;
+                    # migration 41 then conservatively revokes every unverifiable
+                    # predecessor approval and rebinds route/stage to Node 1.
                     installed_manifest_path = (
                         fast_target / ".agent/.workflow-manifest.json"
                     )
                     installed_manifest = json.loads(
                         installed_manifest_path.read_text(encoding="utf-8")
                     )
+                    installed_manifest["schema"] = "agent-workflow-install/v4"
                     installed_manifest["version"] = "3.1.46"
                     installed_manifest["migration_version"] = 38
+                    installed_manifest["repo_plugin_files"] = {}
+                    installed_manifest["marketplace_entry"] = {
+                        "name": "pxpipe-context", "sha256": "0" * 64,
+                    }
+                    legacy_payload = {
+                        "agent_files": installed_manifest["agent_files"],
+                        "repo_plugin_files": installed_manifest["repo_plugin_files"],
+                        "marketplace_entry_sha256": installed_manifest["marketplace_entry"]["sha256"],
+                        "agents_bootstrap_sha256": installed_manifest["agents_bootstrap"]["sha256"],
+                        "claude_bootstrap_sha256": installed_manifest["claude_bootstrap"]["sha256"],
+                    }
+                    installed_manifest["source_tree_sha256"] = hashlib.sha256(
+                        json.dumps(legacy_payload, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":")).encode()
+                    ).hexdigest()
                     installed_manifest_path.write_text(
                         json.dumps(installed_manifest, indent=2) + "\n",
                         encoding="utf-8",
@@ -761,6 +874,7 @@ def main() -> int:
                         sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
                         cwd=fast_target,
                     ).stdout)
+                    migrated_task = json.loads((fast_target / ".agent/state/TASK.json").read_text(encoding="utf-8"))
                     if (
                         migrated_context.get("checkpoint", {}).get("reason")
                         != "migration-39-budget-resume-rebind"
@@ -770,22 +884,37 @@ def main() -> int:
                         < before_migration_estimate
                         or migrated_context.get("resume", {}).get("budget_state")
                         != migrated_route.get("budget_state")
-                        or migrated_route.get("terminal") is not True
+                        or migrated_route.get("terminal") is not False
+                        or migrated_route.get("control") != "human-decision-required"
+                        or migrated_task.get("status") != "waiting_human"
+                        or migrated_task.get("requirements_clarified") is not False
+                        or migrated_task.get("gate_approvals") != {}
+                        or migrated_task.get("current_node") != 1
+                        or migrated_task.get("accepted_nodes") != [0]
                     ):
-                        raise SystemExit(
-                            "migration 39 did not preserve terminal effective-budget state"
-                        )
+                        raise SystemExit("migration 39/41 state mismatch: " + json.dumps({
+                            "checkpoint": migrated_context.get("checkpoint"),
+                            "compaction": migrated_context.get("compaction"),
+                            "usage": migrated_context.get("usage_freshness"),
+                            "resume": migrated_context.get("resume"),
+                            "route": migrated_route,
+                            "task": {key: migrated_task.get(key) for key in (
+                                "status", "current_node", "accepted_nodes", "requirements_clarified", "gate_approvals")},
+                        }, sort_keys=True))
                     run(
                         sys.executable, ".agent/scripts/contextctl.py", "account-turn",
                         "--turn-id", "real-lifecycle-post-migration-39-turn",
                         cwd=fast_target,
                     )
-                    if json.loads(run(
+                    post_migration_turn_route = json.loads(run(
                         sys.executable, ".agent/scripts/workflowctl.py", "route-resume",
                         cwd=fast_target,
-                    ).stdout).get("terminal") is not True:
+                    ).stdout)
+                    if (post_migration_turn_route.get("terminal") is not False
+                            or post_migration_turn_route.get("current_node") != 1
+                            or post_migration_turn_route.get("control") != "human-decision-required"):
                         raise SystemExit(
-                            "migration 39 terminal origin did not survive host-turn accounting"
+                            "host-turn accounting restored authority revoked by migration 41"
                         )
             return fast_target
 
@@ -810,6 +939,19 @@ def main() -> int:
         )
         if strike_install.returncode:
             raise SystemExit(f"real three-strike install failed:\n{strike_install.stdout}")
+        install_test_provider_verifier(strike_target)
+        strike_requirement_receipt = write_test_provider_receipt(
+            strike_target, "test-strike-requirement-receipt.json",
+        )
+        strike_lightweight_repair_receipt = write_test_provider_receipt(
+            strike_target, "test-strike-lightweight-repair-receipt.json",
+        )
+        strike_repair_receipt = write_test_provider_receipt(
+            strike_target, "test-strike-repair-receipt.json",
+        )
+        strike_failure_receipt = write_test_provider_receipt(
+            strike_target, "test-strike-failure-receipt.json",
+        )
         strike_guardrails = strike_target / "project-guardrails.md"
         strike_guardrails.write_text(
             "# Project Guardrails\n\n"
@@ -827,7 +969,7 @@ def main() -> int:
             "--guardrails-file", strike_guardrails.name, cwd=strike_target,
         )
         run(
-            sys.executable, ".agent/scripts/agentctl.py", "start",
+            sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
             "--title", "real three-strike recovery", "--mode", "standard",
             "--environment", "local", "--task-type", "maintenance",
             "--complexity", "bounded", "--files", "3", cwd=strike_target,
@@ -853,7 +995,9 @@ def main() -> int:
         )
         run(
             sys.executable, ".agent/scripts/agentctl.py", "approve-requirements",
-            "--source", "user:real-three-strike", cwd=strike_target,
+            "--source", "user:real-three-strike",
+            "--human-decision-receipt", str(strike_requirement_receipt.relative_to(strike_target)),
+            cwd=strike_target,
         )
         run(
             sys.executable, ".agent/scripts/templatectl.py", "route",
@@ -887,7 +1031,9 @@ def main() -> int:
         )
         run(
             sys.executable, ".agent/scripts/contextctl.py", "approve-repair",
-            "--source", "user:real-three-strike", cwd=strike_target,
+            "--source", "user:real-three-strike",
+            "--human-decision-receipt", str(strike_lightweight_repair_receipt.relative_to(strike_target)),
+            cwd=strike_target,
         )
         run(
             sys.executable, ".agent/scripts/workflowctl.py", "return-node",
@@ -938,7 +1084,9 @@ def main() -> int:
         )
         run(
             sys.executable, ".agent/scripts/contextctl.py", "approve-repair",
-            "--source", "user:real-three-strike", cwd=strike_target,
+            "--source", "user:real-three-strike",
+            "--human-decision-receipt", str(strike_repair_receipt.relative_to(strike_target)),
+            cwd=strike_target,
         )
         for from_node, to_node in ((5, 4), (4, 3), (3, 2)):
             run(
@@ -956,7 +1104,9 @@ def main() -> int:
             raise SystemExit("real three-strike lifecycle did not reach its human decision gate")
         run(
             sys.executable, ".agent/scripts/workflowctl.py", "resolve-failure",
-            "--source", "user:real-three-strike", cwd=strike_target,
+            "--source", "user:real-three-strike",
+            "--human-decision-receipt", str(strike_failure_receipt.relative_to(strike_target)),
+            cwd=strike_target,
         )
         resolved = json.loads(strike_task_path.read_text(encoding="utf-8"))
         resolved_context = json.loads(
@@ -995,7 +1145,8 @@ def main() -> int:
             "requirement_contract_sha256": resolved["requirement_contract_sha256"],
             "mode_appropriate_implementer_agent_id": None,
             "projection": [2, 3, 4, 5, 6],
-            "change_receipts": [receipt(strike_target, strike_change)],
+            "change_receipts":[receipt(strike_target,strike_change)],
+            "candidate_snapshot_receipts":[{**receipt(strike_target,strike_change),"mode":420}],
             "check_receipts": [{
                 "id": "resolved-three-strike-context",
                 "command": [sys.executable, ".agent/scripts/contextctl.py", "check"],
@@ -1035,37 +1186,98 @@ def main() -> int:
         run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=strike_target)
         run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=strike_target)
 
-        legacy_fast = workspace / "migration32-legacy-fast"
-        run(sys.executable, str(installer), str(legacy_fast), "--project-name", "migration32-legacy-fast")
-        legacy_config_path = legacy_fast / ".agent/config.json"
-        legacy_config = json.loads(legacy_config_path.read_text(encoding="utf-8"))
-        legacy_config["context"]["max_capsule_tokens"]["fast"] = 600
-        legacy_config_path.write_text(json.dumps(legacy_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        legacy_manifest_path = legacy_fast / ".agent/.workflow-manifest.json"
-        legacy_manifest = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
-        legacy_manifest["version"] = "3.1.38"
-        legacy_manifest["migration_version"] = 31
-        legacy_manifest_path.write_text(json.dumps(legacy_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        run(sys.executable, str(installer), str(legacy_fast), "--update")
-        migrated_legacy = json.loads(legacy_config_path.read_text(encoding="utf-8"))
-        if migrated_legacy["context"]["max_capsule_tokens"]["fast"] != 1000:
-            raise SystemExit("migration 32 did not raise the exact legacy fast capsule default")
+        # Updating an active current-version project must not preserve a stale
+        # generation-bound built-in Skill snapshot. Rebind the activation and
+        # its context/stage atomically against the new managed bytes.
+        stale_activation_target=workspace/"active-stale-builtin-activation"
+        run(sys.executable,str(installer),str(stale_activation_target),"--project-name","active-stale-builtin-activation")
+        stale_guardrails=stale_activation_target/"project-guardrails.md"
+        stale_guardrails.write_text("# Project Guardrails\n\n## Required project facts\n\n"
+            "- Product and users: Disposable active installer update fixture.\n"
+            "- Technology and architecture: Python workflow controls and local JSON state.\n"
+            "- Writable and read-only areas: The temporary fixture is writable; external paths are read-only.\n"
+            "- Security, privacy, compliance and performance red lines: No credentials or external effects.\n"
+            "- Build, test and lint commands: Run the template lifecycle self-test.\n"
+            "- Deployment authority and rollback owner: No deployment; the fixture owner rolls back.\n",encoding="utf-8")
+        run(sys.executable,".agent/scripts/agentctl.py","project-init","--guardrails-file",stale_guardrails.name,cwd=stale_activation_target)
+        run(sys.executable,".agent/scripts/agentctl.py","start","--model","vendor-alpha/model.one",
+            "--title","active stale built-in update fixture",cwd=stale_activation_target)
+        stale_manifest_path=stale_activation_target/".agent/.workflow-manifest.json"
+        stale_manifest=json.loads(stale_manifest_path.read_text(encoding="utf-8"))
+        changed_relative="skills/clarify-task/SKILL.md"; changed_path=stale_activation_target/".agent"/changed_relative
+        changed_path.write_bytes(changed_path.read_bytes()+b"\n<!-- prior released built-in fixture -->\n")
+        stale_manifest["agent_files"][changed_relative]=hashlib.sha256(changed_path.read_bytes()).hexdigest()
+        manifest_payload={"schema":stale_manifest["schema"],"version":stale_manifest["version"],
+            "migration_version":stale_manifest["migration_version"],"agent_root_mode":stale_manifest["agent_root_mode"],
+            "agent_files":stale_manifest["agent_files"],"pxpipe":stale_manifest["pxpipe"],
+            "agents_bootstrap_sha256":stale_manifest["agents_bootstrap"]["sha256"],
+            "claude_bootstrap_sha256":stale_manifest["claude_bootstrap"]["sha256"],"agent_modes":stale_manifest["agent_modes"]}
+        stale_manifest["source_tree_sha256"]=canonical_sha256(manifest_payload)
+        stale_manifest_path.write_text(json.dumps(stale_manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        rebind_fixture="""
+import copy,json,sys
+sys.path.insert(0,'.agent/scripts')
+import agentctl
+before=json.loads(agentctl.TASK_PATH.read_text(encoding='utf-8'))
+verification,lock,captured=agentctl.capture_dynamic_skill_activation()
+receipt,data=agentctl.build_task_skill_activation(before['task_generation_id'],verification,lock,captured)
+after=copy.deepcopy(before); after['skill_activation']=receipt
+agentctl.sync_context('prior-release-builtin-fixture',before_task=before,after_task=after,operation='start',
+    summary='bind prior released built-in Skill bytes',side_effects=((agentctl.AGENT_DIR/'state/SKILL_ACTIVATION.json',data),))
+"""
+        run(sys.executable,"-B","-c",rebind_fixture,cwd=stale_activation_target)
+        run(sys.executable,".agent/scripts/agentctl.py","validate",cwd=stale_activation_target)
+        old_activation=(stale_activation_target/".agent/state/SKILL_ACTIVATION.json").read_bytes()
+        run(sys.executable,str(installer),str(stale_activation_target),"--update")
+        run(sys.executable,".agent/scripts/agentctl.py","validate",cwd=stale_activation_target)
+        new_activation=(stale_activation_target/".agent/state/SKILL_ACTIVATION.json").read_bytes()
+        if (new_activation==old_activation or changed_path.read_bytes()!=(source/".agent"/changed_relative).read_bytes()
+                or json.loads(new_activation)["task_generation_id"]!=json.loads(old_activation)["task_generation_id"]):
+            raise SystemExit("active update retained stale built-in activation or broke generation binding")
 
-        custom_fast = workspace / "migration32-custom-fast"
-        run(sys.executable, str(installer), str(custom_fast), "--project-name", "migration32-custom-fast")
-        custom_config_path = custom_fast / ".agent/config.json"
-        custom_config = json.loads(custom_config_path.read_text(encoding="utf-8"))
-        custom_config["context"]["max_capsule_tokens"]["fast"] = 850
-        custom_config_path.write_text(json.dumps(custom_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        custom_manifest_path = custom_fast / ".agent/.workflow-manifest.json"
-        custom_manifest = json.loads(custom_manifest_path.read_text(encoding="utf-8"))
-        custom_manifest["version"] = "3.1.38"
-        custom_manifest["migration_version"] = 31
-        custom_manifest_path.write_text(json.dumps(custom_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        run(sys.executable, str(installer), str(custom_fast), "--update")
-        migrated_custom = json.loads(custom_config_path.read_text(encoding="utf-8"))
-        if migrated_custom["context"]["max_capsule_tokens"]["fast"] != 850:
-            raise SystemExit("migration 32 overwrote a project-owned custom fast capsule limit")
+        # 3.1.38/migration 31 was never a released install-manifest tuple.
+        # Strict migration authority rejects it before touching project state;
+        # the oldest accepted predecessor is 3.1.40/migration 32.
+        unreleased = workspace / "unreleased-migration31"
+        run(sys.executable, str(installer), str(unreleased), "--project-name", "unreleased-migration31")
+        unreleased_config_path = unreleased / ".agent/config.json"
+        unreleased_config = json.loads(unreleased_config_path.read_text(encoding="utf-8"))
+        unreleased_config["context"]["max_capsule_tokens"]["fast"] = 600
+        unreleased_config_path.write_text(
+            json.dumps(unreleased_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        unreleased_manifest_path = unreleased / ".agent/.workflow-manifest.json"
+        unreleased_manifest = json.loads(unreleased_manifest_path.read_text(encoding="utf-8"))
+        unreleased_manifest["version"] = "3.1.38"
+        unreleased_manifest["migration_version"] = 31
+        unreleased_manifest_path.write_text(
+            json.dumps(unreleased_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        unreleased_config_before = unreleased_config_path.read_bytes()
+        unreleased_manifest_before = unreleased_manifest_path.read_bytes()
+        rejected_unreleased = subprocess.run(
+            [sys.executable, str(installer), str(unreleased), "--update"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+        )
+        if (
+            rejected_unreleased.returncode == 0
+            or "not a supported release" not in rejected_unreleased.stdout
+            or unreleased_config_path.read_bytes() != unreleased_config_before
+            or unreleased_manifest_path.read_bytes() != unreleased_manifest_before
+        ):
+            raise SystemExit("unreleased migration 31 tuple was accepted or mutated")
+
+        rejected_v2=workspace/"rejected-v2-manifest"
+        run(sys.executable,str(installer),str(rejected_v2),"--project-name","fixture-rejected-v2")
+        rejected_v2_manifest_path=rejected_v2/".agent/.workflow-manifest.json"
+        rejected_v2_manifest=json.loads(rejected_v2_manifest_path.read_text(encoding="utf-8"))
+        rejected_v2_manifest["schema"]="agent-workflow-install/v2"
+        rejected_v2_manifest["version"]="3.1.40"; rejected_v2_manifest["migration_version"]=32
+        rejected_v2_manifest_path.write_text(json.dumps(rejected_v2_manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        rejected_v2_before=project_tree_bytes(rejected_v2)
+        rejected_v2_result=run(sys.executable,str(installer),str(rejected_v2),"--update",expected=1)
+        if "invalid workflow install manifest" not in rejected_v2_result.stdout or project_tree_bytes(rejected_v2)!=rejected_v2_before:
+            raise SystemExit("v2 manifest schema was accepted or mutated")
 
         fresh_agents_before=(target/".agent/state/agents.json").read_bytes()
         (target / ".agent/workflows/METHODOLOGY.md").unlink()
@@ -1084,36 +1296,26 @@ def main() -> int:
             raise SystemExit("write-free update reseeded the idle CONTEXT/STAGE_INDEX bytes")
         run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=target)
 
-        # Migration 29 preserves the v9 ledger, adaptive decision/archive state,
-        # and rebinds active context after canonical task migration.
-        # Migration 27 upgrades an empty v8 ledger in place without fabricating
-        # historical payload charges or requiring a platform snapshot.
-        v8 = workspace / "empty-v8"
-        run(sys.executable, str(installer), str(v8), "--project-name", "fixture-empty-v8")
-        v8_agents_path = v8 / ".agent/state/agents.json"
-        v8_agents = json.loads(v8_agents_path.read_text(encoding="utf-8"))
-        v8_agents["schema"] = "agent-team/v8"; v8_agents.pop("token_accounting")
-        v8_agents_path.write_text(json.dumps(v8_agents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        v8_manifest_path = v8 / ".agent/.workflow-manifest.json"
-        v8_manifest = json.loads(v8_manifest_path.read_text(encoding="utf-8"))
-        v8_manifest["version"] = "3.1.29"; v8_manifest["migration_version"] = 26
-        v8_manifest_path.write_text(json.dumps(v8_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        run(sys.executable, str(installer), str(v8), "--update")
-        migrated_v8 = json.loads(v8_agents_path.read_text(encoding="utf-8"))
-        if (
-            migrated_v8.get("schema") != "agent-team/v9"
-            or migrated_v8.get("token_accounting") != {
-                "schema": "agent-child-token-accounting/v1", "token_budget": 48000,
-                "settled_tokens": 0,
-            }
-        ):
-            raise SystemExit("migration 27 did not establish empty v8 Token accounting")
-        run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=v8)
+        # v5/3.1.29/migration-26 was never released. Even a history-free
+        # v8 ledger cannot use an invented manifest tuple to enter migrations.
+        v8 = workspace / "empty-v8-unreleased"
+        run(sys.executable,str(installer),str(v8),"--project-name","fixture-empty-v8-unreleased")
+        v8_agents_path=v8/".agent/state/agents.json"; v8_agents=json.loads(v8_agents_path.read_text(encoding="utf-8"))
+        v8_agents["schema"]="agent-team/v8"; v8_agents.pop("token_accounting")
+        v8_agents_path.write_text(json.dumps(v8_agents,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        v8_manifest_path=v8/".agent/.workflow-manifest.json"; v8_manifest=json.loads(v8_manifest_path.read_text(encoding="utf-8"))
+        v8_manifest["version"]="3.1.29"; v8_manifest["migration_version"]=26
+        v8_manifest_path.write_text(json.dumps(v8_manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        v8_before=project_tree_bytes(v8)
+        rejected_v8=run(sys.executable,str(installer),str(v8),"--update",expected=1)
+        if "not a supported release" not in rejected_v8.stdout or project_tree_bytes(v8)!=v8_before:
+            raise SystemExit("unreleased migration-26 tuple was accepted or mutated")
 
         migration28 = workspace / "migration28-active-context"
         run(sys.executable, str(installer), str(migration28), "--project-name", "fixture-migration28")
+        initialize_migration_fixture(migration28,"migration")
         run(
-            sys.executable, ".agent/scripts/agentctl.py", "start",
+            sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
             "--title", "active context rebind fixture", "--mode", "standard",
             "--environment", "local", "--files", "3", cwd=migration28,
         )
@@ -1151,9 +1353,10 @@ def main() -> int:
         context_before = json.loads(context_path.read_text(encoding="utf-8"))
         task_bytes_before = (migration28 / ".agent/state/TASK.json").read_bytes()
         migration28_manifest_path = migration28 / ".agent/.workflow-manifest.json"
-        migration28_manifest = json.loads(migration28_manifest_path.read_text(encoding="utf-8"))
-        migration28_manifest["version"] = "3.1.31"
-        migration28_manifest["migration_version"] = 28
+        migration28_manifest = released_legacy_manifest(
+            json.loads(migration28_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v1","3.1.40",32,
+        )
         migration28_manifest_path.write_text(
             json.dumps(migration28_manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -1167,8 +1370,20 @@ def main() -> int:
                 "migration 34 did not rebind the active context capsule: "
                 f"{before_sequence} -> {after_sequence}"
             )
-        if (migration28 / ".agent/state/TASK.json").read_bytes() != task_bytes_before:
-            raise SystemExit("migration 34 rewrote canonical TASK while rebinding context")
+        task_after=json.loads((migration28/".agent/state/TASK.json").read_text(encoding="utf-8"))
+        task_before=json.loads(task_bytes_before)
+        activation_path=migration28/".agent/state/SKILL_ACTIVATION.json"; activation_raw=activation_path.read_bytes()
+        activation=json.loads(activation_raw); activation_pointer=task_after.get("skill_activation",{})
+        if ((migration28/".agent/state/TASK.json").read_bytes()==task_bytes_before
+                or task_after.get("task_generation_id")==task_before.get("task_generation_id")
+                or not str(task_after.get("task_generation_id","")).startswith("migration-")
+                or task_after.get("decision_policy_version")!=1 or task_after.get("gate_approvals")!={}
+                or task_after.get("requirements_clarified") is not False or task_after.get("status")!="waiting_human"
+                or task_after.get("current_node")!=1 or task_after.get("accepted_nodes")!=[0]
+                or activation.get("task_generation_id")!=task_after.get("task_generation_id")
+                or activation_pointer.get("sha256")!=hashlib.sha256(activation_raw).hexdigest()
+                or activation_pointer.get("bytes")!=len(activation_raw)):
+            raise SystemExit("legacy migration did not rotate generation, revoke unbound authority, and reseal Skill activation")
         for field in ("confirmed_facts", "changed_files", "evidence", "open_risks", "host_compaction"):
             if context_after.get(field) != context_before.get(field):
                 raise SystemExit(f"migration 34 lost active context field: {field}")
@@ -1205,9 +1420,10 @@ def main() -> int:
         m35_agents["token_accounting"]["token_budget"] = 20000
         m35_agents_path.write_text(json.dumps(m35_agents, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         m35_manifest_path = migration35 / ".agent/.workflow-manifest.json"
-        m35_manifest = json.loads(m35_manifest_path.read_text(encoding="utf-8"))
-        m35_manifest["version"] = "3.1.41"
-        m35_manifest["migration_version"] = 34
+        m35_manifest = released_legacy_manifest(
+            json.loads(m35_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v3","3.1.41",34,
+        )
         m35_manifest_path.write_text(json.dumps(m35_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(migration35), "--update")
         m35_migrated = json.loads(m35_config_path.read_text(encoding="utf-8"))
@@ -1227,9 +1443,10 @@ def main() -> int:
         custom35_config["routing"]["modes"]["fast"]["token_budget"] = 11000
         custom35_config_path.write_text(json.dumps(custom35_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         custom35_manifest_path = custom35 / ".agent/.workflow-manifest.json"
-        custom35_manifest = json.loads(custom35_manifest_path.read_text(encoding="utf-8"))
-        custom35_manifest["version"] = "3.1.41"
-        custom35_manifest["migration_version"] = 34
+        custom35_manifest = released_legacy_manifest(
+            json.loads(custom35_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v3","3.1.41",34,
+        )
         custom35_manifest_path.write_text(json.dumps(custom35_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(custom35), "--update")
         custom35_migrated = json.loads(custom35_config_path.read_text(encoding="utf-8"))
@@ -1254,9 +1471,10 @@ def main() -> int:
         }
         tuned36_config_path.write_text(json.dumps(tuned36_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tuned36_manifest_path = tuned36 / ".agent/.workflow-manifest.json"
-        tuned36_manifest = json.loads(tuned36_manifest_path.read_text(encoding="utf-8"))
-        tuned36_manifest["version"] = "3.1.41"
-        tuned36_manifest["migration_version"] = 34
+        tuned36_manifest = released_legacy_manifest(
+            json.loads(tuned36_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v3","3.1.41",34,
+        )
         tuned36_manifest_path.write_text(json.dumps(tuned36_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(tuned36), "--update")
         tuned36_migrated = json.loads(tuned36_config_path.read_text(encoding="utf-8"))
@@ -1284,9 +1502,10 @@ def main() -> int:
         }
         kept36_config_path.write_text(json.dumps(kept36_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         kept36_manifest_path = kept36 / ".agent/.workflow-manifest.json"
-        kept36_manifest = json.loads(kept36_manifest_path.read_text(encoding="utf-8"))
-        kept36_manifest["version"] = "3.1.41"
-        kept36_manifest["migration_version"] = 34
+        kept36_manifest = released_legacy_manifest(
+            json.loads(kept36_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v3","3.1.41",34,
+        )
         kept36_manifest_path.write_text(json.dumps(kept36_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(kept36), "--update")
         kept36_migrated = json.loads(kept36_config_path.read_text(encoding="utf-8"))
@@ -1312,9 +1531,10 @@ def main() -> int:
             encoding="utf-8",
         )
         filled37_manifest_path = filled37 / ".agent/.workflow-manifest.json"
-        filled37_manifest = json.loads(filled37_manifest_path.read_text(encoding="utf-8"))
-        filled37_manifest["version"] = "3.1.43"
-        filled37_manifest["migration_version"] = 36
+        filled37_manifest = released_legacy_manifest(
+            json.loads(filled37_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v4","3.1.43",36,
+        )
         filled37_manifest_path.write_text(json.dumps(filled37_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run(sys.executable, str(installer), str(filled37), "--update")
         filled37_after = json.loads(filled37_config_path.read_text(encoding="utf-8"))
@@ -1326,8 +1546,9 @@ def main() -> int:
         if filled37_after != filled37_before:
             raise SystemExit("migration 37 mutated project config beyond filling transition_token_increment")
 
-        # Migration 38 repairs the invalid lower-mode carry produced by
-        # v3.1.44 (900/400/800) and leaves a validator-accepted monotonic map.
+        # Starting from released v4/3.1.43/migration-36 executes migration
+        # 37 then 38; the already-present invalid map is preserved by 37 and
+        # normalized by 38 without inventing the unreleased 3.1.44/37 tuple.
         normalized38 = workspace / "migration38-normalize-increment"
         run(sys.executable, str(installer), str(normalized38), "--project-name", "fixture-migration38-normalize")
         normalized38_config_path = normalized38 / ".agent/config.json"
@@ -1340,9 +1561,10 @@ def main() -> int:
             encoding="utf-8",
         )
         normalized38_manifest_path = normalized38 / ".agent/.workflow-manifest.json"
-        normalized38_manifest = json.loads(normalized38_manifest_path.read_text(encoding="utf-8"))
-        normalized38_manifest["version"] = "3.1.44"
-        normalized38_manifest["migration_version"] = 37
+        normalized38_manifest = released_legacy_manifest(
+            json.loads(normalized38_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v4","3.1.43",36,
+        )
         normalized38_manifest_path.write_text(
             json.dumps(normalized38_manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -1401,8 +1623,9 @@ def main() -> int:
         # purpose/phase stay live while migration 34 rebinds the changed bytes.
         loaded33 = workspace / "migration33-loaded-managed-reference"
         run(sys.executable, str(installer), str(loaded33), "--project-name", "fixture-loaded33")
+        initialize_migration_fixture(loaded33,"loaded")
         run(
-            sys.executable, ".agent/scripts/agentctl.py", "start",
+            sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
             "--title", "managed reference rebind fixture", "--mode", "standard",
             "--environment", "local", "--files", "3", cwd=loaded33,
         )
@@ -1434,18 +1657,11 @@ def main() -> int:
             if item["path"] == "project-owned-reference.md"
         )
         loaded_manifest_path = loaded33 / ".agent/.workflow-manifest.json"
-        loaded_manifest = json.loads(loaded_manifest_path.read_text(encoding="utf-8"))
-        loaded_manifest["version"] = "3.1.40"; loaded_manifest["migration_version"] = 33
-        loaded_manifest["agent_files"][
-            "skills/manage-agent-team/references/coordination-contract.md"
-        ] = hashlib.sha256(synthetic_v33_bytes).hexdigest()
-        loaded_manifest["source_tree_sha256"] = hashlib.sha256(json.dumps({
-            "agent_files": loaded_manifest["agent_files"],
-            "repo_plugin_files": loaded_manifest["repo_plugin_files"],
-            "marketplace_entry_sha256": loaded_manifest["marketplace_entry"]["sha256"],
-            "agents_bootstrap_sha256": loaded_manifest["agents_bootstrap"]["sha256"],
-            "claude_bootstrap_sha256": loaded_manifest["claude_bootstrap"]["sha256"],
-        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        loaded_current = json.loads(loaded_manifest_path.read_text(encoding="utf-8"))
+        loaded_current["agent_files"]["skills/manage-agent-team/references/coordination-contract.md"] = hashlib.sha256(synthetic_v33_bytes).hexdigest()
+        loaded_manifest = released_legacy_manifest(
+            loaded_current,"agent-workflow-install/v1","3.1.40",32,
+        )
         loaded_manifest_path.write_text(
             json.dumps(loaded_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
@@ -1477,8 +1693,9 @@ def main() -> int:
         # verified checkpoint when it has drifted from canonical TASK state.
         drifted33 = workspace / "migration33-drifted-active-context"
         run(sys.executable, str(installer), str(drifted33), "--project-name", "fixture-migration33")
+        initialize_migration_fixture(drifted33,"drifted")
         run(
-            sys.executable, ".agent/scripts/agentctl.py", "start",
+            sys.executable, ".agent/scripts/agentctl.py", "start", "--model", "provider-neutral/model.fixture",
             "--title", "migration 33 drift rejection fixture", "--mode", "standard",
             "--environment", "local", "--files", "3", cwd=drifted33,
         )
@@ -1494,9 +1711,10 @@ def main() -> int:
             json.dumps(drifted_context, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         drifted_manifest_path = drifted33 / ".agent/.workflow-manifest.json"
-        drifted_manifest = json.loads(drifted_manifest_path.read_text(encoding="utf-8"))
-        drifted_manifest["version"] = "3.1.40"
-        drifted_manifest["migration_version"] = 33
+        drifted_manifest = released_legacy_manifest(
+            json.loads(drifted_manifest_path.read_text(encoding="utf-8")),
+            "agent-workflow-install/v1","3.1.40",32,
+        )
         drifted_manifest_path.write_text(
             json.dumps(drifted_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
@@ -1514,66 +1732,19 @@ def main() -> int:
                 "migration 34 accepted, obscured, or mutated a self-consistent active context drift"
             )
 
-        # Migration 23 compacts an exact active predecessor inside the candidate
-        # transaction; an invalid predecessor is rejected without touching it.
-        migration22 = workspace / "migration22-hot-state"
-        run(sys.executable, str(installer), str(migration22), "--project-name", "fixture-migration22")
+        # v5/3.1.25/migration-22 was never released. A syntactically rich
+        # active predecessor still fails at manifest authority without mutation.
+        migration22=workspace/"migration22-unreleased"
+        run(sys.executable,str(installer),str(migration22),"--project-name","fixture-migration22-unreleased")
         activate_migration22_hot_state(migration22)
-        run(sys.executable, str(installer), str(migration22), "--update")
-        migrated_task_path = migration22 / ".agent/state/TASK.json"
-        migrated_task = json.loads(migrated_task_path.read_text(encoding="utf-8"))
-        if (
-            len(migrated_task["rollback_ledger"]) != 4
-            or len(migrated_task["failure_ledger"]) != 8
-            or migrated_task.get("rollback_archive", {}).get("total_entries") != 5
-            or migrated_task.get("failure_archive", {}).get("total_signatures") != 9
-            or migrated_task.get("failure_archive", {}).get("depth") != 1
-        ):
-            raise SystemExit("migration 23 did not transactionally compact active hot state")
-        migrated22_config = json.loads((migration22 / ".agent/config.json").read_text(encoding="utf-8"))
-        if (
-            {mode: migrated22_config["routing"]["modes"][mode]["token_budget"] for mode in ("fast", "standard", "release")}
-            != {"fast": 16000, "standard": 48000, "release": 96000}
-            or migrated22_config["context"].get("estimated_turn_overhead_tokens")
-            != {"fast": 2000, "standard": 3000, "release": 4000}
-            or migrated22_config["context"].get("bootstrap_overhead_tokens") != 7000
-            or "automatic_transition_token_increment" in migrated22_config["context"]
-            or migrated22_config["agent_control"].get("child_system_tool_margin_tokens") != 4000
-            or migrated_task.get("token_budget") != 96000
-        ):
-            raise SystemExit("migration 36 did not recalibrate the legacy budget policy of the active predecessor")
-        run(sys.executable, ".agent/scripts/contextctl.py", "check", cwd=migration22)
-        run(sys.executable, ".agent/scripts/workflowctl.py", "validate", cwd=migration22)
-        run(sys.executable, ".agent/scripts/evidencectl.py", "verify", "--deep", cwd=migration22)
-        migrated_task_before = migrated_task_path.read_bytes()
-        migrated_context_before = (migration22 / ".agent/state/CONTEXT.json").read_bytes()
-        migrated_stage_before = (migration22 / ".agent/state/STAGE_INDEX.md").read_bytes()
-        run(sys.executable, str(installer), str(migration22), "--update")
-        if (
-            migrated_task_path.read_bytes() != migrated_task_before
-            or (migration22 / ".agent/state/CONTEXT.json").read_bytes() != migrated_context_before
-            or (migration22 / ".agent/state/STAGE_INDEX.md").read_bytes() != migrated_stage_before
-        ):
-            raise SystemExit("idempotent migration-23 update rewrote compacted TASK or CONTEXT/STAGE_INDEX")
-
-        corrupt22 = workspace / "migration22-corrupt-context"
-        run(sys.executable, str(installer), str(corrupt22), "--project-name", "fixture-corrupt22")
-        activate_migration22_hot_state(corrupt22)
-        corrupt_task_path = corrupt22 / ".agent/state/TASK.json"
-        corrupt_task = json.loads(corrupt_task_path.read_text(encoding="utf-8"))
-        corrupt_task["next_action"] = "unbound drift after the verified checkpoint"
-        corrupt_task_path.write_text(json.dumps(corrupt_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        watched = [
-            corrupt22 / ".agent/config.json", corrupt_task_path,
-            corrupt22 / ".agent/state/CONTEXT.json", corrupt22 / ".agent/.workflow-manifest.json",
-        ]
-        before = {path: path.read_bytes() for path in watched}
-        rejected = subprocess.run(
-            [sys.executable, str(installer), str(corrupt22), "--update"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
-        )
-        if rejected.returncode == 0 or any(path.read_bytes() != before[path] for path in watched):
-            raise SystemExit("migration 23 accepted or mutated an unbound active predecessor")
+        migration22_manifest_path=migration22/".agent/.workflow-manifest.json"
+        migration22_manifest=json.loads(migration22_manifest_path.read_text(encoding="utf-8"))
+        migration22_manifest["version"]="3.1.25"; migration22_manifest["migration_version"]=22
+        migration22_manifest_path.write_text(json.dumps(migration22_manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+        migration22_before=project_tree_bytes(migration22)
+        rejected22=run(sys.executable,str(installer),str(migration22),"--update",expected=1)
+        if "not a supported release" not in rejected22.stdout or project_tree_bytes(migration22)!=migration22_before:
+            raise SystemExit("unreleased migration-22 tuple was accepted or mutated")
 
         # The immediate 3.1.19/v7 predecessor may migrate only when completely
         # history-free and accompanied by a fresh empty orchestration assertion.
@@ -1588,20 +1759,6 @@ def main() -> int:
         )
         if rejected_v7.returncode==0 or old_empty_v7_path.read_bytes()!=old_empty_v7_before or old_empty_v7_config.read_bytes()!=old_empty_v7_config_before:
             raise SystemExit("migration 19 replaced an empty v7 ledger without a fresh platform-empty assertion")
-        run(sys.executable,str(installer),str(old_empty_v7),"--update","--agent-platform-snapshot",str(empty_platform_snapshot(workspace/"old-empty-v7-platform.json")))
-        migrated_v7=json.loads(old_empty_v7_path.read_text(encoding="utf-8")); migration=migrated_v7.get("migration_source",{})
-        migration_archive=old_empty_v7/str(migration.get("path",""))
-        if (
-            migrated_v7.get("schema")!="agent-team/v9"
-            or migrated_v7.get("platform_observer")!=fresh_config.get("platform_observer")
-            or migrated_v7.get("platform_empty_verified") is not False
-            or migration.get("sha256")!=hashlib.sha256(old_empty_v7_before).hexdigest()
-            or not migration_archive.is_file()
-            or digest(migration_archive)!=hashlib.sha256(old_empty_v7_before).hexdigest()
-        ):
-            raise SystemExit("migration 19 did not immutably rebuild empty v7 as v9")
-        run(sys.executable,".agent/scripts/agentctl.py","validate",cwd=old_empty_v7)
-
         for history_field,history_value in {
             "members":[{"id":"legacy-member","status":"completed"}],
             "prepared_dispatches":[{"id":"legacy-preparation"}],
@@ -1843,27 +2000,6 @@ def main() -> int:
         )
         if rejected_empty_without_proof.returncode == 0 or old_empty_path.read_bytes() != old_empty_before:
             raise SystemExit("migration 19 replaced an empty v5 ledger without a fresh platform-empty proof")
-        run(
-            sys.executable, str(installer), str(old_empty_v5), "--update",
-            "--agent-platform-snapshot", str(empty_platform_snapshot(workspace / "old-empty-v5-platform.json")),
-        )
-        upgraded_empty = json.loads(old_empty_path.read_text(encoding="utf-8"))
-        if (
-            upgraded_empty.get("schema") != "agent-team/v9"
-            or upgraded_empty.get("prepared_dispatches") != []
-            or upgraded_empty.get("replay_runs") != []
-            or upgraded_empty.get("stall_timeout_seconds") != 300
-            or "interrupt_after_unchanged_checks" in upgraded_empty
-            or upgraded_empty.get("task_payload_schema") != "agent-task-payload/v2"
-            or upgraded_empty.get("task_payload_limits") != {
-                "max_input_count": 24, "max_single_bytes": 131072,
-                "max_total_bytes": 262144, "max_estimated_tokens": 65536,
-            }
-            or upgraded_empty.get("status_request_after_unchanged_checks") != 1
-            or upgraded_empty.get("platform_empty_verified") is not False
-        ):
-            raise SystemExit("migration 19 did not establish v9 review/replay/stall and bounded-payload policy")
-
         old_history_v5 = workspace / "old-history-v5"
         run(sys.executable, str(installer), str(old_history_v5), "--project-name", "fixture-old-history-v5")
         old_history_path = old_history_v5 / ".agent/state/agents.json"
@@ -1933,32 +2069,6 @@ def main() -> int:
             or old_empty_v6_config_path.read_bytes() != old_empty_v6_config_before
         ):
             raise SystemExit("migration 19 replaced an empty v6 ledger without a fresh platform-empty proof")
-        run(
-            sys.executable, str(installer), str(old_empty_v6), "--update",
-            "--agent-platform-snapshot", str(empty_platform_snapshot(workspace / "old-empty-v6-platform.json")),
-        )
-        migrated_v6 = json.loads(old_empty_v6_path.read_text(encoding="utf-8"))
-        migrated_v6_config = json.loads(old_empty_v6_config_path.read_text(encoding="utf-8"))["agent_control"]
-        migrated_v6_source = migrated_v6.get("migration_source", {})
-        migrated_v6_archive = old_empty_v6 / str(migrated_v6_source.get("path", ""))
-        if (
-            migrated_v6.get("schema") != "agent-team/v9"
-            or migrated_v6.get("members") != []
-            or migrated_v6.get("prepared_dispatches") != []
-            or migrated_v6.get("capacity_failures") != []
-            or migrated_v6.get("replay_runs") != []
-            or migrated_v6.get("stall_timeout_seconds") != 300
-            or migrated_v6_config.get("stall_timeout_seconds") != 300
-            or "interrupt_after_unchanged_checks" in migrated_v6
-            or "interrupt_after_unchanged_checks" in migrated_v6_config
-            or migrated_v6_source.get("sha256") != old_empty_v6_digest
-            or not migrated_v6_archive.is_file()
-            or digest(migrated_v6_archive) != old_empty_v6_digest
-            or migrated_v6.get("platform_empty_verified") is not False
-        ):
-            raise SystemExit("migration 19 did not immutably rebuild an empty v6 ledger as v8")
-        run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=old_empty_v6)
-
         v6_history_cases = {
             "members": [{"id": "legacy-member", "status": "completed"}],
             "prepared_dispatches": [{"id": "legacy-preparation"}],
@@ -2014,29 +2124,6 @@ def main() -> int:
             )
             if rejected_without_proof.returncode == 0 or digest(legacy_agents_path) != legacy_digest:
                 raise SystemExit(f"inactive {legacy_schema} migrated without fresh platform-empty proof")
-            platform_empty = empty_platform_snapshot(workspace / f"empty-v{suffix}.json")
-            run(sys.executable, str(installer), str(legacy_agents), "--update", "--agent-platform-snapshot", str(platform_empty))
-            migrated = json.loads(legacy_agents_path.read_text(encoding="utf-8"))
-            migration = migrated.get("migration_source", {})
-            archive = legacy_agents / str(migration.get("path", ""))
-            if (
-                migrated.get("schema") != "agent-team/v9"
-                or migrated.get("replay_runs") != []
-                or migrated.get("stall_timeout_seconds") != 300
-                or "interrupt_after_unchanged_checks" in migrated
-                or migrated.get("task_payload_schema") != "agent-task-payload/v2"
-                or migrated.get("task_payload_limits") != {
-                    "max_input_count": 24, "max_single_bytes": 131072,
-                    "max_total_bytes": 262144, "max_estimated_tokens": 65536,
-                }
-                or migration.get("sha256") != legacy_digest
-                or not archive.is_file()
-                or digest(archive) != legacy_digest
-                or migrated.get("platform_empty_verified") is not False
-            ):
-                raise SystemExit(f"inactive {legacy_schema} was not immutably migrated to v9")
-            run(sys.executable, ".agent/scripts/agentctl.py", "validate", cwd=legacy_agents)
-
             active_agents = workspace / f"active-legacy-agent-ledger-v{suffix}"
             run(sys.executable, str(installer), str(active_agents), "--project-name", f"fixture-active-v{suffix}")
             active_agents_path = active_agents / ".agent/state/agents.json"
@@ -2075,4 +2162,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

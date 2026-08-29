@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="delivery-migration-26-") as raw:
         root = sandbox / old_status
         agent = root / ".agent"
         (agent / "scripts").mkdir(parents=True)
-        for name in ("deliveryctl.py", "artifactctl.py", "humandecision.py", "testrun.py"):
+        for name in ("deliveryctl.py", "artifactctl.py", "humandecision.py", "testrun.py", "process_observation.py"):
             shutil.copy2(AGENT_SOURCE / "scripts" / name, agent / "scripts" / name)
         shutil.copytree(AGENT_SOURCE / "scripts/workflowlib", agent / "scripts/workflowlib")
         (agent / "scripts/delivery-harness.py").write_text(
@@ -155,6 +155,7 @@ with tempfile.TemporaryDirectory(prefix="delivery-migration-26-") as raw:
             node_artifacts = {"8": receipt(root, ".agent/state/artifacts/08-delivery.json")}
         write_json(agent / "state/TASK.json", {
             "environment": "production", "deployment_requested": True,
+            "decision_policy_version":1,"task_generation_id":f"delivery-migration-{old_status}",
             "status": "in_progress" if old_status == "rollback_required" else "accepted",
             "requirements_clarified": True, "requirement_source": "user:legacy",
             "accepted_nodes": list(range(8)) if old_status == "rollback_required" else list(range(9)),

@@ -7,6 +7,8 @@ import os
 import re
 import stat
 
+from schema_validation import validate_managed_schema
+from workflowlib import boundedprocess
 from adaptive_common import (
     AdaptiveError, bytes_sha256, canonical_sha256, fail, load_json, print_json,
     resolve_root, safe_relative_path, write_json,
@@ -115,6 +117,12 @@ def read_knowledge_file(root_path, relative, maximum_bytes=2 * 1024 * 1024):
 
 def load_registry(root, require_files=True):
     value = load_json(registry_path(root), "knowledge registry")
+    try:
+        schema_errors = validate_managed_schema(value, "knowledge-registry.schema.json", "agent-knowledge-registry/v1")
+    except ValueError as error:
+        raise AdaptiveError("INVALID_MANAGED_SCHEMA", str(error), 3) from error
+    if schema_errors:
+        raise AdaptiveError("INVALID_KNOWLEDGE_REGISTRY", "Knowledge registry schema validation failed: " + "; ".join(schema_errors))
     if not isinstance(value, dict) or set(value) != {"schema", "entries"} or value.get("schema") != "agent-knowledge-registry/v1":
         raise AdaptiveError("INVALID_KNOWLEDGE_REGISTRY", "knowledge registry fields are invalid")
     entries = value.get("entries")
@@ -216,12 +224,12 @@ def command_plan_git_diff(root, args):
             raise AdaptiveError("INVALID_GIT_DIFF", f"{label} must be a full 40-hex commit")
     import subprocess
     for label, revision in (("head", args.head), *(([] if args.base == "0" * 40 else [("base", args.base)]))):
-        verified = subprocess.run(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=root,
+        verified = boundedprocess.run(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=root,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         if verified.returncode:
             raise AdaptiveError("GIT_DIFF_FAILED", f"{label} is not an available commit object")
     if args.base == "0" * 40:
-        empty_tree_result = subprocess.run(["git", "hash-object", "-t", "tree", "--stdin"], cwd=root, input=b"",
+        empty_tree_result = boundedprocess.run(["git", "hash-object", "-t", "tree", "--stdin"], cwd=root, input=b"",
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
         if empty_tree_result.returncode:
             raise AdaptiveError("GIT_DIFF_FAILED", "could not derive the Git empty-tree object")
@@ -232,7 +240,7 @@ def command_plan_git_diff(root, args):
         command = ["git", "diff", "--no-ext-diff", "--no-renames", "--ignore-submodules=none", "--name-only", "-z", empty_tree, args.head, "--"]
     else:
         command = ["git", "diff", "--no-ext-diff", "--no-renames", "--ignore-submodules=none", "--name-only", "-z", args.base, args.head, "--"]
-    result = subprocess.run(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    result = boundedprocess.run(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
     if result.returncode:
         raise AdaptiveError("GIT_DIFF_FAILED", "could not derive the authoritative changed-path set")
     try:
@@ -282,4 +290,5 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

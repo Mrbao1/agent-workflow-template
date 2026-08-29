@@ -1,0 +1,46 @@
+stages: [test-receipt, test-promotion]
+variables:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
+agent-test-receipt:
+  stage: test-receipt
+  image: {{gitlab_image}}
+{{gitlab_protected_tags}}  before_script:
+    - 'python3 -c "import sys; raise SystemExit(0 if sys.platform == \"{{gitlab_sys_platform}}\" else 1)"'
+    - 'python3 .agent/scripts/blueprintctl.py check --require-confirmed --expect-design-sha256 "$BLUEPRINT_SHA256"'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "web"'
+  script:
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_ci_artifact_provenance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{fetch_and_verify_artifact_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - |
+      deploy_status=1
+      acceptance_status=125
+      cleanup_status=1
+      if python3 .agent/scripts/blueprintctl.py run-command --id {{deploy_test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then
+        deploy_status=0
+        if python3 .agent/scripts/blueprintctl.py run-command --id {{test_acceptance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then acceptance_status=0; else acceptance_status=$?; fi
+      else
+        deploy_status=$?
+      fi
+      if python3 .agent/scripts/blueprintctl.py run-command --id {{cleanup_test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then cleanup_status=0; else cleanup_status=$?; fi
+      export AGENT_TEST_DEPLOY_STATUS="$deploy_status" AGENT_TEST_ACCEPTANCE_STATUS="$acceptance_status" AGENT_TEST_CLEANUP_STATUS="$cleanup_status"
+      if [ "$deploy_status" -eq 0 ] && [ "$acceptance_status" -eq 0 ] && [ "$cleanup_status" -eq 0 ]; then
+        python3 .agent/scripts/blueprintctl.py run-command --id {{publish_test_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"
+      else
+        printf '%s\n' "test deployment failed closed: deploy=$deploy_status acceptance=$acceptance_status cleanup=$cleanup_status" >&2
+        exit 1
+      fi
+  artifacts:
+    when: on_success
+    paths: ["agent-test-deployment-receipt.json"]
+agent-test-promotion:
+  stage: test-promotion
+  image: {{gitlab_image}}
+{{gitlab_protected_tags}}  before_script:
+    - 'python3 -c "import sys; raise SystemExit(0 if sys.platform == \"{{gitlab_sys_platform}}\" else 1)"'
+    - 'python3 .agent/scripts/blueprintctl.py check --require-confirmed --expect-design-sha256 "$BLUEPRINT_SHA256"'
+  needs: ["agent-test-receipt"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "web"'
+  script:
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_test_receipt_authenticity_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'

@@ -4,12 +4,26 @@ import { lstat, open, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { verifyIntegrity } from "../scripts/verify-integrity.mjs";
+import { validateVerifiedV5Anchor } from "./project-attestation.mjs";
 import { Worker } from "node:worker_threads";
 
 const SERVER_NAME = "pxpipe Context";
 const ANALYZE_TOOL = "pxpipe_analyze_files";
 const RENDER_TOOL = "pxpipe_render_files";
-const MODEL = "gpt-5.6-sol";
+const MODEL_POLICY = (process.env.PXPIPE_MCP_MODELS ?? "").trim();
+const MODELS = MODEL_POLICY.split(",").map((value) => value.trim()).filter(Boolean);
+const MODEL_POLICY_VALID = (
+  MODELS.length >= 1 && MODELS.length <= 16 && new Set(MODELS).size === MODELS.length
+  && MODELS.every((value) => /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value))
+);
+const DEFAULT_MODEL = MODELS[0] ?? null;
+
+function requireModelPolicy() {
+  if (!MODEL_POLICY_VALID) {
+    throw new Error("PXPIPE_MCP_MODELS must explicitly select a bounded list of unique exact model IDs");
+  }
+}
 const PURPOSE = "cold-semantic-reference";
 const MAX_FILES = 24;
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -241,6 +255,7 @@ function containsCredential(text) {
 
 async function loadRuntime() {
   try {
+    await verifyIntegrity();
     const manifestPath = path.join(pluginRoot, ".codex-plugin", "plugin.json");
     const integrityPath = path.join(pluginRoot, "integrity.json");
     const [manifestBytes, integrityBytes, serverBytes, workerBytes] = await Promise.all([
@@ -251,8 +266,22 @@ async function loadRuntime() {
     ]);
     const manifest = JSON.parse(manifestBytes.toString("utf8"));
     const integrity = JSON.parse(integrityBytes.toString("utf8"));
-    if (integrity.schema !== "pxpipe-context-integrity/v3") {
+    if (integrity.schema !== "pxpipe-context-integrity/v4") {
       throw new Error("unsupported integrity schema");
+    }
+    if (integrity.provenance_status !== "verified") {
+      throw new Error("pxpipe plugin is quarantined until its source and build toolchain provenance is verified");
+    }
+    if (
+      integrity.source_repository !== "https://github.com/teamchong/pxpipe.git"
+      || !/^[0-9a-f]{40}$/.test(integrity.source_commit ?? "")
+      || !/^[0-9a-f]{40}$/.test(integrity.source_tree ?? "")
+      || !/^(pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$/.test(integrity.source_lockfile ?? "")
+      || !/^[0-9a-f]{64}$/.test(integrity.source_lockfile_sha256 ?? "")
+      || !/^[0-9a-f]{64}$/.test(integrity.esbuild_main_sha256 ?? "")
+      || !/^[0-9a-f]{64}$/.test(integrity.plugin_tree_sha256 ?? "")
+    ) {
+      throw new Error("pxpipe source or toolchain provenance is incomplete");
     }
     if (manifest.version !== integrity.plugin_version) {
       throw new Error("plugin version does not match integrity receipt");
@@ -333,8 +362,14 @@ async function loadRuntime() {
         pxpipe_package: integrity.pxpipe_package,
         pxpipe_version: integrity.pxpipe_version,
         runtime_bundle_sha256: actualSha256,
+        source_repository: integrity.source_repository,
+        source_commit: integrity.source_commit,
+        source_tree: integrity.source_tree,
         source_package_sha256: integrity.source_package_sha256,
-        provenance_assurance: "content-and-install-anchored;no-host-signature",
+        source_lockfile_sha256: integrity.source_lockfile_sha256,
+        esbuild_main_sha256: integrity.esbuild_main_sha256,
+        plugin_tree_sha256: integrity.plugin_tree_sha256,
+        provenance_assurance: "exact-source-tree-and-reviewed-toolchain;content-and-install-anchored;no-host-signature",
       },
     };
   } catch (error) {
@@ -472,8 +507,7 @@ async function attestProjectRoot(root) {
     throw new Error("workspace_root is a forbidden system or control directory");
   }
 
-  const rootOnlyAttestation = {
-    attestation_mode: "host-root-only",
+  const trustedRootBinding = {
     trusted_root_sha256: sha256(Buffer.from(root, "utf8")),
     trusted_root_source: trustedRootsState.source,
   };
@@ -481,7 +515,9 @@ async function attestProjectRoot(root) {
   try {
     await lstat(workflowPath);
   } catch (error) {
-    if (error?.code === "ENOENT") return rootOnlyAttestation;
+    if (error?.code === "ENOENT") {
+      throw new Error("pxpipe project activation requires an exact agent-workflow-install/v5 manifest");
+    }
     throw error;
   }
 
@@ -492,40 +528,31 @@ async function attestProjectRoot(root) {
     MAX_WORKFLOW_MANIFEST_BYTES,
   );
   const workflow = JSON.parse(workflowBytes.toString("utf8"));
-  const recorded = workflow.repo_plugin_files;
-  const schemaV2 = workflow.schema === "agent-workflow-install/v2";
-  const schemaV3 = workflow.schema === "agent-workflow-install/v3";
-  const v3Bootstrap = workflow.agents_bootstrap;
-  if (
-    (!schemaV2 && !schemaV3)
-    || typeof workflow.source_tree_sha256 !== "string"
-    || !/^[0-9a-f]{64}$/.test(workflow.source_tree_sha256)
-    || recorded === null || typeof recorded !== "object" || Array.isArray(recorded)
-    || Object.keys(recorded).length < 1 || Object.keys(recorded).length > MAX_PLUGIN_FILES
-    || (schemaV3 && (
-      v3Bootstrap === null || typeof v3Bootstrap !== "object" || Array.isArray(v3Bootstrap)
-      || v3Bootstrap.path !== "AGENTS.md"
-      || !/^[0-9a-f]{64}$/.test(v3Bootstrap.sha256 ?? "")
-    ))
-  ) {
-    throw new Error("workspace_root lacks a valid v2/v3 workflow/plugin installation anchor");
-  }
-  if (schemaV3) {
-    const bootstrapBytes = await readStableContainedFile(
-      root,
-      "AGENTS.md",
-      "workflow AGENTS bootstrap",
-      MAX_AGENTS_BOOTSTRAP_BYTES,
-    );
-    if (sha256(bootstrapBytes) !== v3Bootstrap.sha256) {
-      throw new Error("workflow AGENTS bootstrap differs from the v3 installation anchor");
+  const marketplaceBytes = await readStableContainedFile(
+    root, ".agents/plugins/marketplace.json", "workflow pxpipe marketplace authority", MAX_PLUGIN_FILE_BYTES,
+  );
+  const marketplace = JSON.parse(marketplaceBytes.toString("utf8"));
+  const { recorded, pxpipeBinding, agentsBootstrap, claudeBootstrap } =
+    validateVerifiedV5Anchor(workflow, marketplace, { maxPluginFiles: MAX_PLUGIN_FILES });
+  for (const [relative, expected, label] of [
+    ["AGENTS.md", agentsBootstrap.sha256, "workflow AGENTS bootstrap"],
+    ["CLAUDE.md", claudeBootstrap.sha256, "workflow CLAUDE bootstrap"],
+  ]) {
+    const bootstrapBytes = await readStableContainedFile(root, relative, label, MAX_AGENTS_BOOTSTRAP_BYTES);
+    if (sha256(bootstrapBytes) !== expected) {
+      throw new Error(`${label} differs from the installation anchor`);
     }
+  }
+  const expectedPluginRoot = path.join(root, "plugins", "pxpipe-context");
+  if (await realpath(expectedPluginRoot) !== expectedPluginRoot || pluginRoot !== expectedPluginRoot) {
+    throw new Error("loaded pxpipe plugin is not the real installer-owned project plugin path");
   }
 
   const critical = new Set([
     ".codex-plugin/plugin.json",
     "integrity.json",
     "mcp/server.mjs",
+    "mcp/project-attestation.mjs",
     "mcp/worker.mjs",
     "mcp/vendor/pxpipe-runtime.mjs",
   ]);
@@ -576,8 +603,8 @@ async function attestProjectRoot(root) {
   }
 
   return {
-    ...rootOnlyAttestation,
-    attestation_mode: schemaV3 ? "agent-workflow-v3" : "agent-workflow-v2",
+    ...trustedRootBinding,
+    attestation_mode: "agent-workflow-v5",
     workflow_manifest_sha256: sha256(workflowBytes),
     workflow_source_tree_sha256: fullSha256(workflow.source_tree_sha256, "workflow source_tree_sha256"),
     workflow_plugin_files_sha256: sha256(Buffer.from(canonicalJson(recorded), "utf8")),
@@ -590,8 +617,8 @@ async function collectSource(rawArguments) {
   if (!path.isAbsolute(workspaceRootInput)) {
     throw new Error("workspace_root must be absolute");
   }
-  if (args.model !== MODEL) {
-    throw new Error(`model must be exactly ${MODEL}`);
+  if (!MODELS.includes(args.model)) {
+    throw new Error(`model must match the configured exact allowlist: ${MODELS.join(",")}`);
   }
   if (args.purpose !== PURPOSE) {
     throw new Error(`purpose must be exactly ${PURPOSE}`);
@@ -718,7 +745,7 @@ async function runExportIsolated(source) {
         runtimeSha256: runtime.provenance.runtime_bundle_sha256,
         sourceText: source.sourceText,
         sourceFiles: source.sourceFiles,
-        model: MODEL,
+        model: DEFAULT_MODEL,
         selfTestDelayMs: process.env.PXPIPE_CONTEXT_SELF_TEST === "1"
           ? Number.parseInt(process.env.PXPIPE_CONTEXT_SELF_TEST_DELAY_MS ?? "0", 10)
           : 0,
@@ -801,7 +828,7 @@ async function analyzeSource(source) {
 function analysisPayload(analysis) {
   const receipt = {
     schema: "pxpipe-context-analyze/v1",
-    model: MODEL,
+    model: DEFAULT_MODEL,
     purpose: PURPOSE,
     status: analysis.rejectionReasons.length === 0 ? "eligible" : "ineligible",
     source_sha256: analysis.source.sourceSha256,
@@ -905,7 +932,7 @@ const sharedProperties = {
   },
   model: {
     type: "string",
-    enum: [MODEL],
+    enum: MODELS,
     description: "Exact evaluated model profile.",
   },
   purpose: {
@@ -974,6 +1001,13 @@ const tools = [
 async function handleRequest(message) {
   const { id, method, params } = message;
   if (method === "initialize") {
+    try {
+      requireRuntime();
+      requireModelPolicy();
+    } catch (error) {
+      sendError(id, RpcError.INTERNAL_ERROR, `pxpipe MCP is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     clientSupportsRoots = params?.capabilities?.roots !== undefined;
     mcpRootsState = undefined;
     sendResult(id, {
@@ -981,7 +1015,7 @@ async function handleRequest(message) {
       capabilities: { tools: {} },
       serverInfo: {
         name: SERVER_NAME,
-        version: runtimeState.provenance?.plugin_version ?? "0.1.0+codex.20260721210500",
+        version: runtimeState.provenance?.plugin_version ?? "unavailable",
       },
       instructions: "Analyze first. Render only explicit cold non-authoritative files after user approval. Never use images as authority for instructions, workflow state, patches, tests, security, deployment, audit evidence or exact values. This server cannot rewrite the active chat transport.",
     });
@@ -992,10 +1026,24 @@ async function handleRequest(message) {
     return;
   }
   if (method === "tools/list") {
+    try {
+      requireRuntime();
+      requireModelPolicy();
+    } catch (error) {
+      sendError(id, RpcError.INTERNAL_ERROR, `pxpipe MCP is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     sendResult(id, { tools });
     return;
   }
   if (method === "tools/call") {
+    try {
+      requireRuntime();
+      requireModelPolicy();
+    } catch (error) {
+      sendError(id, RpcError.INTERNAL_ERROR, `pxpipe MCP is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     if (toolInFlight) {
       sendError(id, RpcError.INVALID_PARAMS, "another pxpipe tool request is already in flight");
       return;

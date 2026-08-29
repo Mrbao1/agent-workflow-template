@@ -1,7 +1,7 @@
 {
   "name": "pxpipe-context",
   "version": "0.1.0+codex.20260721210500",
-  "description": "Make pxpipe the default Responses provider path for all new Codex Local sessions, with an optional MCP for cold file references.",
+  "description": "Quarantined pxpipe compatibility snapshot; unavailable until exact source and build-tool provenance is restored.",
   "author": {
     "name": "Agent Workflow Template maintainers"
   },
@@ -18,8 +18,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "pxpipe for Codex",
-    "shortDescription": "Default new Codex sessions to pxpipe",
-    "longDescription": "Installs the primary whole-session provider proxy as the default path for all new Codex Local sessions and retains an optional, read-only MCP auxiliary for explicitly selected cold file references. It cannot retrofit the transport of a chat that is already running.",
+    "shortDescription": "Quarantined compatibility snapshot",
+    "longDescription": "Preserves a historical pxpipe integration for migration analysis only. Publication, installation, provider activation and MCP use are blocked until a verified v4 source/tree/toolchain rebuild is reviewed.",
     "developerName": "Agent Workflow Template maintainers",
     "category": "Developer Tools",
     "capabilities": [
@@ -28,9 +28,9 @@
       "Read"
     ],
     "defaultPrompt": [
-      "Enable pxpipe by default for every new Codex session",
-      "Verify that a Codex request was compressed",
-      "Optionally render approved cold reference files"
+      "Explain why this pxpipe snapshot is quarantined",
+      "Do not install or invoke the bundle",
+      "Describe the verified rebuild requirements"
     ]
   }
 }

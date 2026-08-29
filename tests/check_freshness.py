@@ -37,7 +37,7 @@ def bundle_errors(contextctl, install) -> list:
     try:
         candidate = tmp / "proj" / ".agent"
         install.copy_managed_fresh_install(ROOT / ".agent", candidate)
-        install.initialize_fresh_context(candidate)
+        install.initialize_fresh_context(ROOT / ".agent", candidate)
         rebuilt = json.loads((candidate / "state" / "CONTEXT.json").read_text(encoding="utf-8"))
         committed = json.loads((SEED / "state" / "CONTEXT.json").read_text(encoding="utf-8"))
         if committed.get("policy_bundle_sha256") != rebuilt.get("policy_bundle_sha256"):
@@ -93,10 +93,16 @@ def main() -> int:
             failures.append(f"contextctl check failed: {result.stdout.strip().splitlines()[-1] if result.stdout.strip() else result.returncode}")
 
     try:
-        result = subprocess.run(
-            [sys.executable, "install.py", ".", "--check"],
-            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
-        )
+        with tempfile.TemporaryDirectory(prefix="freshness-manifest-") as raw:
+            target = Path(raw) / "project"
+            shutil.copytree(ROOT / ".agent", target / ".agent")
+            (target / ".agent").chmod(0o700)
+            for bootstrap in ("AGENTS.md", "CLAUDE.md"):
+                shutil.copy2(ROOT / bootstrap, target / bootstrap)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "install.py"), str(target), "--check"],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+            )
     except subprocess.TimeoutExpired:
         failures.append("install manifest check timed out after 120s")
     else:

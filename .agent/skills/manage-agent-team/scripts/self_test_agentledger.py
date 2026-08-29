@@ -20,6 +20,8 @@ INPUT_BYTES = b"read-only input"
 INPUT_SHA = hashlib.sha256(INPUT_BYTES).hexdigest()
 INPUT_INTERNAL = f".agent/state/evidence/agent-input-artifacts/{INPUT_SHA}.blob"
 NODE6_PATH = ".agent/state/artifacts/06-implementation.json"
+_FAILURE_CONTROL = tempfile.TemporaryDirectory(prefix="agent-ledger-failure-control-")
+FAILURE_MARKER = Path(_FAILURE_CONTROL.name) / "force-replay-failure.txt"
 NODE6_VALUE = {
     "schema": "agent-node-implementation/v3", "status": "verified",
     "requirement_contract_sha256": "a" * 64,
@@ -27,7 +29,7 @@ NODE6_VALUE = {
     "changes": [{"path": "managed.txt", "sha256": "b" * 64, "bytes": 1}],
     "checks": [
         {"id": "alpha", "command": [sys.executable, "replay-case.py", "alpha"], "exit_code": 0},
-        {"id": "beta", "command": [sys.executable, "replay-case.py", "beta"], "exit_code": 0},
+        {"id": "beta", "command": [sys.executable, "replay-case.py", "beta", str(FAILURE_MARKER)], "exit_code": 0},
     ],
 }
 NODE6_BYTES = (json.dumps(NODE6_VALUE, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -67,16 +69,33 @@ PROOF_BYTES = (
     + "\nfixture review report\n"
 ).encode()
 PROOF_SHA = hashlib.sha256(PROOF_BYTES).hexdigest()
+TEST_EXECUTION_BOUNDARY = {
+    "schema": "agent-test-execution-boundary/v1",
+    "mode": "disposable-exact-candidate",
+    "writable_root": "disposable-candidate",
+    "credentials_inherited": False,
+    "filesystem_confinement": False,
+    "network_confinement": False,
+    "claim_limit": "same-UID/private copies are not an OS filesystem or network security boundary",
+}
 
 
 def run(root: Path, *args: str, expected: int = 0) -> str:
     result = subprocess.run(
         [sys.executable, str(root / ".agent/skills/manage-agent-team/scripts/agentledger.py"), *args],
-        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
     )
     if result.returncode != expected:
         raise AssertionError(f"{args}: expected {expected}, got {result.returncode}\n{result.stdout}")
     return result.stdout
+
+
+def decision_receipt(root: Path, name: str, gate: str, artifact_sha256: str, source: str) -> str:
+    path = root / name
+    path.write_text(json.dumps({
+        "gate": gate, "artifact_sha256": artifact_sha256, "source": source,
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return name
 
 
 def candidate_fingerprint(root: Path) -> str:
@@ -121,7 +140,7 @@ def snapshot(root: Path, name: str, members: list[dict[str, object]],
                 envelope = {
                     "schema": "agent-handoff-envelope/v3", "ledger_epoch": item["ledger_epoch"],
                     "agent_id": item["id"], "root_task_id": item["root_task_id"],
-                    "role_type": item["role_type"], "model": item.get("model", "gpt-5.6-sol"),
+                    "role_type": item["role_type"], "model": item.get("model", "vendor-x/reasoning.model+2026"),
                     "fork_turns": item.get("fork_turns", 0), "started_at": item["started_at"],
                     "deadline_at": item["deadline_at"], "redispatch_count": item["redispatch_count"],
                     "task_payload_path": PAYLOAD_INTERNAL, "task_payload_sha256": item["task_payload_sha256"],
@@ -145,7 +164,18 @@ def snapshot(root: Path, name: str, members: list[dict[str, object]],
     return path.name
 
 
-def platform_member(agent_id: str, status: str, cursor: int = 0, message: str = "", model: str = "gpt-5.6-sol",
+def reset_attack_snapshot(root: Path, name: str, mode: str, mutate_path: Optional[Path] = None) -> str:
+    raw = snapshot(root, name, [])
+    path = root / raw
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["reset_test_mode"] = mode
+    if mutate_path is not None:
+        value["reset_test_mutate_path"] = str(mutate_path)
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    return raw
+
+
+def platform_member(agent_id: str, status: str, cursor: int = 0, message: str = "", model: str = "vendor-x/reasoning.model+2026",
                     fork_turns: object = 0, envelope_sha: Optional[str] = None,
                     role_type: Optional[str] = None, root_task_id: Optional[str] = None,
                     redispatch_count: Optional[int] = None) -> dict[str, object]:
@@ -191,7 +221,7 @@ def rewrite_ledger_legacy(path: Path, value: dict[str, object]) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def prepare_dispatch(root: Path, agent_id: str, role_type: str = "reviewer", model: str = "gpt-5.6-sol",
+def prepare_dispatch(root: Path, agent_id: str, role_type: str = "reviewer", model: str = "vendor-x/reasoning.model+2026",
                      fork_turns: int = 0, root_task_id: Optional[str] = None,
                      redispatch_count: int = 0, expected: int = 0) -> str:
     envelope_name = f"envelope-{re.sub(r'[^A-Za-z0-9._-]', '_', agent_id)}.json"
@@ -217,7 +247,7 @@ def write_review_envelope(root: Path, agent_id: str, role_type: str, chain_id: s
     value = {
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": ledger["epoch"],
         "agent_id": agent_id, "root_task_id": root_task_id, "role_type": role_type,
-        "model": "gpt-5.6-sol", "fork_turns": 0, "started_at": started.isoformat(),
+        "model": "vendor-x/reasoning.model+2026", "fork_turns": 0, "started_at": started.isoformat(),
         "deadline_at": (started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": redispatch_count,
         "task_payload_path": PAYLOAD_INTERNAL, "task_payload_sha256": PAYLOAD_SHA,
@@ -314,7 +344,8 @@ def write_clean_replay(root: Path, suffix: str, run_id: str, replay_time: dt.dat
     output_path.write_text("full-chain passed\n", encoding="utf-8")
     output_receipt = {
         "path": output_path.name, "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
-        "bytes": len(output_path.read_bytes()),
+        "bytes": len(output_path.read_bytes()), "limit_bytes": 8 * 1024 * 1024,
+        "limit_exceeded": False,
     }
     timestamp = replay_time.replace(microsecond=0).isoformat()
     replay_case = {
@@ -322,7 +353,8 @@ def write_clean_replay(root: Path, suffix: str, run_id: str, replay_time: dt.dat
         "candidate_sha256": candidate_fingerprint(root),
         "command": ["python3", "full-chain.py"],
         "started_at": timestamp, "finished_at": timestamp, "exit_code": 0,
-        "outcome": "completed", "cleanup": "passed", "output": output_receipt,
+        "outcome": "completed", "cleanup": "passed",
+        "execution_boundary": dict(TEST_EXECUTION_BOUNDARY), "output": output_receipt,
     }
     replay_case["case_sha256"] = hashlib.sha256(
         json.dumps(replay_case, sort_keys=True, separators=(",", ":")).encode()
@@ -381,7 +413,7 @@ def register_formal(root: Path, agent_id: str, role_type: str, envelope_sha: str
     registration = snapshot(root, f"register-{agent_id}", [item], observed_at=started)
     run(root, "register", "--id", agent_id, "--root-task-id", root_task_id,
         "--role-type", role_type, "--role", role_type, "--task", role_type,
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt",
         "--handoff-envelope", f"envelope-{agent_id}.json", "--deadline-minutes", "5",
         "--progress-hash", seed, "--platform-snapshot", registration)
 
@@ -395,35 +427,83 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     shutil.copy2(SOURCE, scripts / "agentledger.py")
     (root / ".agent/scripts").mkdir(exist_ok=True)
     shutil.copytree(TESTRUN_SOURCE.parent / "workflowlib", root / ".agent/scripts/workflowlib")
+    # Deterministic lock-order regression: budget-gate takes the canonical
+    # .agents.lock and every ledger subprocess is bounded by run()'s timeout.
+    # The historical prepare-under-lock implementation deadlocks here.
     (root / ".agent/scripts/agentctl.py").write_text(
         "#!/usr/bin/env python3\n"
-        "from pathlib import Path\nimport sys\n"
+        "from pathlib import Path\nimport fcntl,sys\n"
         "if 'budget-gate' in sys.argv and '--action' in sys.argv:\n"
-        " p=Path('.agent/state/budget-actions.log')\n"
-        " p.write_text((p.read_text() if p.exists() else '') + sys.argv[sys.argv.index('--action')+1] + '\\n')\n"
+        " lock_path=Path('.agent/state/.agents.lock'); lock_path.touch(exist_ok=True)\n"
+        " with lock_path.open('r+') as lock:\n"
+        "  fcntl.flock(lock.fileno(),fcntl.LOCK_EX)\n"
+        "  p=Path('.agent/state/budget-actions.log')\n"
+        "  p.write_text((p.read_text() if p.exists() else '') + sys.argv[sys.argv.index('--action')+1] + '\\n')\n"
         "raise SystemExit(0)\n",
         encoding="utf-8",
     )
     shutil.copy2(TESTRUN_SOURCE, root / ".agent/scripts/testrun.py")
+    shutil.copy2(TESTRUN_SOURCE.with_name("process_observation.py"), root / ".agent/scripts/process_observation.py")
     shutil.copy2(TESTRUN_SOURCE.with_name("humandecision.py"), root / ".agent/scripts/humandecision.py")
     platform_adapter = root / "platform-adapter.py"
     platform_adapter.write_text(
-        "#!/usr/bin/env python3\nimport hashlib,sys\np=sys.argv[sys.argv.index('--snapshot')+1]\nprint('VERIFIED PLATFORM SNAPSHOT sha256='+hashlib.sha256(open(p,'rb').read()).hexdigest())\n",
+        "#!/usr/bin/env python3\n"
+        "import datetime as dt,hashlib,json,sys\n"
+        "p=sys.argv[sys.argv.index('--snapshot')+1]; raw=open(p,'rb').read(); snapshot=json.loads(raw)\n"
+        "if '--ledger-reset-challenge' not in sys.argv:\n"
+        " print('VERIFIED PLATFORM SNAPSHOT sha256='+hashlib.sha256(raw).hexdigest()); raise SystemExit(0)\n"
+        "def arg(name): return sys.argv[sys.argv.index(name)+1]\n"
+        "mode=snapshot.get('reset_test_mode'); nonce=arg('--ledger-reset-challenge')\n"
+        "proof={'schema':'agent-ledger-reset-proof/v1','nonce':nonce,'authority':'provider-signed-platform-observer',"
+        "'status':'approved-empty-platform','observed_at':dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),"
+        "'project_identity_sha256':arg('--project-identity-sha256'),'task_generation_sha256':arg('--task-generation-sha256'),"
+        "'task_generation_id':arg('--task-generation-id'),'legacy_ledger_sha256':arg('--legacy-ledger-sha256'),"
+        "'legacy_ledger_bytes':int(arg('--legacy-ledger-bytes')),'platform_snapshot_sha256':arg('--platform-snapshot-sha256'),"
+        "'platform_observed_at':snapshot.get('observed_at')}\n"
+        "if mode=='replayed': proof['nonce']='0'*64\n"
+        "elif mode=='tampered-ledger': proof['legacy_ledger_sha256']='f'*64\n"
+        "elif mode=='tampered-project': proof['project_identity_sha256']='f'*64\n"
+        "elif mode=='tampered-task': proof['task_generation_sha256']='f'*64\n"
+        "elif mode=='stale': proof['observed_at']=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(minutes=5)).replace(microsecond=0).isoformat()\n"
+        "elif mode=='unknown-status': proof['status']='maybe-empty'\n"
+        "elif mode=='malformed': print('{not-json'); raise SystemExit(0)\n"
+        "elif mode=='race-ledger': open(snapshot['reset_test_mutate_path'],'ab').write(b' ' )\n"
+        "print(json.dumps(proof,sort_keys=True,separators=(',',':')))\n",
         encoding="utf-8",
     )
     platform_adapter.chmod(0o755)
+    Path(str(platform_adapter)+".agent-workflow-adapter.json").write_text(json.dumps({
+        "schema":"agent-provider-adapter/v1","purpose":"provider-verifiable-agent-control",
+        "executable_sha256":hashlib.sha256(platform_adapter.read_bytes()).hexdigest(),"operations":["verify-platform"],
+    },sort_keys=True)+"\n",encoding="utf-8")
     # Positive platform-protocol fixtures simulate the provider trust boundary
     # through a test-only sitecustomize patch scoped to this one adapter. The
     # production path still rejects this Agent-writable executable.
     site_dir = root / "test-site"
     site_dir.mkdir()
     (site_dir / "sitecustomize.py").write_text(
-        "import os,sys\nfrom pathlib import Path\n"
+        "import hashlib,json,os,sys\nfrom pathlib import Path\n"
         "sys.path.insert(0,str(Path.cwd()/'.agent/scripts'))\n"
-        "import humandecision\n_original=humandecision.adapter_path\n"
-        "def _fixture(root,raw):\n"
-        " return Path(raw).resolve() if str(Path(str(raw)).resolve())==os.environ.get('AGENT_TEST_PLATFORM_ADAPTER') else _original(root,raw)\n"
-        "humandecision.adapter_path=_fixture\n",
+        "import humandecision\n_original=humandecision.adapter_path\n_original_chain=humandecision.protected_path_chain\n"
+        "def _fixture(root,raw,required_operations=('health','verify')):\n"
+        " if str(Path(str(raw)).resolve())==os.environ.get('AGENT_TEST_PLATFORM_ADAPTER'):\n"
+        "  assert tuple(required_operations)==('verify-platform',)\n"
+        "  return Path(raw).resolve()\n"
+        " return _original(root,raw,required_operations=required_operations)\n"
+        "def _chain(path):\n"
+        " adapter=Path(os.environ['AGENT_TEST_PLATFORM_ADAPTER']).resolve(); metadata=Path(str(adapter)+'.agent-workflow-adapter.json').resolve()\n"
+        " return True if Path(path).resolve() in {adapter,metadata} else _original_chain(path)\n"
+        "def _verify(root,config,task,*,gate,artifact_sha256,source,receipt,require_fresh=True):\n"
+        " p=(Path(root)/receipt).resolve(); relative=str(p.relative_to(Path(root).resolve()))\n"
+        " data=p.read_bytes(); value=json.loads(data)\n"
+        " assert value=={'artifact_sha256':artifact_sha256,'gate':gate,'source':source}\n"
+        " return {'path':relative,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'gate':gate,'artifact_sha256':artifact_sha256,'source':source}\n"
+        "def _reverify(root,config,task,*,gate,artifact_sha256,source,record):\n"
+        " try: return record==_verify(root,config,task,gate=gate,artifact_sha256=artifact_sha256,source=source,receipt=record.get('path',''),require_fresh=False)\n"
+        " except Exception: return False\n"
+        "humandecision.adapter_path=_fixture\n"
+        "humandecision.protected_path_chain=_chain\n"
+        "humandecision.verify=_verify\nhumandecision.reverify=_reverify\n",
         encoding="utf-8",
     )
     os.environ["AGENT_TEST_PLATFORM_ADAPTER"] = str(platform_adapter.resolve())
@@ -451,7 +531,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
             "product_roots": [".agent/scripts"],
         },
         "agent_control": {
-            "default_model": "gpt-5.6-sol", "allow_model_fallback": False,
+            "default_model": "vendor-x/reasoning.model+2026", "allow_model_fallback": False,
             "context_strategy": "long-window-capsule", "max_fork_turns": 10, "capacity_retry_limit": 1,
             "inherit_parent_history": False,
             "dispatch_payload_token_limits": {"fast": 0, "standard": 16000, "release": 32000},
@@ -476,7 +556,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         },
     }), encoding="utf-8")
     (state / "TASK.json").write_text(json.dumps({
-        "mode": "release", "title": "fixture", "current_node": 7,
+        "mode": "release", "title": "fixture", "task_generation_id": "fixture-generation-1", "current_node": 7,
         "token_budget": 1000000, "tokens_used": 0,
         "accepted_nodes": [0, 1, 2, 3, 4, 5, 6],
         "node_artifacts": {"6": {"path": NODE6_PATH, "sha256": NODE6_SHA, "bytes": len(NODE6_BYTES)}},
@@ -606,7 +686,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         "schema": "agent-handoff-envelope/v3",
         "ledger_epoch": json.loads((state / "agents.json").read_text())["epoch"],
         "agent_id": historical_id, "root_task_id": historical_id,
-        "role_type": "worker", "model": "gpt-5.6-sol", "fork_turns": 0,
+        "role_type": "worker", "model": "vendor-x/reasoning.model+2026", "fork_turns": 0,
         "started_at": historical_started.isoformat(),
         "deadline_at": (historical_started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": 0, "task_payload_path": PAYLOAD_INTERNAL,
@@ -659,7 +739,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         root, "historical-fork-ten-register", [historical_platform_item], observed_at=historical_started,
     )
     run(root, "register", "--id", historical_id, "--role-type", "worker", "--role", "worker",
-        "--task", "historical worker", "--model", "gpt-5.6-sol", "--fork-turns", "10",
+        "--task", "historical worker", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "10",
         "--task-payload", "payload.txt", "--handoff-envelope", historical_envelope_path.name,
         "--deadline-minutes", "5", "--progress-hash", seed,
         "--platform-snapshot", historical_registration)
@@ -721,7 +801,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     attester_envelope = {
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": ledger["epoch"],
         "agent_id": "attester", "root_task_id": "attester", "role_type": "implementer",
-        "model": "gpt-5.6-sol", "fork_turns": 0,
+        "model": "vendor-x/reasoning.model+2026", "fork_turns": 0,
         "started_at": attester_started.isoformat(),
         "deadline_at": (attester_started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": 0, "task_payload_path": PAYLOAD_INTERNAL,
@@ -780,7 +860,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     )
     stale_register = run(
         root, "register", "--id", "attester", "--role-type", "implementer",
-        "--role", "attester", "--task", "verify Node6", "--model", "gpt-5.6-sol",
+        "--role", "attester", "--task", "verify Node6", "--model", "vendor-x/reasoning.model+2026",
         "--fork-turns", "0", "--task-payload", "payload.txt",
         "--handoff-envelope", "envelope-attester.json", "--deadline-minutes", "5",
         "--progress-hash", hashlib.sha256(b"stale").hexdigest(),
@@ -823,7 +903,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     rewrite_ledger_legacy(state / "agents.json", invalid_timestamps)
     invalid_register = run(
         root, "register", "--id", "attester", "--role-type", "implementer",
-        "--role", "attester", "--task", "verify Node6", "--model", "gpt-5.6-sol",
+        "--role", "attester", "--task", "verify Node6", "--model", "vendor-x/reasoning.model+2026",
         "--fork-turns", "0", "--task-payload", "payload.txt",
         "--handoff-envelope", "envelope-attester.json", "--deadline-minutes", "5",
         "--progress-hash", hashlib.sha256(b"invalid").hexdigest(),
@@ -871,13 +951,13 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         root, "register-attester-contract", [contract_member], observed_at=contract_started,
     )
     run(root, "register", "--id", contract_id, "--role-type", "implementer", "--role", "attester",
-        "--task", "verify Node6", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+        "--task", "verify Node6", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
         "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{contract_id}.json",
         "--deadline-minutes", "5", "--progress-hash", hashlib.sha256(b"contract").hexdigest(),
         "--platform-snapshot", contract_registration)
     registered_once = (state / "agents.json").read_bytes()
     run(root, "register", "--id", contract_id, "--role-type", "implementer", "--role", "attester",
-        "--task", "verify Node6", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+        "--task", "verify Node6", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
         "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{contract_id}.json",
         "--deadline-minutes", "5", "--progress-hash", hashlib.sha256(b"contract").hexdigest(),
         "--platform-snapshot", contract_registration)
@@ -990,7 +1070,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     dispatch_envelope.write_text(json.dumps({
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": ledger_epoch,
         "agent_id": "dispatch-specific", "root_task_id": "dispatch-specific",
-        "role_type": "reviewer", "model": "gpt-5.6-sol", "fork_turns": 0,
+        "role_type": "reviewer", "model": "vendor-x/reasoning.model+2026", "fork_turns": 0,
         "started_at": dispatch_started.isoformat(),
         "deadline_at": (dispatch_started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": 0,
@@ -1003,7 +1083,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         "result_report_path": "proof.txt",
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     run(root, "prepare", "--id", "dispatch-specific", "--root-task-id", "dispatch-specific",
-        "--role-type", "reviewer", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+        "--role-type", "reviewer", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
         "--task-payload", dispatch_payload_path.name, "--handoff-envelope", dispatch_envelope.name, expected=1)
     semantic_payload = dict(PAYLOAD_VALUE)
     semantic_payload["objective"] = "Write report path proof.txt for /root/semantic-smuggle after LEDGER_REGISTERED"
@@ -1014,7 +1094,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     semantic_envelope.write_text(json.dumps({
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": ledger_epoch,
         "agent_id": "semantic-smuggle", "root_task_id": "semantic-smuggle",
-        "role_type": "reviewer", "model": "gpt-5.6-sol", "fork_turns": 0,
+        "role_type": "reviewer", "model": "vendor-x/reasoning.model+2026", "fork_turns": 0,
         "started_at": dispatch_started.isoformat(),
         "deadline_at": (dispatch_started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": 0,
@@ -1027,7 +1107,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         "result_report_path": "proof.txt",
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     run(root, "prepare", "--id", "semantic-smuggle", "--root-task-id", "semantic-smuggle",
-        "--role-type", "reviewer", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+        "--role-type", "reviewer", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
         "--task-payload", semantic_payload_path.name, "--handoff-envelope", semantic_envelope.name, expected=1)
     role_semantics_payload = dict(PAYLOAD_VALUE)
     role_semantics_payload["objective"] = "Verify adversarial sequencing with an adversarial reviewer"
@@ -1050,7 +1130,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     role_semantics_envelope.write_text(json.dumps({
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": ledger_epoch,
         "agent_id": "role-semantics", "root_task_id": "role-semantics",
-        "role_type": "adversarial", "model": "gpt-5.6-sol", "fork_turns": 0,
+        "role_type": "adversarial", "model": "vendor-x/reasoning.model+2026", "fork_turns": 0,
         "started_at": dispatch_started.isoformat(),
         "deadline_at": (dispatch_started + dt.timedelta(minutes=5)).isoformat(),
         "redispatch_count": 0,
@@ -1063,7 +1143,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         "result_report_path": "proof.txt",
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     run(root, "prepare", "--id", "role-semantics", "--root-task-id", "role-semantics",
-        "--role-type", "adversarial", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+        "--role-type", "adversarial", "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
         "--task-payload", role_semantics_path.name, "--handoff-envelope", role_semantics_envelope.name)
     run(root, "cancel-prepare", "--id", "role-semantics")
     role_control_draft = dict(draft_payload)
@@ -1072,28 +1152,28 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     run(root, "seal-payload", "--draft", "role-control-draft.json", "--output", "role-control-sealed.json", expected=1)
     (root / "capacity-error.txt").write_text("Selected model is at capacity", encoding="utf-8")
     run(root, "capacity-failure", "--root-task-id", "capacity-review", "--attempt-id", "initial",
-        "--model", "gpt-5.6-terra", "--evidence", "capacity-error.txt", expected=1)
+        "--model", "provider-neutral/alternate-model-v2", "--evidence", "capacity-error.txt", expected=1)
     run(root, "capacity-failure", "--root-task-id", "capacity-review", "--attempt-id", "initial",
-        "--model", "gpt-5.6-sol", "--evidence", "capacity-error.txt")
+        "--model", "vendor-x/reasoning.model+2026", "--evidence", "capacity-error.txt")
     run(root, "capacity-failure", "--root-task-id", "capacity-review", "--attempt-id", "initial",
-        "--model", "gpt-5.6-sol", "--evidence", "capacity-error.txt", expected=1)
+        "--model", "vendor-x/reasoning.model+2026", "--evidence", "capacity-error.txt", expected=1)
     (root / "capacity-error.txt").write_text("Selected model is still at capacity on the retry", encoding="utf-8")
     run(root, "capacity-failure", "--root-task-id", "capacity-review", "--attempt-id", "same-model-retry",
-        "--model", "gpt-5.6-sol", "--evidence", "capacity-error.txt", expected=3)
+        "--model", "vendor-x/reasoning.model+2026", "--evidence", "capacity-error.txt", expected=3)
     run(root, "capacity-failure", "--root-task-id", "capacity-review", "--attempt-id", "forbidden-third",
-        "--model", "gpt-5.6-sol", "--evidence", "capacity-error.txt", expected=1)
+        "--model", "vendor-x/reasoning.model+2026", "--evidence", "capacity-error.txt", expected=1)
     run(root, "validate")
     capacity_ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     capacity_paths = [item["error_evidence"]["path"] for item in capacity_ledger["capacity_failures"]]
     if len(set(capacity_paths)) != 2 or not all(path.startswith(".agent/state/evidence/capacity-failures/") for path in capacity_paths):
         raise AssertionError("reused caller capacity path was not preserved as distinct immutable evidence")
     run(root, "register", "--id", "unproven", "--role-type", "reviewer", "--role", "reviewer", "--task", "x",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-unproven.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-unproven.json",
         "--deadline-minutes", "5", "--progress-hash", seed, expected=1)
-    wrong_model = snapshot(root, "wrong-model", [platform_member("a", "running", model="gpt-5.6-terra")])
-    prepare_dispatch(root, "a", model="gpt-5.6-terra", expected=1)
+    wrong_model = snapshot(root, "wrong-model", [platform_member("a", "running", model="provider-neutral/alternate-model-v2")])
+    prepare_dispatch(root, "a", model="provider-neutral/alternate-model-v2", expected=1)
     run(root, "register", "--id", "a", "--role-type", "reviewer", "--role", "reviewer", "--task", "a",
-        "--model", "gpt-5.6-terra", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-a.json",
+        "--model", "provider-neutral/alternate-model-v2", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-a.json",
         "--deadline-minutes", "5", "--progress-hash", seed,
         "--platform-snapshot", wrong_model, expected=1)
     snapshot(root, "fork-envelope-source", [platform_member("fork-bound", "running", fork_turns=11)])
@@ -1102,13 +1182,13 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     prepare_dispatch(root, "cancel-a")
     wrong_handoff = snapshot(root, "wrong-handoff", [platform_member("cancel-a", "running", envelope_sha="f" * 64)])
     run(root, "register", "--id", "cancel-a", "--role-type", "reviewer", "--role", "reviewer", "--task", "cancel-a",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-cancel-a.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-cancel-a.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", wrong_handoff, expected=1)
     run(root, "cancel-prepare", "--id", "cancel-a")
     wrong_role = snapshot(root, "wrong-role", [platform_member("a", "running", role_type="implementer")])
     prepare_dispatch(root, "a", role_type="reviewer", expected=1)
     run(root, "register", "--id", "a", "--role-type", "reviewer", "--role", "reviewer", "--task", "a",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-a.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-a.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", wrong_role, expected=1)
     registered: list[str] = []
     for name in ("a", "b", "c"):
@@ -1117,7 +1197,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         registration = snapshot(root, "shared-running", [platform_member(item, "running") for item in registered])
         prepare_dispatch(root, name)
         run(root, "register", "--id", name, "--role-type", "reviewer", "--role", "reviewer", "--task", name,
-            "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{name}.json",
+            "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{name}.json",
             "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", registration)
     ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     registration_paths = [item["registration_platform_evidence"]["path"] for item in ledger["members"]]
@@ -1127,7 +1207,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     overflow_snapshot = snapshot(root, "register-overflow", [platform_member(item, "running") for item in ("a", "b", "c", "overflow")])
     prepare_dispatch(root, "overflow", expected=1)
     run(root, "register", "--id", "overflow", "--role-type", "reviewer", "--role", "reviewer", "--task", "x",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-overflow.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-overflow.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", overflow_snapshot, expected=1)
 
     active = snapshot(root, "active", [platform_member(name, "running") for name in ("a", "b", "c")])
@@ -1291,7 +1371,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         root, "register-barrier", [barrier_member], observed_at=barrier_registered,
     )
     run(root, "register", "--id", "barrier", "--role-type", "reviewer", "--role", "reviewer", "--task", "barrier",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-barrier.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-barrier.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", registration_barrier)
     barrier_poll_at = barrier_registered + dt.timedelta(seconds=59)
     barrier_poll = snapshot(
@@ -1313,7 +1393,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     )
     prepare_dispatch(root, "near")
     run(root, "register", "--id", "near", "--role-type", "reviewer", "--role", "reviewer", "--task", "near",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-near.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-near.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", registration_near)
     near_poll = snapshot(
         root, "near-poll", [platform_member("near", "running")], observed_at=near_started + dt.timedelta(seconds=59),
@@ -1335,7 +1415,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     )
     prepare_dispatch(root, "gap")
     run(root, "register", "--id", "gap", "--role-type", "reviewer", "--role", "reviewer", "--task", "gap",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-gap.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-gap.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", registration_gap)
     stale_poll = snapshot(root, "stale-poll", [platform_member("gap", "running")], observed_at=gap_started + dt.timedelta(seconds=61))
     run(root, "check", "--platform-snapshot", stale_poll, expected=2)
@@ -1378,7 +1458,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     )
     prepare_dispatch(root, "late")
     run(root, "register", "--id", "late", "--role-type", "reviewer", "--role", "reviewer", "--task", "late",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-late.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-late.json",
         "--deadline-minutes", "1", "--progress-hash", seed, "--platform-snapshot", registration_late)
     late_started = dt.datetime.fromisoformat(json.loads((state / "agents.json").read_text(encoding="utf-8"))["members"][-1]["started_at"])
     terminal_late = snapshot(root, "terminal-late", [platform_member("late", "completed", 1)],
@@ -1388,7 +1468,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     run(root, "finish", "--id", "late", "--status", "expired", "--conclusion", "deadline and monitoring expired",
         "--platform-snapshot", terminal_late)
 
-    # Unchanged-check counts only request status. A 100-second gpt-5.6-sol task
+    # Unchanged-check counts only request status. A 100-second vendor-x/reasoning.model+2026 task
     # remains healthy under the default 300-second stall window when platform
     # observations remain sparse but below the independent stall timeout.
     long_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0) - dt.timedelta(seconds=100)
@@ -1396,7 +1476,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
                                  observed_at=long_started)
     prepare_dispatch(root, "long-ok")
     run(root, "register", "--id", "long-ok", "--role-type", "reviewer", "--role", "reviewer", "--task", "long-ok",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-long-ok.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-long-ok.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", long_registration)
     long_poll = snapshot(root, "long-ok-poll", [platform_member("long-ok", "running")],
                          observed_at=long_started + dt.timedelta(seconds=50))
@@ -1421,7 +1501,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
                                   observed_at=stall_started)
     prepare_dispatch(root, "stall-late")
     run(root, "register", "--id", "stall-late", "--role-type", "reviewer", "--role", "reviewer", "--task", "stall-late",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-stall-late.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-stall-late.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", stall_registration)
     for offset in (50, 100):
         stall_poll = snapshot(root, f"stall-late-poll-{offset}", [platform_member("stall-late", "running")],
@@ -1441,7 +1521,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
                                        observed_at=historical_started)
     prepare_dispatch(root, "stall-historical")
     run(root, "register", "--id", "stall-historical", "--role-type", "reviewer", "--role", "reviewer", "--task", "stall-historical",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-stall-historical.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-stall-historical.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", historical_registration)
     for offset in (50, 100):
         historical_poll = snapshot(root, f"stall-historical-poll-{offset}", [platform_member("stall-historical", "running")],
@@ -1467,7 +1547,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
                                    observed_at=sparse_started)
     prepare_dispatch(root, "sparse-terminal")
     run(root, "register", "--id", "sparse-terminal", "--role-type", "reviewer", "--role", "reviewer", "--task", "sparse terminal",
-        "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-sparse-terminal.json",
+        "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0", "--task-payload", "payload.txt", "--handoff-envelope", "envelope-sparse-terminal.json",
         "--deadline-minutes", "5", "--progress-hash", seed, "--platform-snapshot", sparse_registration)
     sparse_terminal = snapshot(root, "sparse-terminal", [platform_member("sparse-terminal", "completed", 1)],
                                observed_at=sparse_started + dt.timedelta(seconds=121))
@@ -1558,7 +1638,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     replay_script.write_text(
         "from pathlib import Path\nimport sys\n"
         "if sys.argv[1] == 'mismatch': Path('mismatch-executed.txt').write_text('bad')\n"
-        "if Path('force-replay-failure.txt').exists(): print('intentional failure ' + sys.argv[1]); raise SystemExit(1)\n"
+        "if len(sys.argv)>2 and Path(sys.argv[2]).is_file(): print('intentional failure ' + sys.argv[1]); raise SystemExit(1)\n"
         "print('full-chain passed ' + sys.argv[1])\n",
         encoding="utf-8",
     )
@@ -1674,7 +1754,10 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     with tempfile.TemporaryDirectory(prefix="agent-ledger-failed-replay-") as failed_raw:
         failed_root = Path(failed_raw) / "project"
         shutil.copytree(root, failed_root)
-        (failed_root / "force-replay-failure.txt").write_text("fail\n", encoding="utf-8")
+        # The private runner leaves absolute paths outside ROOT unchanged and
+        # reports that filesystem confinement is false. Bind that exact path in
+        # Node 6 so beta is a real failure without mutating the candidate.
+        FAILURE_MARKER.write_text("fail\n", encoding="utf-8")
         failed_plan = write_replay_plan(failed_root, "a", run_ids["a"])
         run(failed_root, "replay-prepare", "--integrator-id", "formal-integrator", "--plan", failed_plan)
         failed_replay_output = run_managed_replay(failed_root, run_ids["a"], expected=1)
@@ -1695,6 +1778,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
             "--platform-snapshot", interrupted_terminal)
         interrupted_state = json.loads((failed_root / ".agent/state/agents.json").read_text(encoding="utf-8"))
         run(failed_root, "validate")
+        FAILURE_MARKER.unlink()
 
     plan_name = write_replay_plan(root, "a", run_ids["a"])
     run(root, "replay-prepare", "--integrator-id", "formal-integrator", "--plan", plan_name)
@@ -2010,6 +2094,22 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         raise AssertionError("active-chain journal truncation escaped the append hash chain")
     chain_journal.write_bytes(journal_bytes)
     run(root, "validate")
+
+    lock_path=state/".agents.lock"; external_lock=root/"external-agents-lock"
+    if lock_path.exists() or lock_path.is_symlink(): lock_path.unlink()
+    external_lock.write_text("unchanged\n",encoding="utf-8"); lock_path.symlink_to(external_lock)
+    locked=run(root,"validate",expected=1)
+    if "lock is missing or unsafe" not in locked or external_lock.read_text(encoding="utf-8")!="unchanged\n":
+        raise AssertionError("agent ledger lock followed an unsafe symlink")
+    lock_path.unlink(); external_lock.unlink()
+
+    journal_backup=state/"agents-chain.backup"; external_journal=root/"external-agents-chain"
+    os.replace(chain_journal,journal_backup); external_journal.write_bytes(journal_bytes); chain_journal.symlink_to(external_journal)
+    journal_attack=run(root,"validate",expected=1)
+    if "not one bounded regular file" not in journal_attack or external_journal.read_bytes()!=journal_bytes:
+        raise AssertionError("agent ledger journal followed an unsafe symlink")
+    chain_journal.unlink(); external_journal.unlink(); os.replace(journal_backup,chain_journal)
+    run(root,"validate")
     rewrite_ledger_legacy(state / "agents.json", json.loads(pristine_chained_ledger))
     run(root, "validate")
     legacy_poll = snapshot(root, "legacy-upgrade-poll", [])
@@ -2043,21 +2143,25 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     result_internal.chmod(0o444)
     run(root, "validate")
     internal = root / ledger["members"][0]["registration_platform_evidence"]["path"]
-    internal.chmod(0o644)
+    internal_original=internal.read_bytes(); internal.chmod(0o644)
     internal.write_text("{}", encoding="utf-8")
     run(root, "validate", expected=1)
+    # Archive-reset never legitimizes damaged historical evidence. Restore the
+    # exact content-addressed bytes, prove full validity, then archive.
+    internal.write_bytes(internal_original); internal.chmod(0o444)
+    run(root,"validate")
     run(root, "init", "--archive-existing", "--platform-snapshot", final_empty)
     run(root, "validate", "--require-empty", "--platform-snapshot", final_empty)
     recovered = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     if not recovered.get("migration_source"):
         raise AssertionError("audited recovery did not retain the archived damaged ledger receipt")
 
-    # P4-2/P4-4 endgame: a fresh standard-mode epoch whose local decision
-    # boundary (policy v2) permits recorded human decisions.
+    # P4-2/P4-4 endgame: a fresh standard-mode epoch whose authoritative
+    # decisions are all bound to provider-verifiable receipts.
     task_value = json.loads(task_path.read_text(encoding="utf-8"))
     task_value.update({
         "mode": "standard", "token_budget": 48000,
-        "decision_policy_version": 2, "environment": "local",
+        "decision_policy_version": 1, "environment": "local",
         "deployment_requested": False, "risk_flags": {},
     })
     task_path.write_text(json.dumps(task_value), encoding="utf-8")
@@ -2069,7 +2173,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
                                 observed_at=started)
         prepare_dispatch(root, agent_id)
         run(root, "register", "--id", agent_id, "--role-type", "reviewer", "--role", "reviewer",
-            "--task", agent_id, "--model", "gpt-5.6-sol", "--fork-turns", "0",
+            "--task", agent_id, "--model", "vendor-x/reasoning.model+2026", "--fork-turns", "0",
             "--task-payload", "payload.txt", "--handoff-envelope", f"envelope-{agent_id}.json",
             "--deadline-minutes", "5", "--progress-hash", seed,
             "--platform-snapshot", registration)
@@ -2082,7 +2186,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     if "--force" not in refused or "ledger-force-reset" not in refused:
         raise AssertionError("archive-reset with an active member lacks the audited force cursor")
     run(root, "init", "--archive-existing", "--force", "--force-reason", "abandon a wedged child",
-        "--platform-snapshot", endgame_empty, expected=1)
+        "--source", "user:local text is advisory", "--platform-snapshot", endgame_empty, expected=1)
     ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     if next(item for item in ledger["members"] if item["id"] == "lost-counter")["status"] != "active":
         raise AssertionError("refused archive-reset mutated the ledger")
@@ -2092,7 +2196,7 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     run(root, "finish", "--id", "lost-counter", "--status", "lost", "--conclusion", "vanished",
         "--platform-snapshot", endgame_empty, expected=1)
     run(root, "finish", "--id", "lost-counter", "--status", "lost", "--lost", "--conclusion", "vanished",
-        "--platform-snapshot", endgame_empty, expected=1)
+        "--source", "user:local text is advisory", "--platform-snapshot", endgame_empty, expected=1)
     lost_polls = []
     for index in (1, 2, 3):
         poll = snapshot(root, f"lost-poll-{index}", [],
@@ -2124,14 +2228,22 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         raise AssertionError("finish --lost did not settle the reservation as released")
     run(root, "validate")
 
-    # The same exit is reachable below the observation threshold through a
-    # recorded human decision bound to the member.
+    # The same exit is reachable below the observation threshold only through
+    # a provider-verifiable decision bound to the exact member and ledger epoch.
     decision_started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     register_active("lost-decision", decision_started)
     decision_empty = snapshot(root, "decision-empty", [])
+    decision_state = json.loads((state / "agents.json").read_text(encoding="utf-8"))
+    decision_source = "provider:self-test-agent-lost"
+    lost_artifact = hashlib.sha256(
+        f"agent-lost|{decision_state['epoch']}|lost-decision".encode()
+    ).hexdigest()
+    lost_receipt = decision_receipt(
+        root, "decision-agent-lost.json", "agent-lost", lost_artifact, decision_source,
+    )
     run(root, "finish", "--id", "lost-decision", "--status", "lost", "--lost",
-        "--conclusion", "human declared the child lost",
-        "--source", "user:the platform lost this child permanently",
+        "--conclusion", "provider declared the child lost",
+        "--source", decision_source, "--human-decision-receipt", lost_receipt,
         "--platform-snapshot", decision_empty)
     ledger = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     decision_member = next(item for item in ledger["members"] if item["id"] == "lost-decision")
@@ -2143,6 +2255,50 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     require_empty_snapshot = snapshot(root, "lost-require-empty", [])
     run(root, "validate", "--require-empty", "--platform-snapshot", require_empty_snapshot)
 
+    # Legacy reset input is descriptor-snapshotted and never follows aliases.
+    ledger_path = state / "agents.json"
+    hardlink = state / "agents-reset-hardlink.json"
+    os.link(ledger_path, hardlink)
+    run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
+    hardlink.unlink()
+    symlink_backup = state / "agents-reset-symlink-backup.json"
+    os.replace(ledger_path, symlink_backup)
+    os.symlink(symlink_backup.name, ledger_path)
+    run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
+    ledger_path.unlink(); os.replace(symlink_backup, ledger_path)
+
+    # Reset authority is mandatory even outside release mode.
+    config_value = json.loads(config_path.read_text(encoding="utf-8"))
+    signed_adapter = config_value["agent_control"]["platform_observer"]["signed_adapter"]
+    signed_ledger_bytes=ledger_path.read_bytes(); unsigned_ledger=json.loads(signed_ledger_bytes)
+    config_value["agent_control"]["platform_observer"]["signed_adapter"] = None
+    unsigned_ledger["platform_observer"]["signed_adapter"] = None
+    config_path.write_text(json.dumps(config_value), encoding="utf-8")
+    rewrite_ledger_legacy(ledger_path,unsigned_ledger)
+    unsigned = run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
+    if "signed platform observer authority" not in unsigned:
+        raise AssertionError("legacy reset did not reach the mandatory signed platform observer gate")
+    ledger_path.write_bytes(signed_ledger_bytes)
+    config_value["agent_control"]["platform_observer"]["signed_adapter"] = signed_adapter
+    config_path.write_text(json.dumps(config_value), encoding="utf-8")
+    task_generation_bytes = task_path.read_bytes()
+    missing_generation = json.loads(task_generation_bytes)
+    missing_generation.pop("task_generation_id", None)
+    task_path.write_text(json.dumps(missing_generation), encoding="utf-8")
+    unbound = run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
+    if "task-generation identity" not in unbound:
+        raise AssertionError("legacy reset accepted a missing task-generation identity")
+    task_path.write_bytes(task_generation_bytes)
+
+    # Malformed and unknown live status evidence is rejected before reset proof.
+    malformed_snapshot = root / "snapshot-reset-malformed.json"
+    malformed_snapshot.write_text("{not-json", encoding="utf-8")
+    run(root, "init", "--archive-existing", "--platform-snapshot", malformed_snapshot.name, expected=1)
+    unknown_snapshot = snapshot(root, "reset-unknown-platform-status", [
+        platform_member("unknown-reset-child", "quantum"),
+    ])
+    run(root, "init", "--archive-existing", "--platform-snapshot", unknown_snapshot, expected=1)
+
     # P4-2: the audited force path archives the wedged ledger with its bound
     # decision and starts a new epoch; prior-epoch markers stay on disk but
     # are scoped to their own epoch.
@@ -2150,9 +2306,37 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
     register_active("force-active", force_started)
     run(root, "init", "--archive-existing", "--platform-snapshot", require_empty_snapshot, expected=1)
     forced_empty = snapshot(root, "forced-empty", [])
-    run(root, "init", "--archive-existing", "--force", "--force-reason", "abandon a wedged child",
-        "--source", "user:reset the wedged ledger",
-        "--platform-snapshot", forced_empty)
+    force_source = "provider:self-test-ledger-reset"
+    force_artifact = hashlib.sha256((state / "agents.json").read_bytes()).hexdigest()
+    force_receipt = decision_receipt(
+        root, "decision-ledger-force-reset.json", "ledger-force-reset",
+        force_artifact, force_source,
+    )
+    force_arguments = [
+        "init", "--archive-existing", "--force", "--force-reason", "abandon a wedged child",
+        "--source", force_source, "--human-decision-receipt", force_receipt,
+    ]
+    for proof_mode in (
+        "replayed", "tampered-ledger", "tampered-project", "tampered-task",
+        "stale", "unknown-status", "malformed",
+    ):
+        rejected_snapshot = reset_attack_snapshot(root, f"reset-proof-{proof_mode}", proof_mode)
+        rejected = run(root, *force_arguments, "--platform-snapshot", rejected_snapshot, expected=1)
+        if "reset proof" not in rejected and "observer" not in rejected:
+            raise AssertionError(f"{proof_mode} reset proof did not fail closed through the proof boundary")
+        if hashlib.sha256((state / "agents.json").read_bytes()).hexdigest() != force_artifact:
+            raise AssertionError(f"{proof_mode} reset proof mutated the live ledger")
+
+    # The provider proof can be valid while the live ledger changes afterward;
+    # the final descriptor compare-and-swap must still refuse replacement.
+    pristine_force_ledger = (state / "agents.json").read_bytes()
+    racing_snapshot = reset_attack_snapshot(root, "reset-proof-race", "race-ledger", state / "agents.json")
+    raced = run(root, *force_arguments, "--platform-snapshot", racing_snapshot, expected=1)
+    if "compare-and-swap refused" not in raced:
+        raise AssertionError("live ledger race escaped the final compare-and-swap")
+    (state / "agents.json").write_bytes(pristine_force_ledger)
+
+    run(root, *force_arguments, "--platform-snapshot", forced_empty)
     recovered = json.loads((state / "agents.json").read_text(encoding="utf-8"))
     archive_record = recovered.get("migration_source")
     if not archive_record:
@@ -2163,6 +2347,9 @@ with tempfile.TemporaryDirectory(prefix="agent-ledger-test-") as raw:
         or archive.get("force_reason") != "abandon a wedged child"
         or archive.get("ledger_sha256") != archive.get("decision", {}).get("artifact_sha256")
         or archive.get("decision", {}).get("gate") != "ledger-force-reset"
+        or archive.get("reset_proof", {}).get("schema") != "agent-ledger-reset-proof/v1"
+        or archive.get("reset_proof", {}).get("legacy_ledger_sha256") != force_artifact
+        or archive.get("reset_proof", {}).get("status") != "approved-empty-platform"
         or not isinstance(archive.get("decision", {}).get("approval"), dict)
         or not any(item.get("id") == "force-active" for item in archive.get("ledger", {}).get("members", []))
     ):

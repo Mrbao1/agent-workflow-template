@@ -12,10 +12,10 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import contextctl
+from workflowlib import boundedio,boundedprocess
 
 
 AGENT_DIR = contextctl.AGENT_DIR
@@ -31,18 +31,8 @@ TRANSITION_JOURNAL_STATUS_SCHEMA = "agent-context-transition-journal-status/v1"
 
 
 def atomic_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    try: boundedio.atomic_write(path,data,mode=0o600,label="context transaction state")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def canonical(value: object) -> bytes:
@@ -58,7 +48,6 @@ def changed_fields(before: Dict[str, object], after: Dict[str, object]) -> list[
 def _authorization(
     before: Dict[str, object], after: Dict[str, object], mutator: str, operation: str, reason: str
 ) -> Tuple[Path, str]:
-    AUTH_DIR.mkdir(parents=True, exist_ok=True)
     value = {
         "schema": "agent-context-transition-authorization/v1",
         "mutator": mutator,
@@ -71,26 +60,17 @@ def _authorization(
         "before_task": before,
         "after_task": after,
     }
-    descriptor, raw = tempfile.mkstemp(prefix="context-transition-", suffix=".json", dir=str(AUTH_DIR))
-    path = Path(raw)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            data = json.dumps(value, ensure_ascii=False, indent=2).encode() + b"\n"
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return path, hashlib.sha256(path.read_bytes()).hexdigest()
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+    data=json.dumps(value,ensure_ascii=False,indent=2).encode()+b"\n"
+    try: path=boundedio.create_private_file(AUTH_DIR,data,prefix="context-transition-",suffix=".json",mode=0o600,label="context authorization")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    return path,hashlib.sha256(data).hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    try: descriptor=boundedio.private_directory_fd(path,"context transaction directory",False)
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
 
 
 def _fsync_parents(paths: Iterable[Path]) -> None:
@@ -99,34 +79,12 @@ def _fsync_parents(paths: Iterable[Path]) -> None:
 
 
 def _restore_all(backups: Dict[Path, Optional[bytes]]) -> None:
-    """Roll back committed files: stage every temporary first, then rename.
-
-    A crash during rollback then leaves at worst unrenamed temporaries next to
-    untouched targets, and the transition journal still holds the pre-commit
-    bytes for a later recovery pass.
-    """
-    staged: List[Tuple[Path, Optional[Path]]] = []
-    try:
-        for path, previous in backups.items():
-            if previous is None:
-                staged.append((path, None))
-                continue
-            descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.restore-", dir=str(path.parent))
-            temporary = Path(raw)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(previous)
-                handle.flush()
-                os.fsync(handle.fileno())
-            staged.append((path, temporary))
-        for path, temporary in staged:
-            if temporary is None:
-                path.unlink(missing_ok=True)
-            else:
-                os.replace(temporary, path)
-    finally:
-        for _, temporary in staged:
-            if temporary is not None and temporary.exists():
-                temporary.unlink()
+    """Roll back through no-follow atomic writes; the journal survives interruption."""
+    for path,previous in backups.items():
+        try:
+            if previous is None: boundedio.unlink_private(path,missing_ok=True,label="context transaction rollback")
+            else: boundedio.atomic_write(path,previous,mode=0o600,label="context transaction rollback")
+        except RuntimeError as error: raise SystemExit(str(error)) from error
     _fsync_parents(list(backups))
 
 
@@ -161,7 +119,6 @@ def _transition_journal(backups: Dict[Path, Optional[bytes]], after_digests: Dic
 
 
 def _write_transition_journal(journal: Dict[str, object]) -> None:
-    TRANSITION_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_bytes(
         TRANSITION_JOURNAL_PATH,
         (json.dumps(journal, ensure_ascii=False, indent=2) + "\n").encode(),
@@ -170,7 +127,8 @@ def _write_transition_journal(journal: Dict[str, object]) -> None:
 
 
 def _discard_transition_journal() -> None:
-    TRANSITION_JOURNAL_PATH.unlink(missing_ok=True)
+    try: boundedio.unlink_private(TRANSITION_JOURNAL_PATH,missing_ok=True,label="context transition journal")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     _fsync_directory(TRANSITION_JOURNAL_PATH.parent)
 
 
@@ -178,7 +136,7 @@ def _read_transition_journal() -> Optional[Dict[str, object]]:
     if not TRANSITION_JOURNAL_PATH.is_file() or TRANSITION_JOURNAL_PATH.is_symlink():
         return None
     try:
-        journal = json.loads(TRANSITION_JOURNAL_PATH.read_text(encoding="utf-8"))
+        journal = json.loads(boundedio.read_text(TRANSITION_JOURNAL_PATH,label="context transition journal"))
     except (OSError, ValueError):
         return {}
     return journal if isinstance(journal, dict) else {}
@@ -218,7 +176,7 @@ def transition_journal_status() -> Optional[Dict[str, object]]:
     def classify(relative: str, before_sha256: Optional[str]) -> Dict[str, object]:
         path = ROOT / relative
         current = (
-            hashlib.sha256(path.read_bytes()).hexdigest()
+            hashlib.sha256(boundedio.read_bytes(path,label="context transaction file")).hexdigest()
             if path.is_file() and not path.is_symlink()
             else None
         )
@@ -273,9 +231,9 @@ def transition_journal_status() -> Optional[Dict[str, object]]:
 
 def restore_transition_journal() -> Dict[str, object]:
     """Roll an interrupted transition back to its journaled pre-commit bytes."""
-    TASK_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    TASK_LOCK.touch(exist_ok=True)
-    with TASK_LOCK.open("r+") as lock:
+    try: lock_handle=boundedio.open_private_lock(TASK_LOCK,label="task transition lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         # Restore is only safe for a genuinely interrupted transition: a stale
         # "committed" or "rolled_back" journal (crash between commit and
@@ -367,11 +325,11 @@ def transition_task(
     """Commit TASK, side effects and CONTEXT as one rollback-safe transaction."""
     if not changed_fields(before, after):
         raise SystemExit("authorized task transition requires at least one invariant field change")
-    TASK_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    TASK_LOCK.touch(exist_ok=True)
-    with TASK_LOCK.open("r+") as lock:
+    try: lock_handle=boundedio.open_private_lock(TASK_LOCK,label="task transition lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        observed = json.loads(TASK_PATH.read_text(encoding="utf-8"))
+        observed = json.loads(boundedio.read_text(TASK_PATH,label="task state"))
         if canonical(observed) != canonical(before):
             raise SystemExit("canonical TASK changed before the authorized transaction acquired its lock")
         try:
@@ -399,11 +357,11 @@ def transition_task(
         )
         effective_source_tokens += released_reference_tokens
         backups = {
-            TASK_PATH: TASK_PATH.read_bytes(),
-            CONTEXT_PATH: CONTEXT_PATH.read_bytes() if CONTEXT_PATH.is_file() else None,
+            TASK_PATH: boundedio.read_bytes(TASK_PATH,label="task state"),
+            CONTEXT_PATH: boundedio.read_bytes(CONTEXT_PATH,label="context state") if CONTEXT_PATH.is_file() else None,
         }
         for path, _ in side_effects:
-            backups[path] = path.read_bytes() if path.is_file() else None
+            backups[path] = boundedio.read_bytes(path,label="context transaction file") if path.is_file() else None
         after_payload = json.dumps(after, ensure_ascii=False, indent=2).encode() + b"\n"
         after_digests: Dict[Path, Optional[str]] = {
             TASK_PATH: hashlib.sha256(after_payload).hexdigest(),
@@ -448,7 +406,7 @@ def transition_task(
                 for value in values:
                     command.extend([flag, str(value)])
             try:
-                result = subprocess.run(
+                result = boundedprocess.run(
                     command, cwd=str(ROOT), text=True,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
                 )
@@ -469,4 +427,5 @@ def transition_task(
             _discard_transition_journal()
         finally:
             if authorization is not None:
-                authorization.unlink(missing_ok=True)
+                try: boundedio.unlink_private(authorization,missing_ok=True,label="context authorization")
+                except RuntimeError as error: raise SystemExit(str(error)) from error

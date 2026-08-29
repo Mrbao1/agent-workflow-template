@@ -5,13 +5,14 @@ from pathlib import Path
 import importlib.util
 import hashlib
 import json
-import signal
-import subprocess
+import os
+import sys
 import tempfile
 import time
 
 
 SOURCE = Path(__file__).with_name("run_workflow_release_gate.py").resolve()
+ARTIFACT_SOURCE = SOURCE.parents[3] / "scripts/artifactctl.py"
 
 
 def load_gate():
@@ -23,39 +24,23 @@ def load_gate():
     return module
 
 
-class Pipe:
-    def __init__(self):
-        self.closed = False
+def load_artifactctl():
+    spec = importlib.util.spec_from_file_location("artifactctl_under_test", ARTIFACT_SOURCE)
+    if spec is None or spec.loader is None:
+        raise AssertionError("artifact controller module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    def close(self):
-        self.closed = True
-
-
-class StuckProcess:
-    pid = 424242
-    returncode = None
-
-    def __init__(self):
-        self.stdout = Pipe()
-        self.timeouts = []
-
-    def communicate(self, timeout=None):
-        if timeout is None:
-            raise AssertionError("workflow gate attempted an unbounded communicate")
-        self.timeouts.append(timeout)
-        raise subprocess.TimeoutExpired(["fixture"], timeout, output=b"partial-output\n")
-
-    def poll(self):
-        return self.returncode
-
-    def wait(self, timeout=None):
-        if timeout is None:
-            raise AssertionError("workflow gate attempted an unbounded wait")
-        raise subprocess.TimeoutExpired(["fixture"], timeout)
-
+def process_alive(pid: int) -> bool:
+    try: os.kill(pid,0)
+    except ProcessLookupError: return False
+    except PermissionError: return True
+    return True
 
 def main() -> int:
     gate = load_gate()
+    artifactctl = load_artifactctl()
     with tempfile.TemporaryDirectory(prefix="local-adapter-contract-") as raw:
         root = Path(raw)
         for adapter in ("workflow", "api", "cli", "ios-simulator"):
@@ -126,6 +111,7 @@ def main() -> int:
         "command": commands[0][1], "started_at": "2026-07-22T00:00:00+00:00",
         "finished_at": "2026-07-22T00:00:01+00:00", "exit_code": 0,
         "outcome": "completed", "cleanup": "passed",
+        "execution_boundary": dict(gate.TEST_EXECUTION_BOUNDARY),
         "output": {"path": "fixture.log", "sha256": "2" * 64, "bytes": 0},
     }
     case["case_sha256"] = hashlib.sha256(
@@ -141,6 +127,22 @@ def main() -> int:
     gate.receipt_path = lambda record, label: gate.AGENT / "scripts/testrun.py"
     if gate.validate_test_receipt(receipt, commands, candidate) != "1" * 32:
         raise AssertionError("current-candidate integrator receipt was not accepted")
+    original_candidate_fingerprint = artifactctl.supervised_test.candidate_fingerprint
+    original_artifact_receipt = artifactctl.receipt
+    artifactctl.supervised_test.candidate_fingerprint = lambda _config: candidate
+    artifactctl.receipt = lambda record, _errors, _label: artifactctl.ROOT / record["path"]
+
+    def artifact_validation(value):
+        with tempfile.TemporaryDirectory(prefix="artifact-receipt-boundary-") as raw:
+            path = Path(raw) / "receipt.json"
+            path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            errors = []
+            run_id = artifactctl.verify_test_receipt(path, errors, "integrator replay", None, None)
+            return run_id, errors
+
+    artifact_run_id, artifact_errors = artifact_validation(receipt)
+    if artifact_run_id != "1" * 32 or artifact_errors:
+        raise AssertionError(f"artifact controller rejected canonical private boundary: {artifact_errors}")
     try:
         gate.validate_test_receipt(receipt, commands, "b" * 64)
     except ValueError as error:
@@ -148,7 +150,32 @@ def main() -> int:
             raise
     else:
         raise AssertionError("stale integrator receipt replay was accepted for a new candidate")
+    for label, attack in (
+        ("missing", lambda value: value.pop("execution_boundary")),
+        ("drifted", lambda value: value["execution_boundary"].update({"credentials_inherited": True})),
+        ("extended", lambda value: value["execution_boundary"].update({"unreviewed_claim": "trusted"})),
+    ):
+        attacked = json.loads(json.dumps(receipt))
+        attack(attacked["cases"][0])
+        attacked_case = attacked["cases"][0]
+        attacked_case["case_sha256"] = hashlib.sha256(
+            json.dumps(
+                {key: item for key, item in attacked_case.items() if key != "case_sha256"},
+                sort_keys=True, separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        try:
+            gate.validate_test_receipt(attacked, commands, candidate)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label} private-runner execution boundary was accepted")
+        artifact_run_id, artifact_errors = artifact_validation(attacked)
+        if artifact_run_id != "1" * 32 or not any("clean completed replay" in error for error in artifact_errors):
+            raise AssertionError(f"artifact controller accepted {label} private boundary: {artifact_errors}")
     gate.receipt_path = original_receipt_path
+    artifactctl.supervised_test.candidate_fingerprint = original_candidate_fingerprint
+    artifactctl.receipt = original_artifact_receipt
 
     ios_target = {
         "device_udid": "12345678-1234-1234-1234-123456789ABC",
@@ -217,33 +244,64 @@ def main() -> int:
     else:
         raise AssertionError("stale iOS reset evidence was accepted")
 
-    process = StuckProcess()
-    signals = []
-    gate.subprocess.Popen = lambda *args, **kwargs: process
-    gate.os.killpg = lambda pid, sent: signals.append((pid, sent))
-    gate.stop_group = lambda pgid: True
-    started = time.monotonic()
-    result = gate.execute(
-        ["fixture"], 1, "fresh", {
-            "environment": "local", "authority": "default", "capabilities": ["fixture"],
-        },
-    )
-    elapsed = time.monotonic() - started
-    if elapsed > 1:
-        raise AssertionError(f"fake stuck-pipe fixture exceeded its bound: {elapsed:.3f}s")
-    if process.timeouts != [1, 5, 2]:
-        raise AssertionError(f"unexpected communicate timeouts: {process.timeouts}")
-    if signals != [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]:
-        raise AssertionError(f"termination did not escalate TERM -> KILL: {signals}")
-    if not process.stdout.closed:
-        raise AssertionError("stuck output pipe was not closed after its final timeout")
-    if result["exit_code"] != 125 or result["process_cleanup"] != {"remaining": -1}:
-        raise AssertionError("partial cleanup was not returned as bounded infrastructure failure")
-    if result["output_tail"] != ["partial-output"]:
-        raise AssertionError("partial output was not preserved")
-    print("PASS: candidate-bound receipts, gate-owned iOS evidence, and TERM/KILL drain are bounded")
+    with tempfile.TemporaryDirectory(prefix="workflow-bounded-output-") as raw:
+        fixture=Path(raw); child_pid=fixture/"child.pid"; escaping=fixture/"escaping.py"
+        escaping.write_text("""#!/usr/bin/env python3
+import os,sys,time
+pid=os.fork()
+if pid==0:
+ os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(30); os._exit(0)
+os.write(1,b'invalid-utf8-\\xff\\n'); os._exit(0)
+""",encoding="utf-8")
+        result=gate.execute([sys.executable,str(escaping),str(child_pid)],2,"fresh",{
+            "environment":"local","authority":"default","capabilities":["fixture"],
+        })
+        if result["exit_code"]!=125 or result["process_cleanup"]!={"remaining":0}:
+            raise AssertionError("escaped invalid-UTF8 command was not cleaned as bounded infrastructure failure")
+        if "invalid-utf8-" not in result["captured_output"]:
+            raise AssertionError("invalid UTF-8 output was not captured with replacement decoding")
+        if child_pid.exists() and process_alive(int(child_pid.read_text(encoding="utf-8"))):
+            raise AssertionError("workflow command left its token-bound escaped child alive")
+
+        gate.MAX_COMMAND_OUTPUT_BYTES=1024
+        flooded=gate.execute([sys.executable,"-c","import os;os.write(1,b'x'*8192)"],2,"fresh",{
+            "environment":"local","authority":"default","capabilities":["fixture"],
+        })
+        if flooded["exit_code"]!=125 or not flooded["output_limit_exceeded"] or flooded["output_bytes"]>1024:
+            raise AssertionError("workflow command output was not byte-bounded and failed closed")
+
+        original_snapshot=gate.supervised_test.process_snapshot; captured=[]; original_popen=gate.subprocess.Popen
+        def capture(*args,**kwargs):
+            process=original_popen(*args,**kwargs); captured.append(process); return process
+        gate.subprocess.Popen=capture
+        gate.supervised_test.process_snapshot=lambda: (_ for _ in ()).throw(RuntimeError("injected observer failure"))
+        try:
+            try: gate.execute([sys.executable,"-c","import time;time.sleep(30)"],2,"fresh",{
+                "environment":"local","authority":"default","capabilities":["fixture"],
+            })
+            except RuntimeError as error:
+                if "observer failure" not in str(error): raise
+            else: raise AssertionError("observer exception was accepted")
+        finally:
+            gate.supervised_test.process_snapshot=original_snapshot; gate.subprocess.Popen=original_popen
+        if len(captured)!=1 or captured[0].returncode is None:
+            raise AssertionError("observer exception left the exact workflow leader unreaped")
+
+        previous=os.environ.get("GITHUB_TOKEN"); os.environ["GITHUB_TOKEN"]="poison-secret"
+        try:
+            sanitized=gate.execute([sys.executable,"-c","import os;print('GITHUB_TOKEN' in os.environ)"],2,"fresh",{
+                "environment":"local","authority":"default","capabilities":["fixture"],
+            })
+        finally:
+            if previous is None: os.environ.pop("GITHUB_TOKEN",None)
+            else: os.environ["GITHUB_TOKEN"]=previous
+        if sanitized["exit_code"]!=0 or sanitized["captured_output"].strip()!="False":
+            raise AssertionError("workflow command inherited an ambient credential")
+    print("PASS: candidate-bound receipts, bounded binary output, guaranteed cleanup, and credential stripping")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

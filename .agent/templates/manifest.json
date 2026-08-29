@@ -7,307 +7,945 @@
       "output": ".agent/state/REQUIREMENT_CONTRACT.md",
       "renderable": false,
       "depends_on": [],
-      "nodes": [1],
-      "modes": ["fast", "standard", "release"],
-      "capabilities": ["core"],
-      "required": ["goal", "users", "success", "in_scope", "out_of_scope", "constraints", "data_permissions", "environment", "context_transport", "acceptance", "provenance", "production_provider_target_or_none", "human_decisions", "true_or_false"]
+      "nodes": [
+        1
+      ],
+      "modes": [
+        "fast",
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "goal",
+        "users",
+        "success",
+        "in_scope",
+        "out_of_scope",
+        "constraints",
+        "data_permissions",
+        "environment",
+        "context_transport",
+        "acceptance",
+        "provenance",
+        "production_provider_target_or_none",
+        "human_decisions",
+        "true_or_false"
+      ]
     },
     {
       "id": "fast-projection",
       "path": "templates/fast-projection.json.tmpl",
       "output": ".agent/state/artifacts/01-fast-projection.json",
       "renderable": true,
-      "depends_on": ["requirement-contract"],
-      "nodes": [1, 5],
-      "modes": ["fast"],
-      "capabilities": ["core"],
-      "required": ["requirement_contract_sha256", "scope_summary", "change_receipts", "check_receipts", "cleanup_receipt", "exclusions"]
+      "depends_on": [
+        "requirement-contract"
+      ],
+      "nodes": [
+        1,
+        5
+      ],
+      "modes": [
+        "fast"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "requirement_contract_sha256",
+        "scope_summary",
+        "change_receipts",
+        "candidate_snapshot_receipts",
+        "check_receipts",
+        "cleanup_receipt",
+        "exclusions"
+      ]
     },
     {
       "id": "structured-requirement",
       "path": "templates/structured-requirement.md.tmpl",
       "output": ".agent/state/artifacts/02-structured-requirement.md",
       "renderable": true,
-      "depends_on": ["requirement-contract"],
-      "nodes": [2],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["background", "goal", "roles", "flow", "data_sources", "inputs_outputs", "exceptions", "acceptance", "field_provenance", "inferences"]
+      "depends_on": [
+        "requirement-contract"
+      ],
+      "nodes": [
+        2
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "background",
+        "goal",
+        "roles",
+        "flow",
+        "data_sources",
+        "inputs_outputs",
+        "exceptions",
+        "acceptance",
+        "field_provenance",
+        "inferences"
+      ]
     },
     {
       "id": "deliverables",
       "path": "templates/deliverables.md.tmpl",
       "output": ".agent/state/artifacts/03-deliverables.md",
       "renderable": true,
-      "depends_on": ["structured-requirement"],
-      "nodes": [3],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["business_boundary", "deliver_now", "exclusions", "later_batches", "acceptance_mapping"]
+      "depends_on": [
+        "structured-requirement"
+      ],
+      "nodes": [
+        3
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "business_boundary",
+        "deliver_now",
+        "exclusions",
+        "later_batches",
+        "acceptance_mapping"
+      ]
     },
     {
       "id": "solution",
       "path": "templates/solution.md.tmpl",
       "output": ".agent/state/artifacts/04-solution.md",
       "renderable": true,
-      "depends_on": ["deliverables"],
-      "nodes": [4],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["architecture", "modules_data_flow", "interfaces", "risks_rollback", "dependencies", "file_boundaries", "ownership", "human_decision", "decision_requested", "approval_enables", "approval_excludes"]
+      "depends_on": [
+        "deliverables"
+      ],
+      "nodes": [
+        4
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "architecture",
+        "modules_data_flow",
+        "interfaces",
+        "risks_rollback",
+        "dependencies",
+        "file_boundaries",
+        "ownership",
+        "human_decision",
+        "decision_requested",
+        "approval_enables",
+        "approval_excludes"
+      ]
     },
     {
       "id": "task-plan",
       "path": "templates/task-plan.md.tmpl",
       "output": ".agent/state/artifacts/04-task-plan.md",
       "renderable": true,
-      "depends_on": ["requirement-contract"],
-      "nodes": [4],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["fast_standard_release", "budget", "measured_or_estimated", "thresholds", "skill", "templates", "inputs", "outputs", "allowed", "forbidden", "tasks", "tests", "cleanup", "rollback"]
+      "depends_on": [
+        "requirement-contract"
+      ],
+      "nodes": [
+        4
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "fast_standard_release",
+        "budget",
+        "measured_or_estimated",
+        "thresholds",
+        "skill",
+        "templates",
+        "inputs",
+        "outputs",
+        "allowed",
+        "forbidden",
+        "tasks",
+        "tests",
+        "cleanup",
+        "rollback"
+      ]
     },
     {
       "id": "acceptance-matrix",
       "path": "templates/acceptance-matrix.md.tmpl",
       "output": ".agent/state/artifacts/05-acceptance-matrix.md",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [5, 7],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["normal", "abnormal", "boundary", "security", "performance", "regression", "human_acceptance", "return_nodes"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        5,
+        7
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "normal",
+        "abnormal",
+        "boundary",
+        "security",
+        "performance",
+        "regression",
+        "human_acceptance",
+        "return_nodes"
+      ]
     },
     {
       "id": "context-transport-profile",
       "path": "templates/context-transport-profile.json.tmpl",
       "output": ".agent/state/artifacts/04-context-transport-profile.json",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [4, 6],
-      "modes": ["standard", "release"],
-      "capabilities": ["context-transport-pxpipe"],
-      "required": ["model", "plugin_name", "plugin_version", "plugin_manifest_sha256", "plugin_integrity_sha256", "mcp_server_sha256", "mcp_worker_sha256", "runtime_bundle_sha256", "workflow_manifest_sha256", "workflow_source_tree_sha256", "workflow_plugin_files_sha256", "trusted_root_sha256", "source_sha256", "analyze_receipt_path", "analyze_receipt_sha256", "requirement_contract_sha256", "task_invariant_sha256", "approval_source", "approval_receipt_sha256"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        4,
+        6
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "context-transport-pxpipe"
+      ],
+      "required": [
+        "model",
+        "plugin_name",
+        "plugin_version",
+        "plugin_manifest_sha256",
+        "plugin_integrity_sha256",
+        "mcp_server_sha256",
+        "mcp_worker_sha256",
+        "runtime_bundle_sha256",
+        "workflow_manifest_sha256",
+        "workflow_source_tree_sha256",
+        "workflow_plugin_files_sha256",
+        "trusted_root_sha256",
+        "source_sha256",
+        "analyze_receipt_path",
+        "analyze_receipt_sha256",
+        "requirement_contract_sha256",
+        "task_invariant_sha256",
+        "approval_source",
+        "approval_receipt_sha256"
+      ]
     },
     {
       "id": "review-policy",
       "path": "templates/review-policy.json.tmpl",
       "output": ".agent/state/artifacts/05-review-policy.json",
       "renderable": true,
-      "depends_on": ["acceptance-matrix"],
-      "nodes": [5, 7],
-      "modes": ["standard", "release"],
-      "capabilities": ["multi-agent"],
-      "required": ["mode", "implementer", "adversarial_reviewer", "cross_reviewer", "integrator", "required_roles", "scenario_roles", "clean_reruns", "test_strategy", "wall_time_minutes", "max_automatic_test_attempts", "receipt_reuse", "full_chain_owner", "reviewer_targeted_case_limit", "failure_classes", "preflight"]
+      "depends_on": [
+        "acceptance-matrix"
+      ],
+      "nodes": [
+        5,
+        7
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "multi-agent"
+      ],
+      "required": [
+        "mode",
+        "implementer",
+        "adversarial_reviewer",
+        "cross_reviewer",
+        "integrator",
+        "required_roles",
+        "scenario_roles",
+        "clean_reruns",
+        "test_strategy",
+        "wall_time_minutes",
+        "max_automatic_test_attempts",
+        "receipt_reuse",
+        "full_chain_owner",
+        "reviewer_targeted_case_limit",
+        "failure_classes",
+        "preflight"
+      ]
     },
     {
       "id": "node-implementation",
       "path": "templates/node-implementation.json.tmpl",
       "output": ".agent/state/artifacts/06-implementation.json",
       "renderable": true,
-      "depends_on": ["requirement-contract"],
-      "nodes": [6],
-      "modes": ["fast", "standard", "release"],
-      "capabilities": ["core"],
-      "required": ["mode", "requirement_contract_sha256", "mode_appropriate_implementer_agent_id", "projection", "change_receipts", "check_receipts", "cleanup_receipt", "scope_summary"]
+      "depends_on": [
+        "requirement-contract"
+      ],
+      "nodes": [
+        6
+      ],
+      "modes": [
+        "fast",
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "mode",
+        "requirement_contract_sha256",
+        "mode_appropriate_implementer_agent_id",
+        "projection",
+        "change_receipts",
+        "candidate_snapshot_receipts",
+        "check_receipts",
+        "cleanup_receipt",
+        "scope_summary"
+      ]
     },
     {
       "id": "node-acceptance",
       "path": "templates/node-acceptance.json.tmpl",
       "output": ".agent/state/artifacts/07-acceptance.json",
       "renderable": true,
-      "depends_on": ["acceptance-matrix", "node-implementation"],
-      "nodes": [7],
-      "modes": ["standard", "release"],
-      "capabilities": ["core"],
-      "required": ["mode", "status", "human_decision", "node_bindings", "acceptance_checks", "mode_appropriate_reviewers", "release_review_chain", "release_scenario_receipt_sha256", "release_scenarios", "release_live_gate_receipt", "release_platform_assurance", "release_platform_observation_set", "release_platform_observation_set_sha256", "release_supervision_debt", "release_supervision_debt_sha256", "recommendation"]
+      "depends_on": [
+        "acceptance-matrix",
+        "node-implementation"
+      ],
+      "nodes": [
+        7
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "mode",
+        "status",
+        "human_decision",
+        "node_bindings",
+        "acceptance_checks",
+        "mode_appropriate_reviewers",
+        "release_review_chain",
+        "release_scenario_receipt_sha256",
+        "release_scenarios",
+        "release_live_gate_receipt",
+        "release_platform_assurance",
+        "release_platform_observation_set",
+        "release_platform_observation_set_sha256",
+        "release_supervision_debt",
+        "release_supervision_debt_sha256",
+        "recommendation"
+      ]
     },
     {
       "id": "targeted-acceptance",
       "path": "templates/targeted-acceptance.json.tmpl",
       "output": ".agent/state/artifacts/07-acceptance.json",
       "renderable": true,
-      "depends_on": ["fast-projection", "node-implementation"],
-      "nodes": [7],
-      "modes": ["fast"],
-      "capabilities": ["core"],
-      "required": ["mode", "node_bindings", "acceptance_checks"]
+      "depends_on": [
+        "fast-projection",
+        "node-implementation"
+      ],
+      "nodes": [
+        7
+      ],
+      "modes": [
+        "fast"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "mode",
+        "node_bindings",
+        "acceptance_checks"
+      ]
     },
     {
       "id": "delivery-plan",
       "path": "templates/delivery-plan.md.tmpl",
       "output": ".agent/state/artifacts/08-delivery-plan.md",
       "renderable": true,
-      "depends_on": ["node-acceptance"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["delivery"],
-      "required": ["local_test_production", "branch", "artifact_digest", "ci_checks", "cd_steps", "variables", "migration", "verification", "rollback", "approval", "approved_production_provider_target", "provider_preflight", "production_decision_packet"]
+      "depends_on": [
+        "node-acceptance"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "delivery"
+      ],
+      "required": [
+        "local_test_production",
+        "branch",
+        "artifact_digest",
+        "ci_checks",
+        "cd_steps",
+        "variables",
+        "migration",
+        "verification",
+        "rollback",
+        "approval",
+        "approved_production_provider_target",
+        "provider_preflight",
+        "production_decision_packet"
+      ]
     },
     {
       "id": "retrospective",
       "path": "templates/retrospective.md.tmpl",
       "output": ".agent/state/artifacts/08-retrospective.md",
       "renderable": true,
-      "depends_on": ["requirement-contract"],
-      "nodes": [8],
-      "modes": ["fast", "standard", "release"],
-      "capabilities": ["core"],
-      "required": ["result", "time", "tokens", "resources", "costs", "learning", "candidates", "promotion"]
+      "depends_on": [
+        "requirement-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "fast",
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "core"
+      ],
+      "required": [
+        "result",
+        "time",
+        "tokens",
+        "resources",
+        "costs",
+        "learning",
+        "candidates",
+        "promotion"
+      ]
     },
     {
       "id": "frontend-profile",
       "path": "assets/templates/frontend/PROFILE.md.tmpl",
       "output": ".agent/state/artifacts/04-frontend-profile.md",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [4],
-      "modes": ["standard", "release"],
-      "capabilities": ["frontend"],
-      "required": ["framework_build", "targets", "commands", "gates", "runtime_contract"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        4
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "frontend"
+      ],
+      "required": [
+        "framework_build",
+        "targets",
+        "commands",
+        "gates",
+        "runtime_contract"
+      ]
     },
     {
       "id": "backend-profile",
       "path": "assets/templates/backend/PROFILE.md.tmpl",
       "output": ".agent/state/artifacts/04-backend-profile.md",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [4],
-      "modes": ["standard", "release"],
-      "capabilities": ["backend"],
-      "required": ["runtime", "boundaries", "commands", "migration", "runtime_contract"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        4
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "backend"
+      ],
+      "required": [
+        "runtime",
+        "boundaries",
+        "commands",
+        "migration",
+        "runtime_contract"
+      ]
     },
     {
       "id": "ios-profile",
       "path": "assets/templates/ios/PROFILE.md.tmpl",
       "output": ".agent/state/artifacts/04-ios-profile.md",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [4],
-      "modes": ["standard", "release"],
-      "capabilities": ["ios"],
-      "required": ["target", "matrix", "commands", "signing", "artifact_cleanup"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        4
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "ios"
+      ],
+      "required": [
+        "target",
+        "matrix",
+        "commands",
+        "signing",
+        "artifact_cleanup"
+      ]
     },
     {
       "id": "docker-compose",
       "path": "assets/templates/docker/compose.yaml.tmpl",
       "output": ".agent/state/artifacts/04-compose.yaml",
       "renderable": true,
-      "depends_on": ["task-plan"],
-      "nodes": [4, 6],
-      "modes": ["standard", "release"],
-      "capabilities": ["docker"],
-      "required": ["project", "port", "container_port", "health_command"]
+      "depends_on": [
+        "task-plan"
+      ],
+      "nodes": [
+        4,
+        6
+      ],
+      "modes": [
+        "standard",
+        "release"
+      ],
+      "capabilities": [
+        "docker"
+      ],
+      "required": [
+        "project",
+        "port",
+        "container_port",
+        "health_command"
+      ]
     },
     {
       "id": "ci-contract",
       "path": "assets/templates/ci-cd/PIPELINE.md.tmpl",
       "output": ".agent/state/artifacts/08-ci-contract.md",
       "renderable": true,
-      "depends_on": ["delivery-plan"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["ci-provider-github"],
-      "required": ["provider", "provider_preflight_receipt_sha256", "provider_preflight_observed_at", "repository_identity", "effective_branch_protection_or_ruleset", "required_status_checks", "production_environment_required_reviewers", "production_decision_packet_sha256", "approvals", "secret_provider", "rollback"]
+      "depends_on": [
+        "delivery-plan"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-github",
+        "ci-provider-gitlab"
+      ],
+      "required": [
+        "provider",
+        "provider_preflight_receipt_sha256",
+        "provider_preflight_observed_at",
+        "repository_identity",
+        "effective_branch_protection_or_ruleset",
+        "required_status_checks",
+        "production_environment_required_reviewers",
+        "production_decision_packet_sha256",
+        "approvals",
+        "secret_provider",
+        "rollback"
+      ]
     },
     {
       "id": "github-ci",
       "path": "assets/templates/ci-cd/github-ci.yml.tmpl",
       "output": ".agent/state/artifacts/08-github-ci.yml",
       "renderable": true,
-      "depends_on": ["ci-contract"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["ci-provider-github"],
-      "required": ["install_command", "static_security_command", "test_command", "integration_command", "migration_dry_run_command", "build_command", "publish_artifact_and_digest_command", "publish_artifact_receipt_command"]
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-github"
+      ],
+      "required": [
+        "install_command_id",
+        "static_security_command_id",
+        "test_command_id",
+        "integration_command_id",
+        "migration_dry_run_command_id",
+        "build_command_id",
+        "artifact_path"
+      ],
+      "authority": [
+        "github_candidate_runner",
+        "github_protected_runner",
+        "github_container",
+        "github_default_branch",
+        "blueprint_sha256"
+      ]
     },
     {
       "id": "github-test-cd",
       "path": "assets/templates/ci-cd/github-test-cd.yml.tmpl",
       "output": ".agent/state/artifacts/08-github-test-cd.yml",
       "renderable": true,
-      "depends_on": ["ci-contract"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["ci-provider-github"],
-      "required": ["fetch_and_verify_artifact_command", "deploy_test_command", "test_acceptance_command", "publish_test_receipt_command", "cleanup_test_command"]
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-github"
+      ],
+      "required": [
+        "verify_ci_artifact_provenance_command_id",
+        "fetch_and_verify_artifact_command_id",
+        "deploy_test_command_id",
+        "test_acceptance_command_id",
+        "publish_test_receipt_command_id",
+        "cleanup_test_command_id"
+      ],
+      "authority": [
+        "github_protected_runner",
+        "github_container",
+        "github_default_branch",
+        "blueprint_sha256"
+      ]
     },
     {
       "id": "github-production-cd",
       "path": "assets/templates/ci-cd/github-production-cd.yml.tmpl",
       "output": ".agent/state/artifacts/08-github-production-cd.yml",
       "renderable": true,
-      "depends_on": ["ci-contract"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["ci-provider-github"],
-      "required": ["verify_provider_preflight_receipt_command", "verify_artifact_and_receipt_command", "verify_production_decision_packet_command", "deploy_production_command", "verify_or_rollback_command", "publish_promotion_receipt_command"]
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-github"
+      ],
+      "required": [
+        "verify_ci_artifact_provenance_command_id",
+        "verify_provider_preflight_receipt_command_id",
+        "verify_artifact_and_receipt_command_id",
+        "verify_production_decision_packet_command_id",
+        "deploy_production_command_id",
+        "verify_production_command_id",
+        "rollback_production_command_id",
+        "publish_promotion_receipt_command_id",
+        "verify_promotion_receipt_authenticity_command_id"
+      ],
+      "authority": [
+        "github_protected_runner",
+        "github_container",
+        "github_default_branch",
+        "blueprint_sha256"
+      ]
     },
     {
       "id": "environment-profile",
       "path": "templates/environment-profile.json.tmpl",
       "output": ".agent/state/artifacts/08-environment-profile.json",
       "renderable": true,
-      "depends_on": ["delivery-plan"],
-      "nodes": [8],
-      "modes": ["release"],
-      "capabilities": ["delivery"],
-      "required": ["local_test_production", "patterns", "install_command", "check_commands", "build_command", "artifact_path_or_digest", "deploy_command_or_none", "health_check", "cleanup_command", "rollback_command", "true_or_false"]
+      "depends_on": [
+        "delivery-plan"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "delivery"
+      ],
+      "required": [
+        "local_test_production",
+        "patterns",
+        "install_command",
+        "check_commands",
+        "build_command",
+        "artifact_path_or_digest",
+        "deploy_command_or_none",
+        "health_check",
+        "cleanup_command",
+        "rollback_command",
+        "true_or_false"
+      ]
     },
     {
       "id": "acceptance-web-docker",
       "path": "assets/templates/acceptance/web-docker.json.tmpl",
       "output": ".agent/state/artifacts/04-acceptance-runner.json",
       "renderable": true,
-      "depends_on": ["task-plan", "review-policy"],
-      "nodes": [4, 7],
-      "modes": ["release"],
-      "capabilities": ["acceptance-web-docker"],
-      "required": ["execution_profile", "bounded_preflight_command_records", "client_profile"]
+      "depends_on": [
+        "task-plan",
+        "review-policy"
+      ],
+      "nodes": [
+        4,
+        7
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "acceptance-web-docker"
+      ],
+      "required": [
+        "execution_profile",
+        "bounded_preflight_command_records",
+        "client_profile"
+      ]
     },
     {
       "id": "acceptance-api",
       "path": "assets/templates/acceptance/api.json.tmpl",
       "output": ".agent/state/artifacts/04-acceptance-runner.json",
       "renderable": true,
-      "depends_on": ["task-plan", "review-policy"],
-      "nodes": [4, 7],
-      "modes": ["release"],
-      "capabilities": ["acceptance-api"],
-      "required": ["execution_profile", "bounded_preflight_command_records", "bounded_command_records"]
+      "depends_on": [
+        "task-plan",
+        "review-policy"
+      ],
+      "nodes": [
+        4,
+        7
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "acceptance-api"
+      ],
+      "required": [
+        "execution_profile",
+        "bounded_preflight_command_records",
+        "bounded_command_records"
+      ]
     },
     {
       "id": "acceptance-cli",
       "path": "assets/templates/acceptance/cli.json.tmpl",
       "output": ".agent/state/artifacts/04-acceptance-runner.json",
       "renderable": true,
-      "depends_on": ["task-plan", "review-policy"],
-      "nodes": [4, 7],
-      "modes": ["release"],
-      "capabilities": ["acceptance-cli"],
-      "required": ["execution_profile", "bounded_preflight_command_records", "bounded_command_records"]
+      "depends_on": [
+        "task-plan",
+        "review-policy"
+      ],
+      "nodes": [
+        4,
+        7
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "acceptance-cli"
+      ],
+      "required": [
+        "execution_profile",
+        "bounded_preflight_command_records",
+        "bounded_command_records"
+      ]
     },
     {
       "id": "acceptance-ios",
       "path": "assets/templates/acceptance/ios-simulator.json.tmpl",
       "output": ".agent/state/artifacts/04-acceptance-runner.json",
       "renderable": true,
-      "depends_on": ["task-plan", "review-policy"],
-      "nodes": [4, 7],
-      "modes": ["release"],
-      "capabilities": ["acceptance-ios"],
-      "required": ["execution_profile", "simulator_target", "bounded_preflight_command_records", "bounded_command_records"]
+      "depends_on": [
+        "task-plan",
+        "review-policy"
+      ],
+      "nodes": [
+        4,
+        7
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "acceptance-ios"
+      ],
+      "required": [
+        "execution_profile",
+        "simulator_target",
+        "bounded_preflight_command_records",
+        "bounded_command_records"
+      ]
     },
     {
       "id": "acceptance-workflow",
       "path": "templates/workflow-acceptance-runner.json.tmpl",
       "output": ".agent/state/artifacts/04-acceptance-runner.json",
       "renderable": true,
-      "depends_on": ["task-plan", "review-policy"],
-      "nodes": [4, 7],
-      "modes": ["release"],
-      "capabilities": ["acceptance-workflow"],
-      "required": ["execution_profile", "bounded_preflight_command_records", "bounded_command_records"]
+      "depends_on": [
+        "task-plan",
+        "review-policy"
+      ],
+      "nodes": [
+        4,
+        7
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "acceptance-workflow"
+      ],
+      "required": [
+        "execution_profile",
+        "bounded_preflight_command_records",
+        "bounded_command_records"
+      ]
+    },
+    {
+      "id": "gitlab-ci",
+      "path": "assets/templates/ci-cd/gitlab-ci.yml.tmpl",
+      "output": ".agent/state/artifacts/08-gitlab-ci.yml",
+      "renderable": true,
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-gitlab"
+      ],
+      "required": [
+        "install_command_id",
+        "static_security_command_id",
+        "test_command_id",
+        "integration_command_id",
+        "migration_dry_run_command_id",
+        "build_command_id",
+        "artifact_path"
+      ],
+      "authority": [
+        "gitlab_sys_platform",
+        "gitlab_image",
+        "gitlab_candidate_tags",
+        "blueprint_sha256"
+      ]
+    },
+    {
+      "id": "gitlab-test-cd",
+      "path": "assets/templates/ci-cd/gitlab-test-cd.yml.tmpl",
+      "output": ".agent/state/artifacts/08-gitlab-test-cd.yml",
+      "renderable": true,
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-gitlab"
+      ],
+      "required": [
+        "verify_ci_artifact_provenance_command_id",
+        "fetch_and_verify_artifact_command_id",
+        "deploy_test_command_id",
+        "test_acceptance_command_id",
+        "publish_test_receipt_command_id",
+        "cleanup_test_command_id",
+        "verify_test_receipt_authenticity_command_id"
+      ],
+      "authority": [
+        "gitlab_sys_platform",
+        "gitlab_image",
+        "gitlab_protected_tags",
+        "blueprint_sha256"
+      ]
+    },
+    {
+      "id": "gitlab-production-cd",
+      "path": "assets/templates/ci-cd/gitlab-production-cd.yml.tmpl",
+      "output": ".agent/state/artifacts/08-gitlab-production-cd.yml",
+      "renderable": true,
+      "depends_on": [
+        "ci-contract"
+      ],
+      "nodes": [
+        8
+      ],
+      "modes": [
+        "release"
+      ],
+      "capabilities": [
+        "ci-provider-gitlab"
+      ],
+      "required": [
+        "verify_ci_artifact_provenance_command_id",
+        "verify_provider_preflight_receipt_command_id",
+        "verify_artifact_and_receipt_command_id",
+        "verify_production_decision_packet_command_id",
+        "deploy_production_command_id",
+        "verify_production_command_id",
+        "publish_promotion_receipt_command_id",
+        "verify_promotion_receipt_authenticity_command_id",
+        "rollback_production_command_id"
+      ],
+      "authority": [
+        "gitlab_sys_platform",
+        "gitlab_image",
+        "gitlab_protected_tags",
+        "blueprint_sha256"
+      ]
     }
   ]
 }

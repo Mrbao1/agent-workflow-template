@@ -68,6 +68,8 @@ def require_stale_receipt_rejected(root: Path) -> None:
     local_runner.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(TESTRUN, local_runner)
     shutil.copy2(TESTRUN.with_name("humandecision.py"), local_runner.with_name("humandecision.py"))
+    shutil.copy2(TESTRUN.with_name("process_observation.py"),local_runner.with_name("process_observation.py"))
+    shutil.copytree(TESTRUN.parent/"workflowlib",local_runner.parent/"workflowlib")
     command = [
         sys.executable, str(local_runner), "--receipt", "receipt.json", "--run-id", "1" * 32,
         "--case", "case-a", "--timeout", "2", "--", "/usr/bin/true",
@@ -174,4 +176,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

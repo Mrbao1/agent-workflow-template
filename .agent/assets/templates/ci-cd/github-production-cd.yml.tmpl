@@ -3,49 +3,264 @@ on:
   workflow_dispatch:
     inputs:
       artifact_digest:
-        description: Immutable digest produced by CI
+        description: Immutable sha256 digest produced by protected CI
+        required: true
+      artifact_provenance_receipt:
+        description: Cryptographic provenance receipt bound into the passed test receipt
+        required: true
+      ci_run_id:
+        description: Successful protected CI workflow run ID that produced the artifact
+        required: true
+      ci_head_sha:
+        description: Exact 40-hex source revision tested by protected CI
         required: true
       test_receipt:
-        description: Passed test receipt bound to the same digest
+        description: Passed test receipt identifier bound to the same digest
+        required: true
+      test_receipt_sha256:
+        description: SHA-256 of the exact bounded authenticated test receipt bytes
         required: true
       provider_preflight_receipt:
-        description: Fresh provider-owned proof of branch protection, required checks and production reviewers
+        description: Fresh provider-owned governance receipt identifier
         required: true
       production_decision_packet:
-        description: Human-approved packet binding artifact, repository target, provider proof and test summary
+        description: Human-approved production decision packet identifier
         required: true
 permissions:
   contents: read
+env:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
 concurrency:
   group: cd-production
   cancel-in-progress: false
 jobs:
-  production:
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  dispatch-guard:
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      EXPECTED_DEFAULT_REF: refs/heads/{{github_default_branch}}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_HEAD_SHA: ${{ github.sha }}
+      WORKFLOW_REF: ${{ github.ref }}
+      CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
     steps:
+      - name: Fail invalid dispatch context unconditionally
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$WORKFLOW_REF" == "$EXPECTED_DEFAULT_REF" ]]
+          [[ "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CI_HEAD_SHA" == "$WORKFLOW_HEAD_SHA" ]]
+  production:
+    needs: dispatch-guard
+    environment: production
+    runs-on: {{github_protected_runner}}
+{{github_container}}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      receipt_artifact_id: ${{ steps.upload-production-receipt.outputs.artifact-id }}
+    env:
+      ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      ARTIFACT_PROVENANCE_RECEIPT: ${{ inputs.artifact_provenance_receipt }}
+      CI_RUN_ID: ${{ inputs.ci_run_id }}
+      CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
+      EXPECTED_DEFAULT_REF: refs/heads/{{github_default_branch}}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_HEAD_SHA: ${{ github.sha }}
+      WORKFLOW_REF: ${{ github.ref }}
+      TEST_RECEIPT: ${{ inputs.test_receipt }}
+      TEST_RECEIPT_SHA256: ${{ inputs.test_receipt_sha256 }}
+      PROVIDER_PREFLIGHT_RECEIPT: ${{ inputs.provider_preflight_receipt }}
+      PRODUCTION_DECISION_PACKET: ${{ inputs.production_decision_packet }}
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$WORKFLOW_EVENT_NAME" != workflow_dispatch ]] || [[ "$WORKFLOW_REF" != "$EXPECTED_DEFAULT_REF" ]]; then
+            printf '%s\n' 'production deployment requires dispatch from the confirmed default branch' >&2
+            exit 2
+          fi
+          if [[ ! "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'artifact_digest must be sha256: followed by 64 lowercase hexadecimal characters' >&2
+            exit 2
+          fi
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || [[ ! "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$CI_HEAD_SHA" != "$WORKFLOW_HEAD_SHA" ]]; then
+            printf '%s\n' 'ci_run_id and ci_head_sha must identify protected CI for this exact production workflow revision' >&2
+            exit 2
+          fi
+          if [[ ! "$TEST_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'test_receipt_sha256 must bind exact receipt bytes' >&2
+            exit 2
+          fi
+          for name in ARTIFACT_PROVENANCE_RECEIPT TEST_RECEIPT PROVIDER_PREFLIGHT_RECEIPT PRODUCTION_DECISION_PACKET; do
+            value="${!name}"
+            if (( ${#value} > 512 )) || [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@+=-]*$ ]] || [[ "$value" == *".."* ]]; then
+              printf 'invalid safe identifier in %s\n' "$name" >&2
+              exit 2
+            fi
+          done
+      - name: Checkout exact dispatched revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.CI_HEAD_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+      - name: Bind checkout to dispatch authority
+        shell: bash
+        run: 'test "$(git rev-parse --verify HEAD)" = "$CI_HEAD_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)"'
+      - name: Verify protected CI artifact provenance
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_ci_artifact_provenance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Verify fresh provider governance preflight
-        run: "{{verify_provider_preflight_receipt_command}} ${{ inputs.provider_preflight_receipt }}"
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_provider_preflight_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Verify artifact and test receipt
-        run: "{{verify_artifact_and_receipt_command}} ${{ inputs.artifact_digest }} ${{ inputs.test_receipt }}"
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_artifact_and_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Verify human-approved production decision packet
-        run: "{{verify_production_decision_packet_command}} ${{ inputs.production_decision_packet }} ${{ inputs.artifact_digest }} ${{ inputs.test_receipt }} ${{ inputs.provider_preflight_receipt }}"
-      - name: Promote exact tested artifact
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_production_decision_packet_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Deploy exact tested artifact
         id: deploy_production
         continue-on-error: true
-        run: "{{deploy_production_command}} ${{ inputs.artifact_digest }}"
-      - name: Verify or rollback
-        id: verify_or_rollback
-        if: always()
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{deploy_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Verify deployed production artifact
+        id: verify_production
+        if: always() && steps.deploy_production.outcome == 'success'
         continue-on-error: true
-        run: "{{verify_or_rollback_command}} ${{ inputs.artifact_digest }} ${{ steps.deploy_production.outcome }}"
-      - name: Publish promotion or rollback receipt
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy_production.outcome }}
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Roll back failed or unverified deployment
+        id: rollback_production
+        if: always() && (steps.deploy_production.outcome != 'success' || steps.verify_production.outcome != 'success')
+        continue-on-error: true
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy_production.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify_production.outcome }}
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{rollback_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Publish structured promotion or rollback outcome
         id: publish_promotion_receipt
         if: always()
         continue-on-error: true
-        run: "{{publish_promotion_receipt_command}} ${{ inputs.artifact_digest }} ${{ steps.deploy_production.outcome }} ${{ steps.verify_or_rollback.outcome }}"
-      - name: Fail closed after rollback and receipt
-        if: always() && (steps.deploy_production.outcome != 'success' || steps.verify_or_rollback.outcome != 'success' || steps.publish_promotion_receipt.outcome != 'success')
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy_production.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify_production.outcome }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback_production.outcome }}
+          RECEIPT_DISPOSITION: ${{ steps.deploy_production.outcome == 'success' && steps.verify_production.outcome == 'success' && steps.rollback_production.outcome == 'skipped' && 'promoted' || (steps.rollback_production.outcome == 'success' && 'rolled-back' || 'failed') }}
+          RECEIPT_CONCLUSION: ${{ steps.deploy_production.outcome == 'success' && steps.verify_production.outcome == 'success' && steps.rollback_production.outcome == 'skipped' && 'success' || 'failure' }}
+          RECEIPT_PATH: ${{ runner.temp }}/agent-production-deployment-receipt.json
+          PRODUCTION_RUN_ID: ${{ github.run_id }}
+          PRODUCTION_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCTION_HEAD_SHA: ${{ github.sha }}
+          PRODUCTION_REF: ${{ github.ref }}
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{publish_promotion_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Verify exact structured deployment receipt bindings
+        id: verify_promotion_receipt
+        if: always() && steps.publish_promotion_receipt.outcome == 'success'
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy_production.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify_production.outcome }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback_production.outcome }}
+          RECEIPT_DISPOSITION: ${{ steps.deploy_production.outcome == 'success' && steps.verify_production.outcome == 'success' && steps.rollback_production.outcome == 'skipped' && 'promoted' || (steps.rollback_production.outcome == 'success' && 'rolled-back' || 'failed') }}
+          RECEIPT_CONCLUSION: ${{ steps.deploy_production.outcome == 'success' && steps.verify_production.outcome == 'success' && steps.rollback_production.outcome == 'skipped' && 'success' || 'failure' }}
+          RECEIPT_PATH: ${{ runner.temp }}/agent-production-deployment-receipt.json
+          PRODUCTION_RUN_ID: ${{ github.run_id }}
+          PRODUCTION_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCTION_HEAD_SHA: ${{ github.sha }}
+          PRODUCTION_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RECEIPT_PATH" <<'PY'
+          import json, os, pathlib, stat, sys
+          path=pathlib.Path(sys.argv[1]); before=path.lstat()
+          if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 262144:
+              raise SystemExit("deployment receipt is not one bounded regular file")
+          descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+          try:
+              opened=os.fstat(descriptor)
+              if (opened.st_dev,opened.st_ino,opened.st_size)!=(before.st_dev,before.st_ino,before.st_size):
+                  raise SystemExit("deployment receipt changed while opening")
+              chunks=[]; remaining=262145
+              while remaining:
+                  chunk=os.read(descriptor,min(65536,remaining))
+                  if not chunk: break
+                  chunks.append(chunk); remaining-=len(chunk)
+              raw=b"".join(chunks); after=os.fstat(descriptor)
+              if len(raw)>262144 or (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)!=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns):
+                  raise SystemExit("deployment receipt changed while reading")
+          finally: os.close(descriptor)
+          value=json.loads(raw)
+          expected={"schema":"agent-production-deployment-receipt/v3","artifact_digest":os.environ["ARTIFACT_DIGEST"],
+                    "artifact_provenance_receipt":os.environ["ARTIFACT_PROVENANCE_RECEIPT"],
+                    "ci_run_id":os.environ["CI_RUN_ID"],"ci_head_sha":os.environ["CI_HEAD_SHA"],
+                    "test_receipt":os.environ["TEST_RECEIPT"],"test_receipt_sha256":os.environ["TEST_RECEIPT_SHA256"],
+                    "provider_preflight_receipt":os.environ["PROVIDER_PREFLIGHT_RECEIPT"],
+                    "production_decision_packet":os.environ["PRODUCTION_DECISION_PACKET"],
+                    "production_run_id":os.environ["PRODUCTION_RUN_ID"],"production_run_attempt":os.environ["PRODUCTION_RUN_ATTEMPT"],
+                    "production_head_sha":os.environ["PRODUCTION_HEAD_SHA"],"production_ref":os.environ["PRODUCTION_REF"],
+                    "deploy_outcome":os.environ["DEPLOY_OUTCOME"],"verify_outcome":os.environ["VERIFY_OUTCOME"],
+                    "rollback_outcome":os.environ["ROLLBACK_OUTCOME"],"disposition":os.environ["RECEIPT_DISPOSITION"],
+                    "conclusion":os.environ["RECEIPT_CONCLUSION"]}
+          if value != expected: raise SystemExit("deployment receipt does not bind separate verify and rollback outcomes")
+          if value["conclusion"] == "success" and (value["deploy_outcome"],value["verify_outcome"],value["rollback_outcome"],value["disposition"]) != ("success","success","skipped","promoted"):
+              raise SystemExit("successful promotion requires verification success and no rollback")
+          PY
+      - name: Verify deployment receipt cryptographic and provider authenticity
+        id: verify_promotion_authenticity
+        if: always() && steps.verify_promotion_receipt.outcome == 'success'
+        continue-on-error: true
+        env:
+          RECEIPT_PATH: ${{ runner.temp }}/agent-production-deployment-receipt.json
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_promotion_receipt_authenticity_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Upload exact authenticated deployment outcome
+        id: upload-production-receipt
+        if: always() && steps.verify_promotion_authenticity.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-outcome-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-production-deployment-receipt.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - name: Fail closed unless promotion verified without rollback
+        if: always() && (steps.deploy_production.outcome != 'success' || steps.verify_production.outcome != 'success' || steps.rollback_production.outcome != 'skipped' || steps.publish_promotion_receipt.outcome != 'success' || steps.verify_promotion_receipt.outcome != 'success' || steps.verify_promotion_authenticity.outcome != 'success' || steps.upload-production-receipt.outcome != 'success')
         run: exit 1
+  publish-production-provenance:
+    needs: production
+    environment: production-receipt-publication
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download exact same-run verified promotion receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.production.outputs.receipt_artifact_id }}
+          path: ${{ runner.temp }}/verified-production-receipt
+      - name: Publish provenance only for verified no-rollback promotion
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: ${{ runner.temp }}/verified-production-receipt/agent-production-deployment-receipt.json
+  terminal:
+    if: always()
+    needs: [dispatch-guard, production, publish-production-provenance]
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      GUARD_RESULT: ${{ needs.dispatch-guard.result }}
+      DEPLOY_RESULT: ${{ needs.production.result }}
+      PUBLISH_RESULT: ${{ needs.publish-production-provenance.result }}
+    steps:
+      - name: Require one authenticated no-rollback terminal chain
+        shell: bash
+        run: 'test "$GUARD_RESULT" = success && test "$DEPLOY_RESULT" = success && test "$PUBLISH_RESULT" = success'

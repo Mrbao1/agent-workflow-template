@@ -9,9 +9,11 @@ description: Run local servers, containers, browsers, simulators, workers, and i
 
 ```bash
 python3 .agent/scripts/agentctl.py managed-run --name <name> --timeout 30 --health-url http://127.0.0.1:<port>/health -- <command>
+
+Health probes accept only canonical loopback HTTP, never follow redirects, and stay inside the command's total deadline. Docker cleanup/inventory and controller subprocesses cap output bytes before decoding and fail closed on output overflow or uncertain identity cleanup.
 ```
 
-It creates an isolated process group and tears it down in `finally` on success, failure, timeout or interruption.
+It uses the shared byte/time-bounded launch-token supervisor and removes all twice-observed launch-scoped descendants before reporting normal-path cleanup. This is lifecycle cleanup, not confinement against same-UID token forgery or controller/host failure; use an external ephemeral OS/provider sandbox when crash-safe or hostile-code containment is required.
 
 Before execution, `agentctl start` captures the task's project-process baseline. For an explicitly migrated active task, use `capture-runtime-baseline --source user:<decision>` only after a read-only process/container inspection. `assert-clean` compares live project-cwd processes with that baseline, so an implementation cannot obtain a clean result merely by leaving the registry empty.
 
@@ -23,13 +25,7 @@ python3 .agent/scripts/agentctl.py register-docker --project agent_<unique-id> -
 ```
 
 3. Wait for explicit health; do not equate a listening process with a working data flow.
-4. Run validation. Capture only bounded logs and final evidence. When an independent review Agent must execute a foreground command concurrently with node-6 validation, bind it to that active platform-evidenced review identity and a hard timeout:
-
-```bash
-python3 .agent/scripts/agentctl.py tool-run --agent-id <canonical-review-agent-id> --name <review-check> --timeout 60 -- <command>
-```
-
-`tool-run` first runs the shared full `agent-team/v9` semantic validator without allowing ledger mutation, then requires an unexpired active member whose exact canonical `role_type` is one of `reviewer`, `adversarial`, `cross`, or `integrator`, with a fresh immutable monitor chain, no historical or current stall violation, a valid payload/per-dispatch-envelope provenance chain and no interrupt/terminal state. Review Agents must also carry the current review-chain, subject and predecessor bindings required by their canonical role. Free-form role text, partial ledgers, arbitrary receipt paths, legacy schemas, role/deadline edits, stale envelopes and terminal-to-active edits cannot authorize a lease. It captures the exact caller/supervisor chain and starts a stable isolated launcher behind a one-byte gate, atomically commits the lease before releasing the reviewed command, then tears the group down in `finally`. Runtime inspection derives the caller chain from two live OS process snapshots; caller-provided PID environment variables have no authority. This prevents immediate nested validation from racing ahead of its lease. An unrelated unregistered project process remains a baseline delta and fails the gate; product servers/workers still use `managed-run` or explicit runtime registration.
+4. Run validation. Capture only bounded logs and final evidence. Independent review commands must be launched and attributed by the Agent platform itself; a local process cannot authenticate a platform Agent by presenting an Agent ID. `agentctl.py tool-run` therefore fails closed and never executes caller argv. Product servers/workers use `managed-run` or explicit runtime registration, while reviewer concurrency stays under the platform supervisor.
 
 5. In success, failure, timeout and interruption paths run:
 

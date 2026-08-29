@@ -10,12 +10,28 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
-import tempfile
 from typing import Dict, List, Optional, Tuple
 
+def _reject_nonfinite_json(token):
+    raise json.JSONDecodeError(f"non-finite JSON number is forbidden: {token}",token,0)
+
+def strict_json_loads(raw,**kwargs):
+    return json.loads(raw,parse_constant=_reject_nonfinite_json,**kwargs)
+
+def strict_json_dumps(value,**kwargs):
+    kwargs["allow_nan"]=False
+    return json.dumps(value,**kwargs)
+
+
 import humandecision
+from workflowlib import boundedio
 from workflowlib import budget as total_budget
+
+# Capture handoff arrival before imports/validation can queue behind loaded -jN hosts.
+# The 60-second TTL still applies to producer-to-consumer process startup.
+PROCESS_STARTED_AT = dt.datetime.now(dt.timezone.utc)
 
 
 def find_agent_dir() -> Path:
@@ -50,6 +66,9 @@ MAX_ACCOUNTED_TURN_IDS = 64
 # the transition authorization receipt for audit (see authorization_receipt).
 TASK_INVARIANT_KEYS = (
     "schema",
+    "task_generation_id",
+    "selected_model",
+    "completed_model",
     "title",
     "task_type",
     "complexity",
@@ -65,6 +84,7 @@ TASK_INVARIANT_KEYS = (
     "requirement_contract",
     "requirement_contract_sha256",
     "primary_skill",
+    "skill_activation",
     "risk_flags",
     "token_budget",
     "tokens_used",
@@ -140,7 +160,7 @@ TRANSITION_PROFILES = {
     },
     ("agentctl", "reopen-clarification"): {
         "requirements_clarified", "requirement_source", "requirement_contract",
-        "requirement_contract_sha256", "primary_skill", "selected_templates",
+        "requirement_contract_sha256", "task_generation_id", "primary_skill", "skill_activation", "selected_templates",
         "selected_capabilities", "template_route", "rendered_artifacts", "status",
         "phase", "current_node", "accepted_nodes", "node_artifacts", "gate_approvals",
         "pending_gate_artifacts", "decision_packet", "open_questions", "next_action",
@@ -174,36 +194,26 @@ TRANSITION_PROFILES = {
     },
     ("workflowctl", "complete-task"): {
         "retrospective", "knowledge_candidates", "current_node", "status", "phase", "next_action",
-        "completion_binding",
+        "completion_binding", "selected_model", "completed_model",
     },
 }
 
 
 def load_json(path: Path) -> Dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = strict_json_loads(boundedio.read_text(path,label="context JSON"))
     if not isinstance(value, dict):
         raise SystemExit(f"JSON object required: {path}")
     return value
 
 
 def atomic_json(path: Path, value: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    data=(strict_json_dumps(value,ensure_ascii=False,indent=2)+"\n").encode("utf-8")
+    try: boundedio.atomic_write(path,data,mode=0o600,label="context capsule")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def contract_sha256() -> str:
-    return hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest() if CONTRACT_PATH.is_file() else "missing"
+    return hashlib.sha256(boundedio.read_bytes(CONTRACT_PATH,label="requirement contract")).hexdigest() if CONTRACT_PATH.is_file() else "missing"
 
 
 def governed_contract_binding(task: Dict[str, object]) -> str:
@@ -228,8 +238,38 @@ def task_invariant(task: Dict[str, object]) -> Dict[str, object]:
 
 
 def object_sha256(value: object) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    encoded = strict_json_dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+MAX_POLICY_ENTRIES=32768
+MAX_POLICY_FILES=8192
+MAX_POLICY_FILE_BYTES=16*1024*1024
+
+
+def bounded_policy_tree(base: Path,label: str,state):
+    stack=[base]
+    while stack:
+        directory=stack.pop()
+        with os.scandir(directory) as scanner:
+            batch=[]
+            for entry in scanner:
+                state["entries"]+=1
+                if state["entries"]>MAX_POLICY_ENTRIES: raise SystemExit(f"{label} entry limit exceeded")
+                batch.append(entry)
+        for entry in sorted(batch,key=lambda item:os.fsencode(item.name),reverse=True):
+            metadata=entry.stat(follow_symlinks=False); path=Path(entry.path)
+            if stat.S_ISLNK(metadata.st_mode): raise SystemExit(f"{label} contains a symlink: {path.relative_to(ROOT)}")
+            if stat.S_ISDIR(metadata.st_mode): stack.append(path); continue
+            if not stat.S_ISREG(metadata.st_mode): raise SystemExit(f"{label} contains a special file: {path.relative_to(ROOT)}")
+            state["files"]+=1
+            if state["files"]>MAX_POLICY_FILES: raise SystemExit(f"{label} file limit exceeded")
+            yield path
+
+
+def bounded_policy_digest(path: Path) -> str:
+    try: return boundedio.sha256(path,maximum=MAX_POLICY_FILE_BYTES,label="policy bundle file")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 POLICY_BUNDLE_VERSION = "policy-bundle/v2"
@@ -247,24 +287,26 @@ def policy_bundle_sha256(task: Dict[str, object], version: str = POLICY_BUNDLE_V
     """
     if version not in {POLICY_BUNDLE_VERSION, LEGACY_POLICY_BUNDLE_VERSION}:
         raise SystemExit(f"unknown policy bundle version: {version}")
-    paths = [CONFIG_PATH, AGENT_DIR / "INDEX.md", AGENT_DIR / "templates/manifest.json"]
-    primary = str(task.get("primary_skill", ""))
-    if primary:
-        paths.append(AGENT_DIR / "skills" / primary / "SKILL.md")
-    paths.extend(sorted((AGENT_DIR / "workflows").glob("*.md")))
-    if version == POLICY_BUNDLE_VERSION:
-        paths.append(AGENT_DIR / "policies" / "PROJECT_GUARDRAILS.md")
-        paths.extend(sorted((AGENT_DIR / "scripts").rglob("*.py")))
+    paths=[CONFIG_PATH,AGENT_DIR/"INDEX.md",AGENT_DIR/"templates/manifest.json"]
+    primary=str(task.get("primary_skill","")); traversal={"entries":0,"files":0}
+    if primary: paths.append(AGENT_DIR/"skills"/primary/"SKILL.md")
+    workflows=AGENT_DIR/"workflows"
+    paths.extend(sorted(bounded_policy_tree(workflows,"workflow policy inventory",traversal),key=lambda path:path.relative_to(workflows).as_posix().encode()))
+    if version==POLICY_BUNDLE_VERSION:
+        paths.append(AGENT_DIR/"policies"/"PROJECT_GUARDRAILS.md")
+        scripts=AGENT_DIR/"scripts"
+        script_files=[path for path in bounded_policy_tree(scripts,"script policy inventory",traversal) if path.suffix==".py"]
+        paths.extend(sorted(script_files,key=lambda path:path.relative_to(scripts).as_posix().encode()))
         if primary:
-            for name in ("scripts", "references"):
-                base = AGENT_DIR / "skills" / primary / name
-                if base.is_dir():
-                    paths.extend(sorted(path for path in base.rglob("*") if not path.is_dir()))
+            for name in ("scripts","references"):
+                base=AGENT_DIR/"skills"/primary/name
+                if base.is_dir() and not base.is_symlink():
+                    paths.extend(sorted(bounded_policy_tree(base,f"primary Skill {name} inventory",traversal),key=lambda path:path.relative_to(base).as_posix().encode()))
     entries = []
     for path in paths:
         if not path.is_file() or path.is_symlink():
             raise SystemExit(f"policy bundle file is missing or unsafe: {path.relative_to(ROOT)}")
-        entries.append({"path": str(path.relative_to(ROOT)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        entries.append({"path":str(path.relative_to(ROOT)),"sha256":bounded_policy_digest(path)})
     if version == LEGACY_POLICY_BUNDLE_VERSION:
         return object_sha256(entries)
     return object_sha256({"version": version, "files": entries})
@@ -290,7 +332,7 @@ def normalized_token_estimate(value: Dict[str, object]) -> int:
     integrity = clone.get("integrity")
     if isinstance(integrity, dict):
         integrity["content_sha256"] = "0" * 64
-    encoded = json.dumps(clone, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = strict_json_dumps(clone, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return (len(encoded) + 3) // 4
 
 
@@ -326,7 +368,14 @@ def authorization_receipt(
         issued = dt.datetime.fromisoformat(str(value.get("issued_at")))
         if issued.tzinfo is None:
             raise ValueError("timezone required")
-        age = (dt.datetime.now(dt.timezone.utc) - issued.astimezone(dt.timezone.utc)).total_seconds()
+        issued_utc=issued.astimezone(dt.timezone.utc)
+        now=dt.datetime.now(dt.timezone.utc)
+        # A contextctl child normally starts after contexttx sealed the receipt.
+        # Measure freshness at that handoff boundary, not after slow policy/hash
+        # validation.  Direct in-process callers that predate the receipt retain
+        # validation-time freshness, so this cannot extend a pre-created lease.
+        observed=PROCESS_STARTED_AT if PROCESS_STARTED_AT>=issued_utc else now
+        age=(observed-issued_utc).total_seconds()
         if age < -5 or age > 60:
             raise ValueError("authorization is stale")
     except (TypeError, ValueError):
@@ -367,7 +416,7 @@ def authorization_receipt(
         "operation": profile[1],
         "changed_fields": actual,
         "non_invariant_changed_fields": non_invariant,
-        "receipt_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "receipt_sha256": hashlib.sha256(boundedio.read_bytes(path,label="context receipt")).hexdigest(),
     }
     return receipt, before
 
@@ -381,7 +430,7 @@ def list_value(value: object) -> List[str]:
 def safe_previous() -> Tuple[Dict[str, object], str]:
     if not CONTEXT_PATH.is_file():
         return {}, "none"
-    digest = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+    digest = hashlib.sha256(boundedio.read_bytes(CONTEXT_PATH,label="context capsule")).hexdigest()
     try:
         return load_json(CONTEXT_PATH), digest
     except (OSError, ValueError, SystemExit):
@@ -1000,12 +1049,16 @@ def verify_host_compaction_receipt(raw: str, task: Dict[str, object],
     adapter_raw = observer.get("signed_adapter") if isinstance(observer, dict) else None
     if not isinstance(adapter_raw, str) or not adapter_raw:
         raise SystemExit("host compaction is unsupported until context.host_compaction_observer.signed_adapter is configured")
-    adapter = humandecision.adapter_path(ROOT, adapter_raw)
+    adapter = humandecision.adapter_path(
+        ROOT, adapter_raw, required_operations=("verify-host-compaction",),
+    )
     path = (ROOT / raw).resolve()
     try: path.relative_to(ROOT)
     except ValueError: raise SystemExit("host compaction receipt escapes project")
     if not path.is_file() or path.is_symlink(): raise SystemExit("host compaction receipt is missing or unsafe")
-    value = load_json(path)
+    receipt_data,receipt_identity=humandecision.receipt_snapshot(path)
+    try: value=strict_json_loads(receipt_data.decode("utf-8"))
+    except (UnicodeError,json.JSONDecodeError) as error: raise SystemExit("host compaction receipt is not valid UTF-8 JSON") from error
     required = {"schema", "task_invariant_sha256", "from_estimated_tokens", "to_estimated_tokens", "observed_at", "host_id", "nonce"}
     if (
         set(value) != required or value.get("schema") != "host-compaction-receipt/v1"
@@ -1026,20 +1079,20 @@ def verify_host_compaction_receipt(raw: str, task: Dict[str, object],
         maximum = int(observer.get("max_receipt_age_seconds", 300))
         if age < -30 or age > maximum:
             raise SystemExit("host compaction receipt is stale or future-dated")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = subprocess.run(
-        [str(adapter), "verify-host-compaction", "--receipt", str(path)], cwd=str(ROOT), text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
-    )
+    digest=hashlib.sha256(receipt_data).hexdigest()
+    result=humandecision.run_adapter(adapter,["verify-host-compaction"],required_operations=("verify-host-compaction",),timeout=30,receipt_raw=receipt_data)
     if result.returncode or result.stdout.strip() != f"VERIFIED HOST COMPACTION sha256={digest}":
         raise SystemExit("host compaction adapter rejected the receipt")
+    after_data,after_identity=humandecision.receipt_snapshot(path)
+    if after_identity!=receipt_identity or after_data!=receipt_data:
+        raise SystemExit("host compaction receipt changed during provider verification")
     return {
-        "path": str(path.relative_to(ROOT)), "sha256": digest, "bytes": path.stat().st_size,
+        "path": str(path.relative_to(ROOT)), "sha256": digest, "bytes": len(receipt_data),
         "task_invariant_sha256": value["task_invariant_sha256"],
         "from_estimated_tokens": value["from_estimated_tokens"],
         "to_estimated_tokens": value["to_estimated_tokens"],
         "host_id": value["host_id"], "observed_at": value["observed_at"],
-        "adapter_path": str(adapter), "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
+        "adapter_path": str(adapter), "adapter_sha256": hashlib.sha256(boundedio.read_bytes(adapter,label="context adapter")).hexdigest(),
     }
 
 
@@ -1264,7 +1317,7 @@ def validate_context(quiet: bool = False, ignore_checkpoint_age: bool = False) -
         errors.append("accepted terminal context must not retain unresolved risks")
     if not context.get("confirmed_facts"):
         errors.append("confirmed_facts cannot be empty")
-    encoded = CONTEXT_PATH.read_bytes()
+    encoded = boundedio.read_bytes(CONTEXT_PATH,label="context capsule")
     if len(encoded) > int(policy.get("max_bytes", 8192)):
         errors.append("context capsule exceeds byte budget")
     estimate = normalized_token_estimate(context)
@@ -1325,9 +1378,9 @@ def abort_host_compaction(args: argparse.Namespace) -> int:
     The bounded inverse of ``sync --request-host-compaction``: valid only
     while the capsule awaits a host receipt, it clears the awaiting state,
     preserves every checkpoint value and records the aborted event together
-    with its approval in the capsule compaction block.  Approval routing
-    matches repair: policy-v2 local tasks use a bound local approval,
-    protected routes require a provider-signed receipt.
+    with its approval in the capsule compaction block. Every authoritative
+    abort uses provider policy v1 and requires a provider-signed receipt;
+    local/current-chat text alone is advisory.
     """
     if not args.source.startswith("user:"):
         raise SystemExit("abort approval source must start with user:")
@@ -1337,7 +1390,7 @@ def abort_host_compaction(args: argparse.Namespace) -> int:
         raise SystemExit("abort-host-compaction is valid only while a host compaction is awaited")
     task = load_json(TASK_PATH)
     config = load_json(CONFIG_PATH)
-    capsule_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+    capsule_sha256 = hashlib.sha256(boundedio.read_bytes(CONTEXT_PATH,label="context capsule")).hexdigest()
     approval = humandecision.record_decision_approval(
         ROOT, config, task, gate="context-abort-host-compaction",
         artifact_sha256=capsule_sha256, source=args.source,
@@ -1410,7 +1463,7 @@ def account_host_turn(args: argparse.Namespace) -> int:
         raise SystemExit("host turn accounting requires complete context checkpoint records")
     prior = int(freshness["estimated_tokens"])  # type: ignore[index]
     timestamp = now()
-    previous_file_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+    previous_file_sha256 = hashlib.sha256(boundedio.read_bytes(CONTEXT_PATH,label="context capsule")).hexdigest()
     applied.append(digest)
     accounting["turns_accounted"] = len(applied)
     accounting["estimated_tokens_charged"] = int(accounting["estimated_tokens_charged"]) + overhead
@@ -1518,9 +1571,9 @@ def _main() -> int:
                 "state": "none",
                 "recovery": "no interrupted context transition",
             }
-            print(json.dumps(status, ensure_ascii=False, indent=2))
+            print(strict_json_dumps(status, ensure_ascii=False, indent=2))
             return 0
-        print(json.dumps(status, ensure_ascii=False, indent=2))
+        print(strict_json_dumps(status, ensure_ascii=False, indent=2))
         return 0 if status.get("state") == "restored" else 1
     if args.command == "abort-host-compaction":
         return abort_host_compaction(args)
@@ -1532,7 +1585,7 @@ def _main() -> int:
         context = load_json(CONTEXT_PATH)
         if not isinstance(context.get("integrity"), dict) or context["integrity"].get("status") != "needs_review":
             raise SystemExit("no repaired context is waiting for review")
-        repair_capsule_sha256 = hashlib.sha256(CONTEXT_PATH.read_bytes()).hexdigest()
+        repair_capsule_sha256 = hashlib.sha256(boundedio.read_bytes(CONTEXT_PATH,label="context capsule")).hexdigest()
         approval = humandecision.record_decision_approval(
             ROOT, load_json(CONFIG_PATH), load_json(TASK_PATH), gate="context-repair",
             artifact_sha256=repair_capsule_sha256, source=args.source,
@@ -1647,6 +1700,9 @@ def _main() -> int:
                         "host compaction is unsupported until context.host_compaction_observer.signed_adapter "
                         "is configured; requesting the awaiting state without it would be unrecoverable"
                     )
+                humandecision.adapter_path(
+                    ROOT, adapter_raw, required_operations=("verify-host-compaction",),
+                )
                 if not handoff_artifact_present(previous, load_json(TASK_PATH)):
                     raise SystemExit(
                         "host compaction request requires a written compact handoff: the verified capsule "
@@ -1689,12 +1745,13 @@ def _main() -> int:
 
 
 def main() -> int:
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LOCK_PATH.touch(exist_ok=True)
-    with LOCK_PATH.open("r+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try: lock_handle=boundedio.open_private_lock(LOCK_PATH,label="context capsule lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as handle:
+        fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
         return _main()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

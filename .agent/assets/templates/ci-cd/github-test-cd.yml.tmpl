@@ -3,40 +3,216 @@ on:
   workflow_dispatch:
     inputs:
       artifact_digest:
-        description: Immutable digest produced by CI
+        description: Immutable sha256 digest produced by protected CI
+        required: true
+      artifact_provenance_receipt:
+        description: Cryptographic provenance receipt binding digest, protected CI run, and source SHA
+        required: true
+      ci_run_id:
+        description: Successful protected CI workflow run ID that produced the artifact
+        required: true
+      ci_head_sha:
+        description: Exact 40-hex source revision tested by that protected CI run
         required: true
 permissions:
   contents: read
+env:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
 concurrency:
   group: cd-test
   cancel-in-progress: false
 jobs:
-  test:
-    environment: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  dispatch-guard:
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      EXPECTED_DEFAULT_REF: refs/heads/{{github_default_branch}}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_HEAD_SHA: ${{ github.sha }}
+      WORKFLOW_REF: ${{ github.ref }}
+      CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
     steps:
+      - name: Fail invalid dispatch context unconditionally
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$WORKFLOW_REF" == "$EXPECTED_DEFAULT_REF" ]]
+          [[ "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CI_HEAD_SHA" == "$WORKFLOW_HEAD_SHA" ]]
+  test:
+    needs: dispatch-guard
+    environment: test
+    runs-on: {{github_protected_runner}}
+{{github_container}}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      receipt_artifact_id: ${{ steps.upload-test-receipt.outputs.artifact-id }}
+    env:
+      ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      ARTIFACT_PROVENANCE_RECEIPT: ${{ inputs.artifact_provenance_receipt }}
+      CI_RUN_ID: ${{ inputs.ci_run_id }}
+      CI_HEAD_SHA: ${{ inputs.ci_head_sha }}
+      EXPECTED_DEFAULT_REF: refs/heads/{{github_default_branch}}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_HEAD_SHA: ${{ github.sha }}
+      WORKFLOW_REF: ${{ github.ref }}
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$WORKFLOW_EVENT_NAME" != workflow_dispatch ]] || [[ "$WORKFLOW_REF" != "$EXPECTED_DEFAULT_REF" ]]; then
+            printf '%s\n' 'test deployment requires dispatch from the confirmed default branch' >&2
+            exit 2
+          fi
+          if [[ ! "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'artifact_digest must be sha256: followed by 64 lowercase hexadecimal characters' >&2
+            exit 2
+          fi
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || [[ ! "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$CI_HEAD_SHA" != "$WORKFLOW_HEAD_SHA" ]]; then
+            printf '%s\n' 'ci_run_id and ci_head_sha must identify protected CI for this exact workflow revision' >&2
+            exit 2
+          fi
+          if (( ${#ARTIFACT_PROVENANCE_RECEIPT} > 512 )) || [[ ! "$ARTIFACT_PROVENANCE_RECEIPT" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@+=-]*$ ]] || [[ "$ARTIFACT_PROVENANCE_RECEIPT" == *".."* ]]; then
+            printf '%s\n' 'artifact_provenance_receipt is not one bounded safe identifier' >&2
+            exit 2
+          fi
+      - name: Checkout exact dispatched revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.CI_HEAD_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+      - name: Bind checkout to dispatch authority
+        shell: bash
+        run: 'test "$(git rev-parse --verify HEAD)" = "$CI_HEAD_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)"'
+      - name: Verify protected CI artifact provenance
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_ci_artifact_provenance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Fetch and verify exact CI artifact
-        run: "{{fetch_and_verify_artifact_command}} ${{ inputs.artifact_digest }}"
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{fetch_and_verify_artifact_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Deploy test artifact
         id: deploy_test
         continue-on-error: true
-        run: "{{deploy_test_command}} ${{ inputs.artifact_digest }}"
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{deploy_test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Run independent test acceptance
         id: accept_test
         if: always() && steps.deploy_test.outcome == 'success'
         continue-on-error: true
-        run: "{{test_acceptance_command}} ${{ inputs.artifact_digest }}"
-      - name: Publish digest-bound test receipt
-        id: publish_test_receipt
-        if: always()
-        continue-on-error: true
-        run: "{{publish_test_receipt_command}} ${{ inputs.artifact_digest }}"
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{test_acceptance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
       - name: Clean test runtime
         id: cleanup_test
         if: always()
         continue-on-error: true
-        run: "{{cleanup_test_command}} ${{ inputs.artifact_digest }}"
-      - name: Fail closed after receipt and cleanup
-        if: always() && (steps.deploy_test.outcome != 'success' || steps.accept_test.outcome != 'success' || steps.publish_test_receipt.outcome != 'success' || steps.cleanup_test.outcome != 'success')
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{cleanup_test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Publish digest-bound test receipt
+        id: publish_test_receipt
+        if: always() && steps.deploy_test.outcome == 'success' && steps.accept_test.outcome == 'success' && steps.cleanup_test.outcome == 'success'
+        continue-on-error: true
+        env:
+          RECEIPT_RUN_ID: ${{ github.run_id }}
+          RECEIPT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RECEIPT_HEAD_SHA: ${{ github.sha }}
+          RECEIPT_REF: ${{ github.ref }}
+          RECEIPT_DEPLOY_OUTCOME: ${{ steps.deploy_test.outcome }}
+          RECEIPT_ACCEPTANCE_OUTCOME: ${{ steps.accept_test.outcome }}
+          RECEIPT_CLEANUP_OUTCOME: ${{ steps.cleanup_test.outcome }}
+          RECEIPT_CONCLUSION: success
+          RECEIPT_PATH: ${{ runner.temp }}/agent-test-deployment-receipt.json
+        run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{publish_test_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Verify published receipt binds cleanup and this successful run
+        id: verify_test_receipt
+        if: always() && steps.publish_test_receipt.outcome == 'success'
+        env:
+          RECEIPT_RUN_ID: ${{ github.run_id }}
+          RECEIPT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RECEIPT_HEAD_SHA: ${{ github.sha }}
+          RECEIPT_REF: ${{ github.ref }}
+          RECEIPT_DEPLOY_OUTCOME: ${{ steps.deploy_test.outcome }}
+          RECEIPT_ACCEPTANCE_OUTCOME: ${{ steps.accept_test.outcome }}
+          RECEIPT_CLEANUP_OUTCOME: ${{ steps.cleanup_test.outcome }}
+          RECEIPT_CONCLUSION: success
+          RECEIPT_PATH: ${{ runner.temp }}/agent-test-deployment-receipt.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RECEIPT_PATH" <<'PY'
+          import json, os, pathlib, stat, sys
+          path=pathlib.Path(sys.argv[1]); before=path.lstat()
+          if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 262144:
+              raise SystemExit("publisher receipt is not one bounded regular file")
+          descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+          try:
+              opened=os.fstat(descriptor)
+              if (opened.st_dev,opened.st_ino,opened.st_size)!=(before.st_dev,before.st_ino,before.st_size):
+                  raise SystemExit("publisher receipt changed while opening")
+              chunks=[]; remaining=262145
+              while remaining:
+                  chunk=os.read(descriptor,min(65536,remaining))
+                  if not chunk: break
+                  chunks.append(chunk); remaining-=len(chunk)
+              raw=b"".join(chunks); after=os.fstat(descriptor)
+              if len(raw)>262144 or (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)!=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns):
+                  raise SystemExit("publisher receipt changed while reading")
+          finally: os.close(descriptor)
+          value=json.loads(raw)
+          expected={"schema":"agent-test-deployment-receipt/v2","artifact_digest":os.environ["ARTIFACT_DIGEST"],
+                    "artifact_provenance_receipt":os.environ["ARTIFACT_PROVENANCE_RECEIPT"],
+                    "ci_run_id":os.environ["CI_RUN_ID"],"ci_head_sha":os.environ["CI_HEAD_SHA"],
+                    "run_id":os.environ["RECEIPT_RUN_ID"],"run_attempt":os.environ["RECEIPT_RUN_ATTEMPT"],
+                    "head_sha":os.environ["RECEIPT_HEAD_SHA"],"ref":os.environ["RECEIPT_REF"],
+                    "deploy_outcome":"success","acceptance_outcome":"success","cleanup_outcome":"success","conclusion":"success"}
+          if value != expected: raise SystemExit("publisher receipt does not bind cleanup and this exact successful run")
+          PY
+      - name: Upload exact verified test receipt
+        id: upload-test-receipt
+        if: always() && steps.verify_test_receipt.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-test-deployment-receipt.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - name: Fail closed after cleanup and receipt
+        if: always() && (steps.deploy_test.outcome != 'success' || steps.accept_test.outcome != 'success' || steps.cleanup_test.outcome != 'success' || steps.publish_test_receipt.outcome != 'success' || steps.verify_test_receipt.outcome != 'success' || steps.upload-test-receipt.outcome != 'success')
         run: exit 1
+  publish-test-provenance:
+    needs: test
+    environment: test-receipt-publication
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download exact same-run verified test receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.test.outputs.receipt_artifact_id }}
+          path: ${{ runner.temp }}/verified-test-receipt
+      - name: Publish provenance for verified test receipt
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: ${{ runner.temp }}/verified-test-receipt/agent-test-deployment-receipt.json
+  terminal:
+    if: always()
+    needs: [dispatch-guard, test, publish-test-provenance]
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      GUARD_RESULT: ${{ needs.dispatch-guard.result }}
+      DEPLOY_RESULT: ${{ needs.test.result }}
+      PUBLISH_RESULT: ${{ needs.publish-test-provenance.result }}
+    steps:
+      - name: Require one fully authenticated same-run terminal chain
+        shell: bash
+        run: 'test "$GUARD_RESULT" = success && test "$DEPLOY_RESULT" = success && test "$PUBLISH_RESULT" = success'

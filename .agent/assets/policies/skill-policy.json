@@ -4,12 +4,7 @@
     "github.com"
   ],
   "allowed_licenses": [
-    "MIT",
-    "Apache-2.0",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "MPL-2.0"
+    "MIT"
   ],
   "minimum_score": 55,
   "maximum_candidates": 24,
@@ -26,5 +21,6 @@
     "security": 0.2,
     "trust": 0.1,
     "license": 0.05
-  }
+  },
+  "offline_content_catalogs": []
 }

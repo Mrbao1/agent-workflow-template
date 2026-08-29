@@ -2,12 +2,81 @@
 """Focused regressions for unified budget and pure state routing."""
 
 from pathlib import Path
+import ast
 import copy
 import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workflowlib import budget, state
+
+PUBLICATION_ENTRYPOINTS = {
+    "scripts/agentctl.py",
+    "scripts/artifactctl.py",
+    "scripts/blueprintacceptance.py",
+    "scripts/blueprintctl.py",
+    "scripts/contextctl.py",
+    "scripts/deliveryctl.py",
+    "scripts/evidencectl.py",
+    "scripts/evolutionctl.py",
+    "scripts/knowledgectl.py",
+    "scripts/providerctl.py",
+    "scripts/self_test_adaptive_workflow.py",
+    "scripts/self_test_budget_context_gates.py",
+    "scripts/self_test_control_gates.py",
+    "scripts/self_test_evidence_retention.py",
+    "scripts/self_test_hardening_core.py",
+    "scripts/self_test_local_decision_archive.py",
+    "scripts/self_test_neutrality_contracts.py",
+    "scripts/self_test_plugin_install_lifecycle.py",
+    "scripts/self_test_runner_trust.py",
+    "scripts/self_test_schema_contracts.py",
+    "scripts/self_test_template_lifecycle.py",
+    "scripts/self_test_templatectl.py",
+    "scripts/skillctl.py",
+    "scripts/templatectl.py",
+    "scripts/testrun.py",
+    "scripts/workflowctl.py",
+    "skills/manage-agent-team/scripts/agentledger.py",
+    "skills/manage-task-context/scripts/self_test_context.py",
+    "skills/run-ai-coding-pipeline/scripts/self_test_stage_index.py",
+    "skills/run-ai-coding-pipeline/scripts/validate_stage_index.py",
+    "skills/run-full-chain-acceptance/scripts/preflight_environment.py",
+    "skills/run-full-chain-acceptance/scripts/run_acceptance_runtime.py",
+    "skills/run-full-chain-acceptance/scripts/run_live_release_gate.py",
+    "skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py",
+    "skills/run-full-chain-acceptance/scripts/self_test_acceptance_runtime.py",
+    "skills/run-full-chain-acceptance/scripts/self_test_gate.py",
+    "skills/run-full-chain-acceptance/scripts/self_test_product_fingerprint.py",
+    "skills/run-full-chain-acceptance/scripts/self_test_workflow_release_gate.py",
+    "skills/run-full-chain-acceptance/scripts/validate_acceptance_report.py",
+}
+
+
+def main_guard(node):
+    if not isinstance(node,ast.If): return False
+    for comparison in (item for item in ast.walk(node.test) if isinstance(item,ast.Compare)):
+        values=[comparison.left,*comparison.comparators]
+        if (any(isinstance(value,ast.Name) and value.id=="__name__" for value in values)
+                and any(isinstance(value,ast.Constant) and value.value=="__main__" for value in values)):
+            return True
+    return False
+
+
+def publication_entrypoint_contract():
+    agent_root=Path(__file__).resolve().parents[1]
+    candidates=[*(agent_root/"scripts").glob("*.py"),*(agent_root/"skills").glob("*/scripts/*.py")]
+    discovered=set()
+    for path in candidates:
+        tree=ast.parse(path.read_text(encoding="utf-8"),filename=str(path))
+        guards=[node for node in tree.body if main_guard(node)]
+        if not guards: continue
+        relative=path.relative_to(agent_root).as_posix(); discovered.add(relative)
+        assert any(isinstance(node,ast.ImportFrom) and node.module=="workflowlib.publication"
+                   for node in ast.walk(tree)), relative
+        assert any(isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="run_cli"
+                   for guard in guards for node in ast.walk(guard)), relative
+    assert discovered==PUBLICATION_ENTRYPOINTS,(sorted(discovered-PUBLICATION_ENTRYPOINTS),sorted(PUBLICATION_ENTRYPOINTS-discovered))
 
 
 def fixture():
@@ -85,9 +154,11 @@ def main() -> int:
         raise AssertionError("mode downgrade was accepted")
     assert state.task_projection("governance", "standard") == "lightweight"
     assert state.task_projection("product", "standard") == "product"
-    print(json.dumps({"status": "passed", "cases": 10}, sort_keys=True))
+    publication_entrypoint_contract()
+    print(json.dumps({"status": "passed", "cases": 11}, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

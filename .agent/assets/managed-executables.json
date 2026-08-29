@@ -1,0 +1,8 @@
+{
+  "schema": "agent-managed-executable-inventory/v1",
+  "paths": [
+    "skills/run-full-chain-acceptance/scripts/run_acceptance_runtime.py",
+    "skills/run-full-chain-acceptance/scripts/self_test_gate.py",
+    "skills/run-full-chain-acceptance/scripts/validate_acceptance_report.py"
+  ]
+}

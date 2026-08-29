@@ -7,7 +7,7 @@ import os, socket, subprocess, time, urllib.request, uuid
 ROOT=Path(__file__).resolve().parents[4]
 if not (ROOT/"compose.yaml").is_file():
     print("DOCKER HTTP SELF-TEST SKIPPED: project has no compose.yaml")
-    raise SystemExit(0)
+    raise SystemExit(77)
 project="agent_http_"+uuid.uuid4().hex[:12]
 with socket.socket() as probe: probe.bind(("127.0.0.1",0)); port=probe.getsockname()[1]
 env={**os.environ,"AGENT_ACCEPTANCE_PORT":str(port)}; command=["docker","compose","-f","compose.yaml","-p",project]

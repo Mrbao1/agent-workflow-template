@@ -6,11 +6,12 @@ import datetime as dt
 
 from adaptive_common import (
     AdaptiveError, ID_RE, SHA256_RE, canonical_sha256, fail, load_blueprint, load_json,
-    mutation_lock, print_json, record_human_decision, resolve_root, utc_now, write_json,
+    mutation_lock, prepare_provider_human_decision, print_json, resolve_root, utc_now, write_json,
 )
 from skillctl import (
-    begin_state_journal, finish_state_journal, lifecycle_path, load_lifecycle, load_lock, load_policy, load_report, lock_path,
-    mutation_journal_path, recover_state_journal, validate_report_context, write_lock,
+    authorize_prepared_mutation, decision_placeholder, finalize_lock, intended_post_state, lifecycle_path, load_lifecycle,
+    load_lock, load_policy, load_report, materialized_post_state, mutation_journal_path, mutation_state,
+    prepare_mutation_journal, publish_intended_state, recover_state_journal, validate_report_context,
 )
 
 OUTCOMES = {"success", "failure", "overridden", "unused"}
@@ -278,8 +279,9 @@ def command_apply(root, args):
     approval_sha256 = canonical_sha256(approval_payload)
     if args.approve_digest != approval_sha256:
         raise AdaptiveError("EVOLUTION_APPROVAL_REQUIRED", f"approve the exact evolution action digest: {approval_sha256}")
-    decision_receipt = record_human_decision(root, gate="adaptive-evolution-apply", artifact_sha256=approval_sha256,
-                                             source=args.source, receipt=args.human_decision_receipt)
+    decision_request=prepare_provider_human_decision(root,gate="adaptive-evolution-apply",artifact_sha256=approval_sha256,
+                                                     source=args.source,receipt=args.human_decision_receipt)
+    decision_receipt=decision_placeholder(decision_request)
     skills = [dict(item) for item in lock["skills"]]
     if action["target_type"] != "skill" or action["action"] != "deprecate-after-replacement" or not action["replacement"]:
         raise AdaptiveError("EVOLUTION_NOT_APPLICABLE", "selected proposal is advisory and has no safe local transition")
@@ -291,24 +293,26 @@ def command_apply(root, args):
         raise AdaptiveError("EVOLUTION_NOT_APPLICABLE", "selected replacement identity or coverage is no longer safe")
     source["status"] = "deprecated"
     changed = [{"id": source["id"], "replacement": replacement["id"]}]
-    lifecycle = load_lifecycle(root)
-    begin_state_journal(root, lock, lifecycle, [source["id"]], {source["id"]: source["bundle_sha256"]})
+    prior_lifecycle=load_lifecycle(root); lifecycle_exists=lifecycle_path(root).exists()
+    lifecycle={"schema":prior_lifecycle["schema"],"events":[*prior_lifecycle["events"]]}
     for item in changed:
         lifecycle["events"].append({
             "action": "evolution-deprecate", "skill": item["id"], "replacement": item["replacement"],
             "plan_sha256": plan["plan_sha256"], "selected_action_sha256": action["action_sha256"],
-            "approval_payload": approval_payload, "recorded_at": utc_now(),
+            "selected_action": action, "approval_payload": approval_payload, "recorded_at": utc_now(),
             "decision": {"gate": "adaptive-evolution-apply", "source": args.source,
                          "action_sha256": approval_sha256, "receipt": decision_receipt,
                          "assurance": "human-decision-receipt"},
         })
-    current = write_lock(root, lock, {**lock, "skills": skills, "lock_sha256": None})
-    try:
-        write_json(lifecycle_path(root), lifecycle)
-    except Exception:
-        write_json(lock_path(root), lock)
-        raise
-    finish_state_journal(root)
+    post_lock=finalize_lock({**lock,"skills":skills,"lock_sha256":None})
+    pre=mutation_state(root,lock,prior_lifecycle,[source["id"]],lock_exists=True,lifecycle_exists=lifecycle_exists)
+    post=intended_post_state(root,lock,post_lock,lifecycle,[source["id"]],
+        [{"bundle_sha256":source["bundle_sha256"],"files":source["files"],"preexisting":True}])
+    journal=prepare_mutation_journal(root,operation="deprecate",action_sha256=approval_sha256,
+        gate="adaptive-evolution-apply",source=args.source,
+        approval={"kind":"provider-human-decision","request":decision_request},pre_state=pre,post_state=post)
+    journal=authorize_prepared_mutation(root,journal); publish_intended_state(root,journal)
+    current=materialized_post_state(journal)["lock"]["value"]
     print_json({"status": "applied-status-only", "deprecated": [item["id"] for item in changed], "lock_sha256": current["lock_sha256"], "external_actions": False})
     return 0
 
@@ -347,4 +351,5 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

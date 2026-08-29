@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import argparse
+import base64
 import copy
 import datetime as dt
 import fcntl
@@ -10,10 +11,24 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import signal
+import stat
 import subprocess
 import sys
-import tempfile
 from typing import Dict, List, Optional, Tuple
+from workflowlib import boundedio,boundedprocess
+
+def _reject_nonfinite_json(token):
+    raise json.JSONDecodeError(f"non-finite JSON number is forbidden: {token}",token,0)
+
+def strict_json_loads(raw,**kwargs):
+    return json.loads(raw,parse_constant=_reject_nonfinite_json,**kwargs)
+
+def strict_json_dumps(value,**kwargs):
+    kwargs["allow_nan"]=False
+    return json.dumps(value,**kwargs)
+
 
 import contexttx
 import humandecision
@@ -32,6 +47,10 @@ def find_agent_dir() -> Path:
 
 AGENT_DIR = find_agent_dir(); ROOT = AGENT_DIR.parent.resolve()
 TASK_PATH = AGENT_DIR / "state" / "TASK.json"; STAGE_PATH = AGENT_DIR / "state" / "STAGE_INDEX.md"
+CONFIG_PATH=AGENT_DIR/"config.json"; AGENTS_PATH=AGENT_DIR/"state/agents.json"
+PROJECT_INIT_LOCK_PATH=AGENT_DIR/"state/.project-init.lock"
+AGENTS_LOCK_PATH=AGENT_DIR/"state/.agents.lock"; AGENTS_CHAIN_PATH=AGENT_DIR/"state/agents-chain.jsonl"
+KNOWLEDGE_PENDING_PATH=AGENT_DIR/"state/knowledge-pending.json"
 CONTEXT_TOOL = AGENT_DIR / "scripts" / "contextctl.py"
 PHASES = {0:"bootstrap",1:"clarification",2:"structuring",3:"scope",4:"solution",5:"tests",6:"implementation",7:"acceptance",8:"delivery"}
 GATE_NODE = {"requirement":1,"solution":4,"acceptance":7,"production":8,"knowledge":8}
@@ -45,34 +64,270 @@ def supervised_env() -> Dict[str, str]:
     return os.environ.copy()
 
 
+MAX_WORKFLOW_COMMAND_OUTPUT_BYTES=1024*1024
+MAX_WORKFLOW_COMMAND_INPUT_BYTES=16*1024*1024
+
+
+def run_bounded_command(command,*,cwd=ROOT,env=None,timeout=120,pass_fds=(),input_data=None,output_limit=MAX_WORKFLOW_COMMAND_OUTPUT_BYTES):
+    return boundedprocess.run(command,cwd=cwd,env=env,timeout=timeout,pass_fds=pass_fds,input=input_data,text=True,output_limit=output_limit)
+
+
 def load(path: Path) -> Dict[str, object]:
-    value=json.loads(path.read_text(encoding="utf-8"))
+    value=strict_json_loads(bounded_file_text(path,"workflow JSON"))
     if not isinstance(value,dict): raise SystemExit(f"JSON object required: {path}")
     return value
 
 
 def atomic(path: Path, value: Dict[str, object]) -> None:
-    fd, raw=tempfile.mkstemp(prefix=f".{path.name}.",dir=str(path.parent)); temporary=Path(raw)
+    data=(strict_json_dumps(value,ensure_ascii=False,indent=2)+"\n").encode("utf-8")
+    try: boundedio.atomic_write(path,data,mode=0o600,label="workflow state")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+
+def agents_chain_advance(ledger: Dict[str, object]) -> bytes:
+    previous=bounded_file_bytes(AGENTS_PATH,"agent ledger") if AGENTS_PATH.is_file() else None; revision=ledger.get("revision")
+    if revision is None: ledger["revision"]=1; ledger["prev_sha256"]=None
+    else:
+        if not isinstance(revision,int) or isinstance(revision,bool) or revision<1 or previous is None:
+            raise SystemExit("agent ledger chain cannot advance during completion")
+        ledger["revision"]=revision+1; ledger["prev_sha256"]=hashlib.sha256(previous).hexdigest()
+    return (strict_json_dumps(ledger,ensure_ascii=False,indent=2)+"\n").encode()
+
+
+def agents_chain_journal_data(ledger: Dict[str, object],data: bytes,prior: bytes) -> bytes:
+    if len(prior)>16*1024*1024 or (prior and not prior.endswith(b"\n")):
+        raise SystemExit("agent ledger chain journal is malformed or unbounded")
+    entry={"revision":ledger["revision"],"prev_sha256":ledger["prev_sha256"],"file_sha256":hashlib.sha256(data).hexdigest()}
+    encoded=(strict_json_dumps(entry,sort_keys=True,separators=(",",":"))+"\n").encode()
+    if len(prior)+len(encoded)>16*1024*1024:
+        raise SystemExit("agent ledger chain journal exceeds its completion bound")
+    return prior+encoded
+
+
+def agents_chain_snapshot():
+    try: descriptor,relative=_open_relative_nofollow(str(AGENTS_CHAIN_PATH.relative_to(ROOT)))
+    except FileNotFoundError: return False,b""
+    except OSError as error: raise SystemExit("agent ledger chain journal is unsafe") from error
+    try: data,_identity=_read_bounded_descriptor(descriptor,"agent ledger chain journal")
+    finally: os.close(descriptor)
+    return True,data
+
+
+MAX_NODE_ARTIFACT_BYTES=16*1024*1024
+
+
+def _open_relative_nofollow(raw: str):
+    relative=Path(raw)
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise SystemExit("artifact path must be one lexical project-relative path")
+    if not hasattr(os,"O_NOFOLLOW") or not hasattr(os,"O_DIRECTORY"):
+        raise SystemExit("node artifact capture requires POSIX descriptor-relative no-follow support")
+    current=os.open(ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:
-        with os.fdopen(fd,"w",encoding="utf-8") as handle:
-            json.dump(value,handle,ensure_ascii=False,indent=2); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary,path)
-    finally:
-        if temporary.exists(): temporary.unlink()
+        for index,part in enumerate(relative.parts):
+            final=index==len(relative.parts)-1
+            descriptor=os.open(part,os.O_RDONLY|os.O_NOFOLLOW|(0 if final else os.O_DIRECTORY),dir_fd=current)
+            os.close(current); current=descriptor
+        return current,relative.as_posix()
+    except BaseException:
+        os.close(current); raise
+
+
+def _read_bounded_descriptor(descriptor: int, label: str):
+    opened=os.fstat(descriptor)
+    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1
+            or opened.st_size<0 or opened.st_size>MAX_NODE_ARTIFACT_BYTES):
+        raise SystemExit(f"{label} must be one bounded single-link regular file")
+    identity=(opened.st_dev,opened.st_ino,stat.S_IMODE(opened.st_mode),opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns)
+    chunks=[]; total=0
+    while True:
+        chunk=os.read(descriptor,min(1024*1024,MAX_NODE_ARTIFACT_BYTES+1-total))
+        if not chunk: break
+        chunks.append(chunk); total+=len(chunk)
+        if total>MAX_NODE_ARTIFACT_BYTES: raise SystemExit(f"{label} exceeds its byte limit")
+    final=os.fstat(descriptor)
+    final_identity=(final.st_dev,final.st_ino,stat.S_IMODE(final.st_mode),final.st_size,final.st_mtime_ns,final.st_ctime_ns)
+    if final_identity!=identity or total!=opened.st_size:
+        raise SystemExit(f"{label} changed while reading")
+    return b"".join(chunks),identity
+
+
+def bounded_file_bytes(path: Path,label: str) -> bytes:
+    try: relative=Path(path).relative_to(ROOT).as_posix()
+    except ValueError as error: raise SystemExit(f"{label} escapes project") from error
+    descriptor,_relative=_open_relative_nofollow(relative)
+    try: data,_identity=_read_bounded_descriptor(descriptor,label)
+    finally: os.close(descriptor)
+    return data
+
+
+def bounded_file_text(path: Path,label: str) -> str:
+    try: return bounded_file_bytes(path,label).decode("utf-8")
+    except UnicodeError as error: raise SystemExit(f"{label} is not UTF-8") from error
+
+
+def _node_capture_directory(create: bool):
+    state,_relative=_open_relative_nofollow(".agent/state")
+    try:
+        state_metadata=os.fstat(state)
+        if (not stat.S_ISDIR(state_metadata.st_mode) or state_metadata.st_uid!=os.geteuid()
+                or stat.S_IMODE(state_metadata.st_mode)&0o022):
+            raise SystemExit("node artifact state parent is unsafe")
+        if create:
+            try: os.mkdir("evidence",0o700,dir_fd=state)
+            except FileExistsError: pass
+        parent=os.open("evidence",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=state)
+    finally: os.close(state)
+    try:
+        parent_metadata=os.fstat(parent)
+        if (not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid!=os.geteuid()
+                or stat.S_IMODE(parent_metadata.st_mode)&0o022):
+            raise SystemExit("node artifact evidence parent is unsafe")
+        if create:
+            try: os.mkdir("node-artifact-captures",0o700,dir_fd=parent)
+            except FileExistsError: pass
+        descriptor=os.open("node-artifact-captures",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+    finally: os.close(parent)
+    metadata=os.fstat(descriptor)
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.geteuid()
+            or stat.S_IMODE(metadata.st_mode)&0o022):
+        os.close(descriptor); raise SystemExit("node artifact capture directory is unsafe")
+    return descriptor
+
+
+def _seal_node_artifact(data: bytes, digest: str) -> str:
+    relative=f".agent/state/evidence/node-artifact-captures/{digest}.artifact"; name=f"{digest}.artifact"
+    directory=_node_capture_directory(True); flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW
+    try:
+        try: descriptor=os.open(name,flags,0o400,dir_fd=directory)
+        except FileExistsError:
+            descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+            try: observed,_identity=_read_bounded_descriptor(descriptor,"sealed node artifact")
+            finally: os.close(descriptor)
+            if observed!=data: raise SystemExit("sealed node artifact content-address collision")
+            return relative
+        try:
+            view=memoryview(data)
+            while view: view=view[os.write(descriptor,view):]
+            os.fchmod(descriptor,0o400); os.fsync(descriptor)
+        finally: os.close(descriptor)
+        os.fsync(directory)
+        return relative
+    finally: os.close(directory)
+
+
+def node_artifact(raw: str, *, seal: bool = True) -> Dict[str, object]:
+    try: descriptor,relative=_open_relative_nofollow(raw)
+    except OSError as error: raise SystemExit(f"artifact missing or unsafe: {raw}") from error
+    try: data,identity=_read_bounded_descriptor(descriptor,"node artifact")
+    finally: os.close(descriptor)
+    if b"{{" in data: raise SystemExit("artifact contains unresolved template placeholders")
+    digest=hashlib.sha256(data).hexdigest(); sealed_path=(
+        _seal_node_artifact(data,digest) if seal else f".agent/state/evidence/node-artifact-captures/{digest}.artifact"
+    )
+    dev,inode,mode,size,mtime_ns,ctime_ns=identity
+    capture={"schema":"agent-node-artifact-capture/v1","path":relative,"sha256":digest,"bytes":len(data),"sealed_path":sealed_path,
+             "source":{"device":dev,"inode":inode,"mode":mode,"size":size,"mtime_ns":mtime_ns,"ctime_ns":ctime_ns}}
+    if seal:
+        prefix=f"{digest}-{hashlib.sha256(relative.encode()).hexdigest()}"
+        capture_name=f"{prefix}-{canonical_sha256(capture)}.json"
+        encoded=strict_json_dumps(capture,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+        directory=_node_capture_directory(True)
+        try:
+            try: descriptor=os.open(capture_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=directory)
+            except FileExistsError:
+                descriptor=os.open(capture_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+                try: existing,_=_read_bounded_descriptor(descriptor,"node artifact capture record")
+                finally: os.close(descriptor)
+                if existing!=encoded: raise SystemExit("node artifact provenance content-address collision")
+            else:
+                try:
+                    view=memoryview(encoded)
+                    while view: view=view[os.write(descriptor,view):]
+                    os.fchmod(descriptor,0o400); os.fsync(descriptor)
+                finally: os.close(descriptor)
+                os.fsync(directory)
+        finally: os.close(directory)
+    return {"path":relative,"sha256":digest,"bytes":len(data)}
+
+
+def node_capture_paths(record: Dict[str,object]):
+    relative=str(record.get("path","")); digest=str(record.get("sha256",""))
+    prefix=f"{digest}-{hashlib.sha256(relative.encode()).hexdigest()}-"
+    try: directory=_node_capture_directory(False)
+    except OSError as error: raise SystemExit("node artifact capture inventory is missing or unsafe") from error
+    before=os.fstat(directory); identity=lambda value:(value.st_dev,value.st_ino,value.st_mode,value.st_mtime_ns,value.st_ctime_ns)
+    matches=[]; observed=0
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                observed+=1
+                if observed>4096: raise SystemExit("node artifact capture directory is unbounded")
+                if not entry.name.startswith(prefix) or not entry.name.endswith(".json"): continue
+                metadata=entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink!=1:
+                    raise SystemExit("node artifact capture inventory contains an unsafe matching entry")
+                matches.append(entry.name)
+        after=os.fstat(directory)
+    except BaseException:
+        os.close(directory); raise
+    if identity(after)!=identity(before):
+        os.close(directory); raise SystemExit("node artifact capture inventory changed during enumeration")
+    matches.sort()
+    if not matches or len(matches)>64:
+        os.close(directory); raise SystemExit("node artifact capture inventory is missing or unbounded")
+    return directory,matches,identity(before)
+
+
+def load_node_captures(record: Dict[str,object]):
+    values=[]; directory,names,directory_identity=node_capture_paths(record)
+    try:
+        for name in names:
+            descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+            try: raw,_identity=_read_bounded_descriptor(descriptor,"node artifact capture record")
+            finally: os.close(descriptor)
+            try: value=strict_json_loads(raw.decode("utf-8"))
+            except (UnicodeError,json.JSONDecodeError) as error: raise SystemExit("node artifact capture record is invalid") from error
+            if (not isinstance(value,dict) or set(value)!={"schema","path","sha256","bytes","sealed_path","source"}
+                    or value.get("schema")!="agent-node-artifact-capture/v1"
+                    or any(value.get(key)!=record.get(key) for key in ("path","sha256","bytes"))
+                    or name.rsplit("-",1)[-1]!=canonical_sha256(value)+".json"):
+                raise SystemExit("node artifact capture record does not bind the accepted record")
+            values.append(value)
+        after=os.fstat(directory)
+        if (after.st_dev,after.st_ino,after.st_mode,after.st_mtime_ns,after.st_ctime_ns)!=directory_identity:
+            raise SystemExit("node artifact capture inventory changed during loading")
+    finally: os.close(directory)
+    return values
+
+
+def load_node_capture(record: Dict[str,object]):
+    return load_node_captures(record)[0]
+
+
+def node_capture_matches_source(record: Dict[str,object]) -> bool:
+    try:
+        captures=load_node_captures(record); descriptor,_=_open_relative_nofollow(str(record.get("path","")))
+        try: data,identity=_read_bounded_descriptor(descriptor,"node artifact source revalidation")
+        finally: os.close(descriptor)
+        dev,inode,mode,size,mtime_ns,ctime_ns=identity
+        expected_source={"device":dev,"inode":inode,"mode":mode,"size":size,"mtime_ns":mtime_ns,"ctime_ns":ctime_ns}
+        return (any(capture.get("source")==expected_source for capture in captures)
+                and hashlib.sha256(data).hexdigest()==record.get("sha256") and len(data)==record.get("bytes"))
+    except (OSError,SystemExit,KeyError,TypeError):
+        return False
 
 
 def artifact(raw: str) -> Dict[str, object]:
-    path=(ROOT/raw).resolve()
-    try: relative=str(path.relative_to(ROOT))
-    except ValueError: raise SystemExit("artifact escapes project")
-    if not path.is_file() or path.is_symlink(): raise SystemExit(f"artifact missing: {relative}")
-    data=path.read_bytes()
+    try: descriptor,relative=_open_relative_nofollow(raw)
+    except OSError as error: raise SystemExit(f"artifact missing or unsafe: {raw}") from error
+    try: data,_identity=_read_bounded_descriptor(descriptor,"workflow artifact")
+    finally: os.close(descriptor)
     if b"{{" in data: raise SystemExit("artifact contains unresolved template placeholders")
     return {"path":relative,"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)}
 
 
 def canonical_sha256(value: object) -> str:
-    encoded=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",", ":")).encode()
+    encoded=strict_json_dumps(value,ensure_ascii=False,sort_keys=True,separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -89,6 +344,7 @@ def decision_packet(task: Dict[str, object], gate: str, record: Dict[str, object
         "production": "Approve the proposed production promotion decision?",
         "knowledge": "Approve promotion of the proposed reusable knowledge?",
     }
+
     return {
         "schema": "agent-decision-packet/v1",
         "gate": gate,
@@ -101,6 +357,59 @@ def decision_packet(task: Dict[str, object], gate: str, record: Dict[str, object
         "reply": "Reply approve, or reject with the requested changes.",
         "artifact": record,
     }
+
+def _project_json(relative: str,label: str,max_bytes: int=65536):
+    descriptor,normalized=_open_relative_nofollow(relative)
+    try: data,_identity=_read_bounded_descriptor(descriptor,label)
+    finally: os.close(descriptor)
+    if len(data)>max_bytes: raise SystemExit(f"{label} exceeds {max_bytes} bytes")
+    try: value=strict_json_loads(data.decode("utf-8"))
+    except (UnicodeDecodeError,json.JSONDecodeError) as error: raise SystemExit(f"{label} is not strict UTF-8 JSON: {error}")
+    if not isinstance(value,dict): raise SystemExit(f"{label} must be a JSON object")
+    return value,{"path":normalized,"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)}
+
+
+def capture_knowledge_candidates(paths,allowed_evidence):
+    if not paths: return []
+    registry,_record=_project_json(".agent/project/knowledge/registry.json","knowledge registry",262144)
+    entries=registry.get("entries") if registry.get("schema")=="agent-knowledge-registry/v1" else None
+    if not isinstance(entries,list): raise SystemExit("knowledge candidates require a valid project knowledge registry")
+    owners={entry.get("id"):entry for entry in entries if isinstance(entry,dict) and entry.get("status")=="active" and isinstance(entry.get("owners"),list) and entry.get("owners")}
+    captured=[]; now=dt.datetime.now(dt.timezone.utc)
+    required={"schema","rule","observation","evidence_sha256","reuse_scope","counterexample","expires_at","owner_id"}
+    for path in paths:
+        value,source=_project_json(path,"knowledge candidate")
+        if set(value)!=required or value.get("schema")!="agent-knowledge-candidate/v1": raise SystemExit("knowledge candidate fields are invalid")
+        for key in ("rule","observation","reuse_scope","counterexample","owner_id"):
+            if not isinstance(value.get(key),str) or not value[key].strip() or len(value[key].encode())>4096: raise SystemExit(f"knowledge candidate {key} is invalid")
+        evidence=value.get("evidence_sha256")
+        if not isinstance(evidence,list) or not evidence or evidence!=sorted(set(evidence)) or any(not isinstance(item,str) or re.fullmatch(r"[0-9a-f]{64}",item) is None for item in evidence) or not set(evidence)<=allowed_evidence:
+            raise SystemExit("knowledge candidate evidence must be a sorted non-empty subset of accepted completion evidence")
+        if value["owner_id"] not in owners: raise SystemExit("knowledge candidate must target an existing active registry owner/topic")
+        try: expiry=dt.datetime.fromisoformat(value["expires_at"].replace("Z","+00:00"))
+        except (ValueError,AttributeError): raise SystemExit("knowledge candidate expiry is invalid")
+        if expiry.tzinfo is None or not now<expiry<=now+dt.timedelta(days=365): raise SystemExit("knowledge candidate expiry must be in the next 365 days")
+        normalized={key:(value[key].strip() if isinstance(value[key],str) and key!="expires_at" else value[key]) for key in required}
+        normalized["source_artifact"]=source; normalized["candidate_id"]=hashlib.sha256(strict_json_dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+        captured.append(normalized)
+    ids=[item["candidate_id"] for item in captured]
+    if len(ids)!=len(set(ids)): raise SystemExit("knowledge candidates must be supplied once")
+    return sorted(captured,key=lambda item:item["candidate_id"])
+
+
+def knowledge_pending_side_effect(task,candidates):
+    if not candidates: return None
+    if KNOWLEDGE_PENDING_PATH.exists() or KNOWLEDGE_PENDING_PATH.is_symlink():
+        pending,_record=_project_json(".agent/state/knowledge-pending.json","knowledge pending registry",1048576)
+        if pending.get("schema")!="agent-knowledge-pending/v2" or not isinstance(pending.get("candidates"),list) or not isinstance(pending.get("promotions"),list):
+            raise SystemExit("knowledge pending registry requires explicit migration to v2")
+    else: pending={"schema":"agent-knowledge-pending/v2","candidates":[],"promotions":[]}
+    existing={item.get("candidate_id") for item in pending["candidates"] if isinstance(item,dict)}; recorded=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    for candidate in candidates:
+        if candidate["candidate_id"] in existing: raise SystemExit("knowledge candidate already exists")
+        pending["candidates"].append({**candidate,"task_generation_id":task["task_generation_id"],"task_title":task["title"],"completion_binding_sha256":hashlib.sha256(strict_json_dumps(task["completion_binding"],sort_keys=True,separators=(",",":")).encode()).hexdigest(),"recorded_at":recorded,"status":"pending"})
+    pending["candidates"]=sorted(pending["candidates"],key=lambda item:item["candidate_id"])
+    return KNOWLEDGE_PENDING_PATH,(strict_json_dumps(pending,ensure_ascii=False,indent=2)+"\n").encode()
 
 
 def decision_next_action(packet: Dict[str, object]) -> str:
@@ -190,7 +499,7 @@ def _rollback_chain_depth(head: Dict[str, object]) -> int:
         digest = str(current.get("sha256", ""))
         path = ROOT / ".agent/state/evidence/rollback-archives" / f"{digest}.json"
         try:
-            value = json.loads(path.read_bytes())
+            value = strict_json_loads(bounded_file_bytes(path,"workflow artifact"))
         except (OSError, json.JSONDecodeError):
             break
         previous = value.get("previous") if isinstance(value, dict) else None
@@ -224,7 +533,7 @@ def compact_rollback_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
         "previous": None if snapshot else previous,
         "entries": entries,
     }
-    data = json.dumps(
+    data = strict_json_dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode() + b"\n"
     digest = hashlib.sha256(data).hexdigest()
@@ -286,7 +595,7 @@ def compact_failure_state(task: Dict[str, object]) -> List[Tuple[Path, bytes]]:
             for key in sorted(counts if snapshot else delta)
         },
     }
-    data = json.dumps(
+    data = strict_json_dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode() + b"\n"
     digest = hashlib.sha256(data).hexdigest()
@@ -348,14 +657,31 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
         and binding.get("accepted_artifact_set_sha256") == canonical_sha256(historical_artifact_set)
         and binding.get("terminal_artifact_sha256") == historical_node8.get("sha256")
     )
+    legacy_binding_fields={
+        "schema","accepted_artifact_set_sha256","terminal_artifact_sha256",
+        "release_approval_sha256","completion_platform_snapshot_sha256",
+        "completion_decision_source","completion_decision_receipt",
+    }
+    v2_binding_fields=legacy_binding_fields|{"completed_model","candidate_sha256"}
+    binding_shape_valid=(
+        (binding.get("schema")=="agent-completion-binding/v1" and set(binding)==legacy_binding_fields)
+        or (
+            binding.get("schema")=="agent-completion-binding/v2" and set(binding)==v2_binding_fields
+            and binding.get("completed_model")==task.get("completed_model")
+            and isinstance(binding.get("completed_model"),str) and bool(binding.get("completed_model"))
+            and re.fullmatch(r"[0-9a-f]{64}",str(binding.get("candidate_sha256",""))) is not None
+        )
+    ) if isinstance(binding,dict) else False
+    candidate_binding_valid=binding.get("schema")=="agent-completion-binding/v1"
+    if isinstance(binding,dict) and binding.get("schema")=="agent-completion-binding/v2":
+        try:
+            import testrun as supervised_test
+            candidate_binding_valid=supervised_test.candidate_fingerprint(load(CONFIG_PATH))==binding.get("candidate_sha256")
+        except (SystemExit,OSError,UnicodeError,ValueError,TypeError,KeyError,ImportError): candidate_binding_valid=False
     binding_valid=(
         isinstance(binding,dict)
-        and set(binding)=={
-            "schema","accepted_artifact_set_sha256","terminal_artifact_sha256",
-            "release_approval_sha256","completion_platform_snapshot_sha256",
-            "completion_decision_source","completion_decision_receipt",
-        }
-        and binding.get("schema")=="agent-completion-binding/v1"
+        and binding_shape_valid
+        and candidate_binding_valid
         and artifact_binding_valid
         and binding.get("release_approval_sha256")==(
             canonical_sha256(approval) if task.get("mode")=="release" else None
@@ -366,12 +692,18 @@ def completion_checkpoint_valid(task: Dict[str, object]) -> bool:
             if task.get("mode")=="release" else binding.get("completion_decision_source")=="not_required"
         )
         and (
-            task.get("decision_policy_version")!=1
-            or humandecision.reverify(
-                ROOT,load(AGENT_DIR/"config.json"),task,gate="completion",
-                artifact_sha256=str(binding.get("completion_platform_snapshot_sha256")),
-                source=str(binding.get("completion_decision_source")),
-                record=binding.get("completion_decision_receipt"),
+            (
+                task.get("mode")=="release"
+                and humandecision.reverify(
+                    ROOT,load(AGENT_DIR/"config.json"),task,gate="completion",
+                    artifact_sha256=str(binding.get("completion_platform_snapshot_sha256")),
+                    source=str(binding.get("completion_decision_source")),
+                    record=binding.get("completion_decision_receipt"),
+                )
+            )
+            or (
+                task.get("mode")!="release"
+                and binding.get("completion_decision_receipt") is None
             )
         )
         and isinstance(last_snapshot,dict)
@@ -443,18 +775,9 @@ def release_acceptance_approval_valid(task: Dict[str, object], approval: object,
     release_pair={"platform_transcript_verified_sha256","supervision_debt_waiver_sha256"}
     base={"source","artifact_sha256",*release_pair}
     version=task.get("decision_policy_version")
-    if version==humandecision.PROVIDER_POLICY_VERSION:
-        expected_shapes={frozenset(base|{"decision_receipt"})}
-    elif version==humandecision.LOCAL_POLICY_VERSION:
-        # command_approve mints base+assurance+pair+routing_profile under the
-        # local boundary; the profile-free shape is the pre-binding legacy
-        # record humandecision.local_approval_valid still grandfathered.
-        expected_shapes={
-            frozenset(base|{"assurance"}),
-            frozenset(base|{"assurance","routing_profile_sha256"}),
-        }
-    else:
-        expected_shapes={frozenset(base)}
+    if version!=humandecision.PROVIDER_POLICY_VERSION:
+        return False
+    expected_shapes={frozenset(base|{"decision_receipt"})}
     return (
         frozenset(approval) in expected_shapes
         and human_gate_approval_valid(task,"acceptance",approval,record)
@@ -472,20 +795,9 @@ def human_gate_approval_valid(task: Dict[str, object], gate: str, approval: obje
     if not source.startswith("user:") or approval.get("artifact_sha256")!=digest:
         return False
     if task.get("decision_policy_version") == humandecision.LOCAL_POLICY_VERSION:
-        try:
-            config = load(AGENT_DIR / "config.json")
-        except SystemExit:
-            if task.get("mode") == "release":
-                # Fail closed: without the config the retroactive
-                # allow_current_chat_local_release withdrawal recheck cannot
-                # run, so a stored release approval is unverifiable.
-                return False
-            config = None
-        return humandecision.local_approval_valid(
-            task, approval, source=source, artifact_sha256=digest, config=config,
-        )
+        return False
     if task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION:
-        return True
+        return False
     try:
         return humandecision.reverify(
             ROOT,load(AGENT_DIR/"config.json"),task,gate=gate,artifact_sha256=digest,
@@ -506,11 +818,11 @@ def legacy_node8_archive_record(record: object) -> Optional[Dict[str, object]]:
         return None
     if not path.is_file() or path.is_symlink():
         return None
-    data = path.read_bytes()
+    data = bounded_file_bytes(path,"workflow artifact")
     if record != {"path": str(path.relative_to(ROOT)), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}:
         return None
     try:
-        node8 = json.loads(data)
+        node8 = strict_json_loads(data)
         delivery = load(AGENT_DIR / "state/delivery.json")
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -534,13 +846,13 @@ def legacy_node8_archive_record(record: object) -> Optional[Dict[str, object]]:
         return None
     if not archived_path.is_file() or archived_path.is_symlink():
         return None
-    archived_bytes = archived_path.read_bytes()
+    archived_bytes = bounded_file_bytes(archived_path,"archived workflow artifact")
     expected = {
         "path": str(archived_path.relative_to(ROOT)),
         "sha256": hashlib.sha256(archived_bytes).hexdigest(), "bytes": len(archived_bytes),
     }
     try:
-        archived_value = json.loads(archived_bytes)
+        archived_value = strict_json_loads(archived_bytes)
     except (UnicodeError, json.JSONDecodeError):
         return None
     if (
@@ -569,8 +881,8 @@ def validate_provenance_bound_node_template(
         "source_path","source_sha256","source_bytes",
     }
     manifest_path=AGENT_DIR/"templates/manifest.json"
-    manifest_data=manifest_path.read_bytes()
-    manifest=json.loads(manifest_data)
+    manifest_data=bounded_file_bytes(manifest_path,"template manifest")
+    manifest=strict_json_loads(manifest_data)
     templates=manifest.get("templates",[]) if isinstance(manifest,dict) else []
     entries=[item for item in templates if isinstance(item,dict) and item.get("id")==template_id]
     route=task.get("template_route")
@@ -599,8 +911,8 @@ def validate_provenance_bound_node_template(
     if (
         not source.is_file() or source.is_symlink()
         or rendered.get("source_path")!=expected_source
-        or rendered.get("source_sha256")!=hashlib.sha256(source.read_bytes()).hexdigest()
-        or rendered.get("source_bytes")!=len(source.read_bytes())
+        or rendered.get("source_sha256")!=hashlib.sha256(bounded_file_bytes(source,"rendered template source")).hexdigest()
+        or rendered.get("source_bytes")!=len(bounded_file_bytes(source,"rendered template source"))
     ):
         raise SystemExit(f"node {node} requires current provenance-bound {template_id} source evidence")
 
@@ -616,8 +928,76 @@ def validate_node_artifact(task: Dict[str, object], node: int, record: Dict[str,
         raise SystemExit(f"node {node} artifact must use the canonical {node:02d}- prefix")
     if node==4 and task.get("mode")=="release": adapter(task)
     if node in {6,7,8}:
-        result=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/artifactctl.py"),"--node",str(node),"--path",str(record["path"])],cwd=str(ROOT),text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120,env=supervised_env())
+        try: capture=load_node_capture(record)
+        except (OSError,SystemExit): capture=None
+        raw_snapshot=capture.get("sealed_path") if isinstance(capture,dict) else record.get("path")
+        try: descriptor,_relative=_open_relative_nofollow(str(raw_snapshot))
+        except OSError as error: raise SystemExit("node artifact snapshot is missing or unsafe") from error
+        try:
+            snapshot_data,_identity=_read_bounded_descriptor(descriptor,"node artifact semantic snapshot")
+            os.lseek(descriptor,0,os.SEEK_SET)
+            if hashlib.sha256(snapshot_data).hexdigest()!=record.get("sha256") or len(snapshot_data)!=record.get("bytes"):
+                raise SystemExit("node artifact semantic snapshot differs from its capture record")
+            result=run_bounded_command([sys.executable,str(AGENT_DIR/"scripts/artifactctl.py"),"--node",str(node),"--path",str(record["path"]),"--snapshot-fd",str(descriptor)],cwd=ROOT,timeout=120,env=supervised_env(),pass_fds=(descriptor,))
+        finally: os.close(descriptor)
         if result.returncode: raise SystemExit(result.stdout)
+
+
+MANDATORY_SCOPE_RISK_MARKERS = {
+    "security": ("segment:auth", "segment:crypto", "segment:security", "segment:secrets", "segment:iam", "suffix:.pem", "suffix:.key"),
+    "migration": ("contains:migration",),
+    "deploy": ("segment:deploy", "segment:deployment", "segment:ci", "segment:.circleci", "segment:.buildkite",
+               "basename:.gitlab-ci.yml", "basename:jenkinsfile", "basename:azure-pipelines.yml", "basename:bitbucket-pipelines.yml",
+               "contains:.github/workflows/", "contains:.gitlab/ci/"),
+    "external_impact": ("segment:deploy", "segment:deployment", "segment:production", "segment:infra", "segment:ci",
+                        "segment:.circleci", "segment:.buildkite", "basename:.gitlab-ci.yml", "basename:jenkinsfile",
+                        "basename:azure-pipelines.yml", "basename:bitbucket-pipelines.yml",
+                        "contains:.github/workflows/", "contains:.gitlab/ci/"),
+}
+
+
+def scope_risk_markers() -> Dict[str, Tuple[str, ...]]:
+    merged = {name: list(markers) for name, markers in MANDATORY_SCOPE_RISK_MARKERS.items()}
+    config = load(AGENT_DIR / "config.json")
+    workflow = config.get("workflow", {})
+    custom = workflow.get("actual_scope_risk_markers", {}) if isinstance(workflow, dict) else None
+    if not isinstance(custom, dict):
+        raise SystemExit("workflow.actual_scope_risk_markers must be an object")
+    known = set(MANDATORY_SCOPE_RISK_MARKERS) | {"data_risk", "cross_system", "uncertain", "compliance"}
+    for risk, markers in custom.items():
+        if risk not in known or not isinstance(markers, list) or not markers or len(markers) > 64:
+            raise SystemExit("workflow.actual_scope_risk_markers contains an invalid risk rule")
+        for value in markers:
+            if (not isinstance(value, str) or len(value) > 160
+                    or not value.startswith(("segment:", "basename:", "prefix:", "suffix:", "contains:"))
+                    or not value.split(":", 1)[1]):
+                raise SystemExit("workflow.actual_scope_risk_markers contains an invalid path marker")
+            merged.setdefault(risk, []).append(value.lower())
+    return {name: tuple(dict.fromkeys(values)) for name, values in merged.items()}
+
+
+def normalized_governed_path(value: object) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise SystemExit("node 6 change path is not canonical POSIX relative syntax")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise SystemExit("node 6 change path is not canonical POSIX relative syntax")
+    return "/".join(value.lower().split("/"))
+
+
+def marker_matches(path: str, marker: str) -> bool:
+    kind, needle = marker.split(":", 1); parts = path.split("/")
+    if kind == "segment": return needle in parts
+    if kind == "basename": return parts[-1] == needle
+    if kind == "prefix": return path.startswith(needle)
+    if kind == "suffix": return path.endswith(needle)
+    return needle in path
+
+
+def classify_actual_scope(paths: List[str]) -> List[str]:
+    rules = scope_risk_markers(); normalized = [normalized_governed_path(path) for path in paths]
+    return sorted(risk for risk, markers in rules.items()
+                  if any(marker_matches(path, value) for path in normalized for value in markers))
 
 
 def actual_scope_gate(task: Dict[str, object], record: Dict[str, object]) -> None:
@@ -627,18 +1007,7 @@ def actual_scope_gate(task: Dict[str, object], record: Dict[str, object]) -> Non
     governed=[path for path in paths if not path.startswith(".agent/state/")]
     if not governed:
         raise SystemExit("node 6 requires at least one actual product/control-plane owned change")
-    observed_risks=[]
-    lower=[path.lower() for path in governed]
-    sensitive=[path for path in governed if path.lower().startswith(("auth/","crypto/","security/","secrets/")) or path.lower().endswith((".pem",".key"))]
-    if sensitive:
-        print(
-            "WARNING: governed changes touch security-sensitive paths: "
-            + ", ".join(sensitive)
-            + "; confirm the declared mode or escalate with "
-            "`python3 .agent/scripts/agentctl.py escalate-mode --reapprove --source user:<decision>`"
-        )
-    if any("migration" in path for path in lower): observed_risks.append("migration")
-    if any(path.startswith((".github/workflows/", "deploy/", "production/", "infra/")) for path in lower): observed_risks.append("external_impact")
+    observed_risks=classify_actual_scope(governed)
     missing=[name for name in observed_risks if task.get("risk_flags",{}).get(name) is not True]
     observed_files=max(len(governed),int(task.get("files",0)))
     risks=dict(task.get("risk_flags",{})); risks.update({name:True for name in observed_risks})
@@ -704,11 +1073,10 @@ def adapter(task: Dict[str, object]):
         blueprint=AGENT_DIR/"project/BLUEPRINT.json"; runner=AGENT_DIR/"scripts/blueprintacceptance.py"
         if not digest or not blueprint.is_file() or blueprint.is_symlink() or not runner.is_file() or runner.is_symlink():
             raise SystemExit("release requires one legacy adapter or a confirmed blueprint acceptance contract")
-        result=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/blueprintctl.py"),"--root",str(ROOT),"check","--require-confirmed","--expect-design-sha256",digest],
-                              cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30,env=supervised_env())
+        result=run_bounded_command([sys.executable,str(AGENT_DIR/"scripts/blueprintctl.py"),"--root",str(ROOT),"check","--require-confirmed","--expect-design-sha256",digest],cwd=ROOT,timeout=30,env=supervised_env())
         if result.returncode: raise SystemExit("confirmed blueprint acceptance contract is stale")
-        raw=blueprint.read_bytes()
-        return "adaptive-blueprint",{"implemented":True,"runner":str(runner.relative_to(ROOT)),"receipt_schema":"agent-blueprint-acceptance/v2"},{
+        raw=bounded_file_bytes(blueprint,"confirmed blueprint")
+        return "adaptive-blueprint",{"implemented":True,"runner":str(runner.relative_to(ROOT)),"receipt_schema":"agent-blueprint-acceptance/v4"},{
             "template_id":"adaptive-blueprint","path":str(blueprint.relative_to(ROOT)),"sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw)}
     if len(selected)!=1: raise SystemExit("release selects multiple legacy acceptance adapters")
     adapter_id=selected[0]; entry=registry[adapter_id]
@@ -733,10 +1101,9 @@ def replay_release_gate(task: Dict[str, object], acceptance_record: Dict[str, ob
     if not live_path.is_file() or live_path.is_symlink(): raise SystemExit("release receipt is missing")
     # Node completion is verification-only for every adapter.  The integrator
     # owns the sole `run`; this path must never start tests or execute cleanup.
-    result=subprocess.run(
+    result=run_bounded_command(
         [sys.executable,str(ROOT/entry["runner"]),"verify","--runner",str(rendered["path"]),"--receipt",str(live_path.relative_to(ROOT))],
-        cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120,
-        env=supervised_env(),
+        cwd=ROOT,timeout=120,env=supervised_env(),
     )
     if result.returncode: raise SystemExit(f"registered release adapter receipt is stale or invalid for {adapter_id}:\n"+result.stdout)
 
@@ -770,26 +1137,14 @@ def requirement_gate_error(task: Dict[str, object]) -> Optional[str]:
     contract = AGENT_DIR / "state" / "REQUIREMENT_CONTRACT.md"
     if (
         not str(source or "").startswith("user:")
-        or (
-            task.get("decision_policy_version") in {
-                humandecision.PROVIDER_POLICY_VERSION,
-                humandecision.LOCAL_POLICY_VERSION,
-            }
-            and not human_gate_approval_valid(
-                task,"requirement",approval,
-                {"path":".agent/state/REQUIREMENT_CONTRACT.md","sha256":contract_hash,"bytes":len(contract.read_bytes()) if contract.is_file() else 0},
-            )
-        )
-        or (
-            task.get("decision_policy_version") not in {
-                humandecision.PROVIDER_POLICY_VERSION,
-                humandecision.LOCAL_POLICY_VERSION,
-            }
-            and not str(approval or "").startswith("user:")
+        or task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION
+        or not human_gate_approval_valid(
+            task,"requirement",approval,
+            {"path":".agent/state/REQUIREMENT_CONTRACT.md","sha256":contract_hash,"bytes":len(bounded_file_bytes(contract,"requirement contract")) if contract.is_file() else 0},
         )
         or not re.fullmatch(r"[0-9a-f]{64}", contract_hash)
         or not contract.is_file()
-        or hashlib.sha256(contract.read_bytes()).hexdigest() != contract_hash
+        or hashlib.sha256(bounded_file_bytes(contract,"requirement contract")).hexdigest() != contract_hash
         or task.get("mode_status") != "confirmed"
     ):
         return "workflow progression lacks a valid user-bound requirement contract"
@@ -849,11 +1204,11 @@ def failure_escalation_gate(task: Dict[str, object]) -> None:
 def run_checked(command: List[str], label: str, timeout: int = 120) -> None:
     """Run a bounded mutator subprocess; failures and hangs become structured errors."""
     try:
-        result=subprocess.run(command,cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
+        result=run_bounded_command(command,cwd=ROOT,timeout=timeout)
     except subprocess.TimeoutExpired:
         raise SystemExit(f"{label}: timed out after {timeout}s")
     if result.returncode:
-        detail=result.stdout.decode("utf-8",errors="replace").strip().replace("\n"," | ")[:2000]
+        detail=result.stdout.strip().replace("\n"," | ")[:2000]
         raise SystemExit(label + (f": {detail}" if detail else ""))
 
 
@@ -867,9 +1222,8 @@ def execution_gate(task: Dict[str, object], action: str) -> None:
     if isinstance(current, int) and current >= 2 and accepted != expected:
         raise SystemExit("workflow sequence is discontinuous; accepted nodes must exactly precede current_node")
     try:
-        result = subprocess.run(
-            [sys.executable, str(AGENT_DIR / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
-            cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+        result=run_bounded_command(
+            [sys.executable,str(AGENT_DIR/"scripts"/"agentctl.py"),"budget-gate","--action",action],cwd=ROOT,timeout=120,
         )
     except subprocess.TimeoutExpired:
         raise SystemExit(f"budget gate timed out before deciding {action}")
@@ -919,9 +1273,9 @@ def command_approve(args: argparse.Namespace) -> int:
             receipt=args.human_decision_receipt,
         )
     elif decision_policy_version == humandecision.LOCAL_POLICY_VERSION:
-        if args.human_decision_receipt:
-            raise SystemExit("local user-message approval does not accept an unaudited provider receipt")
-        approval = humandecision.local_approval(args.source, args.artifact_sha256, task)
+        raise SystemExit("local user-message evidence is advisory only and cannot authorize a workflow gate")
+    else:
+        raise SystemExit("workflow gate decision policy is unsupported")
     if args.gate=="acceptance" and task.get("mode")=="release":
         pending_path=(ROOT/str(pending.get("path",""))).resolve(); value=load(pending_path)
         observation_digest=value.get("platform_observation_set_sha256")
@@ -959,7 +1313,7 @@ def command_advance(args: argparse.Namespace) -> int:
     if task.get("status") not in {"in_progress","waiting_human"} or (task.get("current_node")!=node and not projected):
         raise SystemExit("advance must match the active node")
     if node<2 or node>8: raise SystemExit("nodes 0-1 use bootstrap/requirement commands")
-    record=artifact(args.artifact)
+    record=node_artifact(args.artifact)
     if node==6: actual_scope_gate(task,record)
     validate_node_artifact(task,node,record)
     if node == 8:
@@ -978,6 +1332,8 @@ def command_advance(args: argparse.Namespace) -> int:
     task.pop("failure_escalation",None)
     if isinstance(task.get("gate_approvals"),dict): task["gate_approvals"].pop("failure-escalation",None)
     artifacts=task.setdefault("node_artifacts",{}); artifacts[str(node)]=record
+    task["node_artifact_capture_version"]=1
+    task["node_artifact_capture_nodes"]=sorted(set([*task.get("node_artifact_capture_nodes",[]),node]))
     additions=[2,3,4,5,6] if projected else [node]
     accepted=sorted(set([*task.setdefault("accepted_nodes",[]),*additions])); task["accepted_nodes"]=accepted
     next_node=node+1
@@ -1104,7 +1460,18 @@ def command_compact_state() -> int:
 
 
 def command_complete(args: argparse.Namespace) -> int:
-    task=load(TASK_PATH); terminal=8 if task["mode"]=="release" else 7
+    # Snapshot exact authority before validation. Nested validators legitimately
+    # acquire the Agent ledger lock, so completion takes the model locks only
+    # for its final compare-and-commit section.
+    task_data=bounded_file_bytes(TASK_PATH,"workflow task"); config_data_before=bounded_file_bytes(CONFIG_PATH,"workflow config"); agents_data_before=bounded_file_bytes(AGENTS_PATH,"agent ledger")
+    task=strict_json_loads(task_data); config=strict_json_loads(config_data_before); agents=strict_json_loads(agents_data_before)
+    if not all(isinstance(value,dict) for value in (task,config,agents)):
+        raise SystemExit("completion authority files must contain JSON objects")
+    terminal=8 if task["mode"]=="release" else 7
+    active_model=task.get("selected_model")
+    if (not isinstance(active_model,str) or not active_model or config.get("agent_control",{}).get("default_model")!=active_model
+            or agents.get("default_model")!=active_model):
+        raise SystemExit("task completion requires exact active task/config/ledger model binding")
     execution_gate(task, "complete")
     before=copy.deepcopy(task)
     required_nodes=list(range(0,terminal+1))
@@ -1125,7 +1492,7 @@ def command_complete(args: argparse.Namespace) -> int:
         raise SystemExit(f"task completion cannot resolve unknown context risks: {unknown_resolutions}")
     remaining_risks = [item for item in open_risks if item not in requested_resolutions]
     if remaining_risks:
-        flags = " ".join(f"--resolve-risk {json.dumps(item, ensure_ascii=False)}" for item in remaining_risks)
+        flags = " ".join(f"--resolve-risk {strict_json_dumps(item, ensure_ascii=False)}" for item in remaining_risks)
         raise SystemExit(
             "task completion is blocked by unresolved context risks; explicitly resolve each verified risk: "
             + flags
@@ -1141,17 +1508,16 @@ def command_complete(args: argparse.Namespace) -> int:
         ):
             raise SystemExit("release completion requires a human decision bound to the exact final empty platform snapshot SHA-256")
         completion_decision_source=args.completion_source
-        if task.get("decision_policy_version")==1:
-            if not args.human_decision_receipt:
-                raise SystemExit("release completion requires a provider-signed human decision receipt")
-            completion_decision_receipt=humandecision.verify(
-                ROOT,load(AGENT_DIR/"config.json"),task,gate="completion",
-                artifact_sha256=completion_snapshot["sha256"],source=args.completion_source,
-                receipt=args.human_decision_receipt,
-            )
+        if not args.human_decision_receipt:
+            raise SystemExit("release completion requires a provider-signed human decision receipt")
+        completion_decision_receipt=humandecision.verify(
+            ROOT,load(AGENT_DIR/"config.json"),task,gate="completion",
+            artifact_sha256=completion_snapshot["sha256"],source=args.completion_source,
+            receipt=args.human_decision_receipt,
+        )
     elif args.completion_source or args.completion_platform_transcript_verified_sha256 or args.human_decision_receipt:
         raise SystemExit("completion human snapshot commitments apply only to release mode")
-    retro=artifact(args.retrospective); retro_text=(ROOT/retro["path"]).read_text(encoding="utf-8")
+    retro=artifact(args.retrospective); retro_text=bounded_file_text(ROOT/retro["path"],"retrospective artifact")
     retro_fields=("Result and success criteria","Wall / waiting time","Measured or estimated Tokens","References / Agent cumulative and peak","Rework / user corrections / tests / defects / blocks","What worked / failed","Knowledge candidates","Promotion decision and source")
     if any(len(re.findall(rf"^- {re.escape(field)}:\s*(.+?)\s*$",retro_text,re.MULTILINE))!=1 for field in retro_fields) or "{{" in retro_text:
         raise SystemExit("retrospective is incomplete or contains unresolved placeholders")
@@ -1165,20 +1531,36 @@ def command_complete(args: argparse.Namespace) -> int:
         "task completion requires a fully valid workflow before consuming the final platform snapshot",
     )
     run_checked(ledger_command,"task completion requires an orchestrator-observed empty Agent ledger")
+    # `agentledger validate --require-empty --platform-snapshot` commits the
+    # exact provider-observed empty-snapshot receipt. Treat only that Agent
+    # ledger postimage as expected; TASK/config authority must stay byte exact.
+    if bounded_file_bytes(TASK_PATH,"workflow task")!=task_data or bounded_file_bytes(CONFIG_PATH,"workflow config")!=config_data_before:
+        raise SystemExit("completion authority changed while binding the empty platform snapshot")
+    agents_data_before=bounded_file_bytes(AGENTS_PATH,"agent ledger"); agents=strict_json_loads(agents_data_before)
+    agents_chain_exists_before,agents_chain_data_before=agents_chain_snapshot()
+    if not isinstance(agents,dict) or agents.get("default_model")!=active_model:
+        raise SystemExit("empty platform verification broke active Agent model authority")
     run_checked([sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"cleanup"],"runtime cleanup failed")
     run_checked(
         [sys.executable,str(AGENT_DIR/"scripts/agentctl.py"),"assert-clean"],
         "task completion leaves runtime residuals after cleanup",
     )
-    task["retrospective"]=retro; task["knowledge_candidates"]=args.knowledge_candidates or []
+    task["retrospective"]=retro
+    task["completed_model"]=active_model; task["selected_model"]=None
     artifact_set=[
         {"node":int(node),**record}
         for node,record in sorted(task.get("node_artifacts",{}).items(),key=lambda item:int(item[0]))
         if isinstance(record,dict)
     ]
+    allowed_knowledge_evidence={retro["sha256"],completion_snapshot["sha256"],*(record["sha256"] for record in artifact_set)}
+    knowledge_candidates=capture_knowledge_candidates(args.knowledge_candidates or [],allowed_knowledge_evidence)
+    task["knowledge_candidates"]=knowledge_candidates
+    import testrun as supervised_test
     task["completion_binding"]={
-        "schema":"agent-completion-binding/v1",
+        "schema":"agent-completion-binding/v2",
         "accepted_artifact_set_sha256":canonical_sha256(artifact_set),
+        "completed_model":active_model,
+        "candidate_sha256":supervised_test.candidate_fingerprint(config),
         "terminal_artifact_sha256":task.get("node_artifacts",{}).get(str(terminal),{}).get("sha256"),
         "release_approval_sha256":canonical_sha256(acceptance_approval) if task.get("mode")=="release" else None,
         "completion_platform_snapshot_sha256":completion_snapshot["sha256"],
@@ -1186,11 +1568,31 @@ def command_complete(args: argparse.Namespace) -> int:
         "completion_decision_receipt":completion_decision_receipt,
     }
     task.update({"current_node":"idle","status":"accepted","phase":"idle","next_action":"start the next requirement in clarification"})
-    contexttx.transition_task(
-        before,task,mutator="workflowctl",operation="complete-task",
-        reason="task-completed",summary="completed accepted task and bounded retrospective",
-        side_effects=[stage_side_effect(task)],resolve_risks=requested_resolutions,
-    )
+    knowledge_side_effect=knowledge_pending_side_effect(task,knowledge_candidates)
+    # Match agentctl locked_model_authority ordering (project-init, Agent
+    # ledger, then TASK/context inside contexttx) and reject any exact-byte
+    # drift observed while the slow external validations ran.
+    try:
+        project_handle=boundedio.open_private_lock(PROJECT_INIT_LOCK_PATH,label="project initialization lock")
+        agents_handle=boundedio.open_private_lock(AGENTS_LOCK_PATH,label="agent ledger lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with project_handle as project_lock:
+        fcntl.flock(project_lock.fileno(),fcntl.LOCK_EX)
+        with agents_handle as agents_lock:
+            fcntl.flock(agents_lock.fileno(),fcntl.LOCK_EX)
+            if (bounded_file_bytes(TASK_PATH,"workflow task")!=task_data or bounded_file_bytes(CONFIG_PATH,"workflow config")!=config_data_before
+                    or bounded_file_bytes(AGENTS_PATH,"agent ledger")!=agents_data_before
+                    or agents_chain_snapshot()!=(agents_chain_exists_before,agents_chain_data_before)):
+                raise SystemExit("completion authority changed during validation; retry against the new exact state")
+            idle_config=copy.deepcopy(config); idle_config.setdefault("agent_control",{})["default_model"]=None
+            idle_agents=copy.deepcopy(agents); idle_agents["default_model"]=None; idle_agents["updated_at"]=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+            agents_data=agents_chain_advance(idle_agents); config_data=(strict_json_dumps(idle_config,ensure_ascii=False,indent=2)+"\n").encode()
+            agents_chain_data=agents_chain_journal_data(idle_agents,agents_data,agents_chain_data_before)
+            contexttx.transition_task(
+                before,task,mutator="workflowctl",operation="complete-task",
+                reason="task-completed",summary="completed accepted task and bounded retrospective",
+                side_effects=[stage_side_effect(task),(CONFIG_PATH,config_data),(AGENTS_PATH,agents_data),(AGENTS_CHAIN_PATH,agents_chain_data),*([knowledge_side_effect] if knowledge_side_effect else [])],resolve_risks=requested_resolutions,
+            )
     print("TASK COMPLETED")
     return 0
 
@@ -1200,17 +1602,8 @@ def state_machine_errors(task: Dict[str, object]) -> List[str]:
     mode=task.get("mode"); terminal=8 if mode=="release" else 7
     accepted=task.get("accepted_nodes",[])
     decision_policy_version = task.get("decision_policy_version")
-    if decision_policy_version == humandecision.LOCAL_POLICY_VERSION and (
-        mode not in {"fast", "standard", "release"}
-        or task.get("environment") != "local"
-        or task.get("deployment_requested") is not False
-        or any(
-            isinstance(task.get("risk_flags"), dict)
-            and task["risk_flags"].get(name) is True
-            for name in ("deploy", "irreversible", "external_impact")
-        )
-    ):
-        errors.append("local user-message decisions are restricted to local non-deploy, reversible and non-external tasks")
+    if decision_policy_version != humandecision.PROVIDER_POLICY_VERSION:
+        errors.append("workflow decision policy must be provider-verifiable policy 1; legacy local records are advisory only")
     if status=="idle":
         if current!="idle" or accepted!=[]: errors.append("idle workflow must have current_node=idle and no accepted nodes")
     elif status=="accepted":
@@ -1258,9 +1651,9 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
         "decision_receipt", "task", "requirement_contract", "previous",
     }
     # agentctl build_task_archive writes v2 payloads: the v1 identity fields
-    # plus the embedded delivery record and the structured referenced-evidence
-    # digest list (see the reader contract in evidencectl.py).
-    payload_v2_fields = payload_fields | {"delivery", "referenced_evidence"}
+    # plus the generation-bound Skill activation, embedded delivery record, and
+    # structured referenced-evidence digest list (see evidencectl.py).
+    payload_v2_fields = payload_fields | {"skill_activation", "delivery", "referenced_evidence"}
     visited: set[str] = set()
     expected_total = current.get("total_archives") if isinstance(current, dict) else None
     while current is not None:
@@ -1283,11 +1676,11 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
         path = ROOT / relative
         if not path.is_file() or path.is_symlink():
             return ["task_archive content is missing"]
-        data = path.read_bytes()
+        data = bounded_file_bytes(path,"workflow artifact")
         if len(data) != current["bytes"] or hashlib.sha256(data).hexdigest() != digest:
             return ["task_archive content drifted"]
         try:
-            value = json.loads(data)
+            value = strict_json_loads(data)
         except json.JSONDecodeError:
             return ["task_archive content is not valid JSON"]
         if (
@@ -1308,7 +1701,7 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
         ):
             return ["task_archive task bytes or reason are invalid"]
         try:
-            archived_task_value = json.loads(archived_task["utf8"])
+            archived_task_value = strict_json_loads(archived_task["utf8"])
             archived_at = dt.datetime.fromisoformat(str(value.get("archived_at")))
             if archived_at.tzinfo is None:
                 raise ValueError("timezone required")
@@ -1327,6 +1720,64 @@ def task_archive_errors(task: Dict[str, object]) -> List[str]:
         ):
             return ["task_archive requirement contract is invalid"]
         if value.get("schema") == "agent-task-archive/v2":
+            activation=value.get("skill_activation")
+            if activation is None:
+                if archived_task_value.get("skill_activation") is not None:
+                    return ["legacy task_archive cannot discard declared Skill activation"]
+            else:
+                if (not isinstance(activation,dict) or set(activation)!={"sha256","bytes","utf8"}
+                        or not isinstance(activation.get("utf8"),str) or len(activation["utf8"].encode())!=activation.get("bytes")
+                        or hashlib.sha256(activation["utf8"].encode()).hexdigest()!=activation.get("sha256")):
+                    return ["task_archive Skill activation record is invalid"]
+                try: activation_value=strict_json_loads(activation["utf8"])
+                except json.JSONDecodeError: return ["task_archive Skill activation JSON is invalid"]
+                schema=activation_value.get("schema") if isinstance(activation_value,dict) else None
+                v2=schema=="agent-task-skill-activation/v2"
+                activation_fields=({"schema","task_generation_id","blueprint_sha256","lock_sha256","skills","builtins","activation_sha256"}
+                                   if v2 else {"schema","task_generation_id","blueprint_sha256","lock_sha256","skills","activation_sha256"})
+                pointer_fields=({"schema","path","sha256","bytes","activation_sha256","lock_sha256","skill_ids","builtin_skill_ids"}
+                                if v2 else {"schema","path","sha256","bytes","activation_sha256","lock_sha256","skill_ids"})
+                pointer=archived_task_value.get("skill_activation"); skills=activation_value.get("skills") if isinstance(activation_value,dict) else None
+                unsigned={key:item for key,item in activation_value.items() if key!="activation_sha256"} if isinstance(activation_value,dict) else {}
+                activation_sha=hashlib.sha256(json.dumps(unsigned,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+                ids=[item.get("id") for item in skills] if isinstance(skills,list) and all(isinstance(item,dict) for item in skills) else None
+                if (schema not in {"agent-task-skill-activation/v1","agent-task-skill-activation/v2"}
+                        or not isinstance(activation_value,dict) or set(activation_value)!=activation_fields
+                        or activation_value.get("activation_sha256")!=activation_sha
+                        or activation_value.get("task_generation_id")!=archived_task_value.get("task_generation_id")
+                        or not isinstance(pointer,dict) or set(pointer)!=pointer_fields
+                        or pointer.get("schema")!=schema or pointer.get("path")!=".agent/state/SKILL_ACTIVATION.json"
+                        or pointer.get("sha256")!=activation.get("sha256") or pointer.get("bytes")!=activation.get("bytes")
+                        or pointer.get("activation_sha256")!=activation_sha or pointer.get("lock_sha256")!=activation_value.get("lock_sha256")
+                        or ids is None or ids!=sorted(set(ids)) or pointer.get("skill_ids")!=ids):
+                    return ["task_archive Skill activation binding is invalid"]
+                if v2:
+                    builtins=activation_value.get("builtins"); builtin_ids=[]
+                    if not isinstance(builtins,list): return ["task_archive built-in Skill activation set is invalid"]
+                    for builtin in builtins:
+                        if not isinstance(builtin,dict) or set(builtin)!={"id","bundle_sha256","files"} or not isinstance(builtin.get("files"),list): return ["task_archive built-in Skill entry is invalid"]
+                        records=[]
+                        for document in builtin["files"]:
+                            if not isinstance(document,dict) or set(document)!={"path","sha256","bytes","mode","content_base64"}: return ["task_archive built-in Skill file is invalid"]
+                            try: data=base64.b64decode(document["content_base64"],validate=True)
+                            except (ValueError,TypeError): return ["task_archive built-in Skill content is invalid"]
+                            if len(data)!=document.get("bytes") or hashlib.sha256(data).hexdigest()!=document.get("sha256"): return ["task_archive built-in Skill bytes are invalid"]
+                            records.append({key:document[key] for key in ("path","sha256","bytes","mode")})
+                        if hashlib.sha256(json.dumps(records,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()!=builtin.get("bundle_sha256"): return ["task_archive built-in Skill bundle is invalid"]
+                        builtin_ids.append(builtin.get("id"))
+                    if builtin_ids!=sorted(set(builtin_ids)) or pointer.get("builtin_skill_ids")!=builtin_ids: return ["task_archive built-in Skill identifiers drifted"]
+                for item in skills:
+                    documents=item.get("documents")
+                    if (set(item)!={"id","status","bundle_sha256","matched_capabilities","documents"}
+                            or item.get("status") not in {"active","deprecated"} or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}",str(item.get("id",""))) is None
+                            or re.fullmatch(r"[0-9a-f]{64}",str(item.get("bundle_sha256",""))) is None or not isinstance(item.get("matched_capabilities"),list)
+                            or not isinstance(documents,list) or [doc.get("path") if isinstance(doc,dict) else None for doc in documents]!=["SKILL.md","LICENSE.txt"]):
+                        return ["task_archive Skill activation entry is invalid"]
+                    for document in documents:
+                        content=document.get("content") if isinstance(document,dict) else None; data=content.encode() if isinstance(content,str) else b""
+                        if (not isinstance(document,dict) or set(document)!={"path","sha256","bytes","content"} or not isinstance(content,str)
+                                or len(data)!=document.get("bytes") or hashlib.sha256(data).hexdigest()!=document.get("sha256")):
+                            return ["task_archive Skill activation document is invalid"]
             delivery = value.get("delivery")
             if delivery is not None and (
                 not isinstance(delivery, dict)
@@ -1405,11 +1856,11 @@ def rollback_archive_errors(task: Dict[str, object]) -> List[str]:
         visited.add(digest); path = ROOT / relative
         if not path.is_file() or path.is_symlink():
             return ["rollback_archive content is missing"]
-        data = path.read_bytes()
+        data = bounded_file_bytes(path,"workflow artifact")
         if len(data) != current["bytes"] or hashlib.sha256(data).hexdigest() != digest:
             return ["rollback_archive content drifted"]
         try:
-            value = json.loads(data)
+            value = strict_json_loads(data)
         except json.JSONDecodeError:
             return ["rollback_archive content is not valid JSON"]
         previous = value.get("previous") if isinstance(value, dict) else None
@@ -1460,11 +1911,11 @@ def failure_archive_errors(task: Dict[str, object]) -> List[str]:
         visited.add(digest); path = ROOT / relative
         if not path.is_file() or path.is_symlink():
             return ["failure_archive content is missing"]
-        data = path.read_bytes()
+        data = bounded_file_bytes(path,"workflow artifact")
         if len(data) != current["bytes"] or hashlib.sha256(data).hexdigest() != digest:
             return ["failure_archive content drifted"]
         try:
-            value = json.loads(data)
+            value = strict_json_loads(data)
         except json.JSONDecodeError:
             return ["failure_archive content is not valid JSON"]
         previous = value.get("previous") if isinstance(value, dict) else None
@@ -1548,14 +1999,26 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
             errors.append(f"node artifact escapes project: {record.get('path')}"); continue
         if not path.is_file() or path.is_symlink():
             errors.append(f"node artifact missing: {record.get('path')}"); continue
-        data=path.read_bytes()
-        actual={"path":str(path.relative_to(ROOT)),"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)}
+        capture_nodes=task.get("node_artifact_capture_nodes",[])
+        try:
+            actual=(node_artifact(str(record.get("path","")),seal=False)
+                    if node_number in capture_nodes else artifact(str(record.get("path",""))))
+        except (SystemExit,OSError) as error:
+            errors.append(f"node artifact capture failed: {record.get('path')}: {error}"); continue
         if record!=actual:
             errors.append(f"node artifact drifted: {record.get('path')}"); continue
-        try:
-            validate_node_artifact(task,node_number,actual)
-        except (SystemExit,subprocess.TimeoutExpired) as error:
-            errors.append(f"node {node} semantic artifact validation failed: {error}")
+        if node_number in capture_nodes and not node_capture_matches_source(record):
+            errors.append(f"node artifact capture identity drifted: {record.get('path')}"); continue
+        # `complete-task` already revalidated every semantic artifact before it
+        # atomically wrote the completion checkpoint and cleared active model
+        # authority. Accepted history is thereafter validated by exact bytes +
+        # that checkpoint; replaying live validators against the intentionally
+        # idle config/ledger would substitute a different candidate authority.
+        if task.get("status")!="accepted":
+            try:
+                validate_node_artifact(task,node_number,actual)
+            except (SystemExit,subprocess.TimeoutExpired) as error:
+                errors.append(f"node {node} semantic artifact validation failed: {error}")
     if task.get("mode") in {"standard","release"}:
         # The lightweight standard projection has no node 4 solution gate; the
         # release projection stays full through "lightweight-release".
@@ -1578,18 +2041,18 @@ def workflow_validation_errors(task: Dict[str, object], require_full: bool = Fal
         errors.append("stage index validator or stage index is missing")
     else:
         try:
-            stage=subprocess.run([sys.executable,str(stage_validator),str(STAGE_PATH)],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            stage=run_bounded_command([sys.executable,str(stage_validator),str(STAGE_PATH)],cwd=ROOT,timeout=120)
             if stage.returncode: errors.append("stage index drifted from canonical TASK state")
         except subprocess.TimeoutExpired:
             errors.append("stage index validation timed out")
-    if require_full:
+    if require_full and task.get("status")!="accepted":
         try:
-            template=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/templatectl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            template=run_bounded_command([sys.executable,str(AGENT_DIR/"scripts/templatectl.py"),"validate"],cwd=ROOT,timeout=120)
             if template.returncode: errors.append("terminal workflow template state is invalid")
         except subprocess.TimeoutExpired:
             errors.append("terminal workflow template validation timed out")
         try:
-            delivery=subprocess.run([sys.executable,str(AGENT_DIR/"scripts/deliveryctl.py"),"validate"],cwd=str(ROOT),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120)
+            delivery=run_bounded_command([sys.executable,str(AGENT_DIR/"scripts/deliveryctl.py"),"validate"],cwd=ROOT,timeout=120)
             if delivery.returncode: errors.append("terminal workflow delivery state is invalid")
         except subprocess.TimeoutExpired:
             errors.append("terminal workflow delivery validation timed out")
@@ -1601,23 +2064,33 @@ SCHEDULER_NONCE_LOCK = AGENT_DIR / "state" / ".scheduler-receipt-nonces.lock"
 
 
 def consumed_scheduler_nonces() -> Dict[str, str]:
-    """Live nonce -> expiry map from the consumed scheduler receipt registry."""
+    """Load the initialized nonce registry; loss/corruption must never reset replay history."""
     try:
-        value = json.loads(SCHEDULER_NONCE_PATH.read_text(encoding="utf-8")) if SCHEDULER_NONCE_PATH.is_file() else {}
-    except (OSError, ValueError):
-        return {}
-    raw = value.get("nonces") if isinstance(value, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    now = dt.datetime.now(dt.timezone.utc)
-    live: Dict[str, str] = {}
-    for nonce, expiry in raw.items():
-        try:
-            observed = dt.datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if observed.tzinfo is not None and observed.astimezone(dt.timezone.utc) > now:
-            live[str(nonce)] = str(expiry)
+        before=os.lstat(SCHEDULER_NONCE_PATH)
+    except OSError as error:
+        raise SystemExit("scheduler nonce registry is missing; restore or reinitialize the workflow") from error
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_uid!=os.geteuid()
+            or stat.S_IMODE(before.st_mode)&0o022 or before.st_size>humandecision.MAX_RECEIPT_BYTES):
+        raise SystemExit("scheduler nonce registry is unsafe")
+    try:
+        raw_bytes,identity=humandecision.receipt_snapshot(SCHEDULER_NONCE_PATH)
+        after=os.lstat(SCHEDULER_NONCE_PATH)
+        if identity!=(after.st_dev,after.st_ino) or after.st_mtime_ns!=before.st_mtime_ns or after.st_size!=before.st_size:
+            raise SystemExit("scheduler nonce registry changed while reading")
+        value=strict_json_loads(raw_bytes.decode("utf-8"))
+    except (OSError,UnicodeError,ValueError) as error:
+        raise SystemExit("scheduler nonce registry is unreadable or malformed") from error
+    if (not isinstance(value,dict) or set(value)!={"schema","nonces"}
+            or value.get("schema")!="agent-scheduler-receipt-nonces/v1" or not isinstance(value.get("nonces"),dict)):
+        raise SystemExit("scheduler nonce registry has invalid fields")
+    now=dt.datetime.now(dt.timezone.utc); live: Dict[str,str]={}
+    for nonce,expiry in value["nonces"].items():
+        if not isinstance(nonce,str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}",nonce) or not isinstance(expiry,str):
+            raise SystemExit("scheduler nonce registry contains an invalid entry")
+        try: observed=dt.datetime.fromisoformat(expiry.replace("Z","+00:00"))
+        except ValueError as error: raise SystemExit("scheduler nonce registry contains an invalid expiry") from error
+        if observed.tzinfo is None: raise SystemExit("scheduler nonce registry expiry lacks timezone")
+        if observed.astimezone(dt.timezone.utc)>now: live[nonce]=expiry
     return live
 
 
@@ -1625,33 +2098,24 @@ def record_scheduler_nonce(nonce: str, expiry: dt.datetime) -> None:
     """Consume a verified scheduler nonce, pruning expired entries atomically."""
     live = consumed_scheduler_nonces()
     live[nonce] = expiry.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
-    fd, raw_path = tempfile.mkstemp(prefix=".scheduler-receipt-nonces.", dir=str(SCHEDULER_NONCE_PATH.parent))
-    temporary = Path(raw_path)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"schema": "agent-scheduler-receipt-nonces/v1", "nonces": live}, handle, ensure_ascii=False, sort_keys=True)
-            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, SCHEDULER_NONCE_PATH)
-    finally:
-        if temporary.exists(): temporary.unlink()
+    data=(strict_json_dumps({"schema":"agent-scheduler-receipt-nonces/v1","nonces":live},ensure_ascii=False,sort_keys=True)+"\n").encode("utf-8")
+    try: boundedio.atomic_write(SCHEDULER_NONCE_PATH,data,mode=0o600,label="scheduler nonce registry")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def consume_scheduler_nonce(nonce: str, expiry: dt.datetime) -> None:
-    """Consume a verified nonce under an exclusive lock, re-checking inside it.
+    """Record a provider-consumed nonce in the local fail-closed audit cache.
 
-    The registry is replaced atomically on every write, so the lock lives on a
-    stable sibling inode; without the in-lock re-check two concurrent
-    route-resume processes could both observe an unconsumed nonce and both
-    consume the same receipt.
+    The protected provider adapter is the non-rollbackable replay authority.
+    This owner-private registry is defense in depth and detects local damage;
+    its lock still serializes audit-cache updates from concurrent resumptions.
     """
-    SCHEDULER_NONCE_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    SCHEDULER_NONCE_LOCK.touch(exist_ok=True)
-    with SCHEDULER_NONCE_LOCK.open("r+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if nonce in consumed_scheduler_nonces():
-            raise SystemExit("scheduler receipt nonce was already consumed")
-        record_scheduler_nonce(nonce, expiry)
+    try: lock_handle=boundedio.open_private_lock(SCHEDULER_NONCE_LOCK,label="scheduler nonce lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as handle:
+        fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
+        if nonce in consumed_scheduler_nonces(): raise SystemExit("scheduler receipt nonce was already consumed")
+        record_scheduler_nonce(nonce,expiry)
 
 
 def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, object], config: Dict[str, object]) -> bool:
@@ -1661,17 +2125,30 @@ def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, o
     scheduler = agent_control.get("scheduler", {}) if isinstance(agent_control, dict) else {}
     if not isinstance(scheduler, dict):
         scheduler = {}
-    adapter = humandecision.try_adapter_path(ROOT, scheduler.get("signed_adapter"))
+    adapter = humandecision.try_adapter_path(
+        ROOT, scheduler.get("signed_adapter"), required_operations=("consume-scheduler-resume",),
+    )
     if adapter is None:
         raise SystemExit("host scheduler resume adapter is not configured")
     path = (ROOT / raw).resolve()
     try: path.relative_to(ROOT)
     except ValueError: raise SystemExit("scheduler receipt escapes project")
     if not path.is_file() or path.is_symlink(): raise SystemExit("scheduler receipt is missing or unsafe")
-    value = load(path)
-    required = {"schema", "resume_cursor", "task_invariant_sha256", "observed_at", "scheduler_id", "nonce"}
-    if set(value) != required or value.get("schema") != "host-scheduler-resume/v1" or value.get("resume_cursor") != cursor or value.get("task_invariant_sha256") != contexttx.contextctl.invariant_sha256(task) or not str(value.get("scheduler_id", "")).strip() or not str(value.get("nonce", "")).strip():
-        raise SystemExit("scheduler receipt does not bind the current resume cursor")
+    receipt_data,receipt_identity=humandecision.receipt_snapshot(path)
+    try: value=strict_json_loads(receipt_data.decode("utf-8"))
+    except (UnicodeError,json.JSONDecodeError) as error: raise SystemExit("scheduler receipt is not valid UTF-8 JSON") from error
+    required = {"schema", "resume_cursor", "task_invariant_sha256", "observed_at", "scheduler_id", "nonce",
+                "provider_project_id", "provider_repository_id", "task_generation_id"}
+    provider_ids=(value.get("provider_project_id"),value.get("provider_repository_id"),value.get("task_generation_id")) if isinstance(value,dict) else ()
+    trusted_ids=(scheduler.get("provider_project_id"),scheduler.get("provider_repository_id"),task.get("task_generation_id"))
+    if (not isinstance(value,dict) or set(value) != required or value.get("schema") != "host-scheduler-resume/v2"
+            or value.get("resume_cursor") != cursor
+            or value.get("task_invariant_sha256") != contexttx.contextctl.invariant_sha256(task)
+            or not str(value.get("scheduler_id", "")).strip()
+            or not isinstance(value.get("nonce"),str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}",value["nonce"])
+            or provider_ids!=trusted_ids
+            or any(not isinstance(item,str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}",item) is None for item in provider_ids)):
+        raise SystemExit("scheduler receipt does not bind the current cursor and provider-issued project/repository/task generation identities")
     try: observed = dt.datetime.fromisoformat(str(value.get("observed_at", "")).replace("Z", "+00:00"))
     except ValueError: raise SystemExit("scheduler receipt timestamp is invalid")
     if observed.tzinfo is None: raise SystemExit("scheduler receipt timestamp lacks timezone")
@@ -1682,10 +2159,20 @@ def verified_scheduler_resume(raw: Optional[str], cursor: str, task: Dict[str, o
     nonce = str(value["nonce"])
     if nonce in consumed_scheduler_nonces():
         raise SystemExit("scheduler receipt nonce was already consumed")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = subprocess.run([str(adapter), "verify-scheduler-resume", "--receipt", str(path)], cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
-    if result.returncode or result.stdout.strip() != f"VERIFIED SCHEDULER RESUME sha256={digest}":
-        raise SystemExit("host scheduler adapter rejected the resume receipt")
+    digest=hashlib.sha256(receipt_data).hexdigest()
+    # Replay authority lives outside the rollbackable project state. The
+    # protected provider adapter must verify and atomically consume this nonce
+    # in one operation backed by its own monotonic durable store.
+    result=humandecision.run_adapter(adapter,["consume-scheduler-resume"],required_operations=("consume-scheduler-resume",),timeout=30,receipt_raw=receipt_data)
+    consume_binding={key:value[key] for key in ("provider_project_id","provider_repository_id","task_generation_id","scheduler_id","nonce")}
+    binding_digest=canonical_sha256(consume_binding)
+    expected_prefix=f"CONSUMED SCHEDULER RESUME sha256={digest} binding-sha256={binding_digest} sequence="
+    sequence_text=result.stdout.strip()[len(expected_prefix):] if result.stdout.strip().startswith(expected_prefix) else ""
+    if result.returncode or not sequence_text.isdigit() or int(sequence_text)<=0:
+        raise SystemExit("host scheduler adapter rejected or did not atomically consume the resume receipt")
+    after_data,after_identity=humandecision.receipt_snapshot(path)
+    if after_identity!=receipt_identity or after_data!=receipt_data:
+        raise SystemExit("scheduler receipt changed during provider verification")
     consume_scheduler_nonce(nonce, observed.astimezone(dt.timezone.utc) + dt.timedelta(seconds=maximum))
     return True
 
@@ -1704,11 +2191,11 @@ def terminal_binding_error() -> Optional[str]:
     )
     for command, label in checks:
         try:
-            result = subprocess.run(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+            result=run_bounded_command(command,cwd=ROOT,timeout=30)
         except subprocess.TimeoutExpired:
             return f"{label} timed out"
         if result.returncode:
-            detail = result.stdout.decode("utf-8", errors="replace").strip().replace("\n", " | ")[:500]
+            detail = result.stdout.strip().replace("\n", " | ")[:500]
             return label + (f" failed: {detail}" if detail else " failed")
     return None
 
@@ -1729,7 +2216,7 @@ def transition_journal_recovery() -> Optional[str]:
     return str(status.get("recovery") or "inspect .agent/state/.context-transition-journal.json manually") if isinstance(status, dict) else "inspect .agent/state/.context-transition-journal.json manually"
 
 
-def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
+def _command_route_resume_locked(args: Optional[argparse.Namespace] = None) -> int:
     task=load(TASK_PATH)
     context=load(AGENT_DIR/"state/CONTEXT.json")
     cursor=canonical_sha256({
@@ -1740,10 +2227,7 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
     if args is not None and getattr(args,"after_cursor",None) not in {None,cursor}:
         raise SystemExit("resume cursor is stale; run route-resume without --after-cursor to obtain the current command")
     try:
-        context_result=subprocess.run(
-            [sys.executable,str(CONTEXT_TOOL),"check","--quiet"],cwd=str(ROOT),
-            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=120,
-        )
+        context_result=run_bounded_command([sys.executable,str(CONTEXT_TOOL),"check","--quiet"],cwd=ROOT,timeout=120)
         context_invalid = context_result.returncode != 0
     except subprocess.TimeoutExpired:
         context_invalid = True
@@ -1817,8 +2301,23 @@ def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
         "scheduler_error":scheduler_error,"recovery":recovery,"cleanup":cleanup,
         "resume_cursor":cursor,"resume_command":resume_command,
     }
-    print(json.dumps(receipt,ensure_ascii=False,sort_keys=True,separators=(",",":")))
+    print(strict_json_dumps(receipt,ensure_ascii=False,sort_keys=True,separators=(",",":")))
     return 1 if errors else 0
+
+
+def command_route_resume(args: Optional[argparse.Namespace] = None) -> int:
+    """Linearize cursor validation and irreversible provider nonce consumption.
+
+    Every canonical TASK/CONTEXT transition uses contexttx.TASK_LOCK. Holding the
+    same lock through receipt emission prevents a provider-consumed nonce from
+    authorizing a cursor that a concurrent transition has already revoked.
+    """
+    lock_path=contexttx.TASK_LOCK
+    try: lock_handle=boundedio.open_private_lock(lock_path,label="task transition lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        return _command_route_resume_locked(args)
 
 
 def command_validate() -> int:
@@ -1839,7 +2338,7 @@ def main() -> int:
     advance=sub.add_parser("advance"); advance.add_argument("--node",type=int,required=True); advance.add_argument("--artifact",required=True)
     back=sub.add_parser("return-node"); back.add_argument("--from-node",type=int,required=True); back.add_argument("--to",type=int,required=True); back.add_argument("--issue-id",required=True); back.add_argument("--cause-category",choices=("requirements","provenance","scope","solution","tests","implementation","acceptance","runtime","delivery","agent-control"),required=True); back.add_argument("--subtask",required=True); back.add_argument("--root-cause",required=True); back.add_argument("--change",required=True)
     resolve=sub.add_parser("resolve-failure"); resolve.add_argument("--source",required=True); resolve.add_argument("--human-decision-receipt")
-    complete=sub.add_parser("complete-task"); complete.add_argument("--retrospective",required=True); complete.add_argument("--knowledge-candidates",action="append"); complete.add_argument("--resolve-risk",action="append"); complete.add_argument("--platform-snapshot",required=True); complete.add_argument("--completion-source"); complete.add_argument("--completion-platform-transcript-verified-sha256"); complete.add_argument("--human-decision-receipt")
+    complete=sub.add_parser("complete-task"); complete.add_argument("--retrospective",required=True); complete.add_argument("--knowledge-candidate-file","--knowledge-candidates",dest="knowledge_candidates",action="append"); complete.add_argument("--resolve-risk",action="append"); complete.add_argument("--platform-snapshot",required=True); complete.add_argument("--completion-source"); complete.add_argument("--completion-platform-transcript-verified-sha256"); complete.add_argument("--human-decision-receipt")
     sub.add_parser("compact-state")
     resume=sub.add_parser("route-resume"); resume.add_argument("--after-cursor"); resume.add_argument("--scheduler-receipt")
     sub.add_parser("validate")
@@ -1847,4 +2346,6 @@ def main() -> int:
     return {"submit-gate":lambda:command_submit(args),"approve-gate":lambda:command_approve(args),"advance":lambda:command_advance(args),"return-node":lambda:command_return(args),"resolve-failure":lambda:command_resolve_failure(args),"complete-task":lambda:command_complete(args),"compact-state":command_compact_state,"route-resume":lambda:command_route_resume(args),"validate":command_validate}[args.command]()
 
 
-if __name__=="__main__": raise SystemExit(main())
+if __name__=="__main__":
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

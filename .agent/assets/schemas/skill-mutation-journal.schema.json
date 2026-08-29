@@ -1,0 +1,641 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-skill-mutation-journal/v2",
+  "title": "Skill mutation journal v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "journal_id",
+    "chain_sequence",
+    "previous_journal_sha256",
+    "phase",
+    "operation",
+    "action_sha256",
+    "gate",
+    "source",
+    "approval",
+    "pre_state",
+    "intended_post_state",
+    "prepared_at",
+    "authorization_result",
+    "published_at",
+    "journal_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "agent-skill-mutation-journal/v2"
+    },
+    "journal_id": {
+      "$ref": "#/$defs/sha"
+    },
+    "chain_sequence": {"type":"integer","minimum":1},
+    "previous_journal_sha256": {"oneOf":[{"const":"none"},{"$ref":"#/$defs/sha"}]},
+    "phase": {
+      "enum": [
+        "prepared",
+        "consumed",
+        "published"
+      ]
+    },
+    "operation": {
+      "enum": [
+        "install",
+        "update",
+        "deprecate",
+        "retire",
+        "quarantine",
+        "rollback"
+      ]
+    },
+    "action_sha256": {
+      "$ref": "#/$defs/sha"
+    },
+    "gate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "approval": {"$ref": "#/$defs/providerApproval"},
+    "pre_state": {
+      "$ref": "#/$defs/preState"
+    },
+    "intended_post_state": {
+      "$ref": "#/$defs/postState"
+    },
+    "prepared_at": {
+      "$ref": "#/$defs/time"
+    },
+    "authorization_result": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/providerAuthorization"
+        }
+      ]
+    },
+    "published_at": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/time"
+        }
+      ]
+    },
+    "journal_sha256": {
+      "$ref": "#/$defs/sha"
+    }
+  },
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 64
+    },
+    "file": {
+      "type": "object",
+      "minProperties": 3,
+      "maxProperties": 16
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exists",
+        "value"
+      ],
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "value": {}
+      }
+    },
+    "activeRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "present",
+        "bundle_sha256",
+        "files"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "bundle_sha256": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        }
+      }
+    },
+    "preState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock",
+        "lifecycle",
+        "active"
+      ],
+      "properties": {
+        "lock": {
+          "$ref": "#/$defs/document"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/document"
+        },
+        "active": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/activeRecord"
+          }
+        }
+      }
+    },
+    "casRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_sha256",
+        "files",
+        "preexisting"
+      ],
+      "properties": {
+        "bundle_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "preexisting": {
+          "type": "boolean"
+        }
+      }
+    },
+    "historyRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "value",
+        "value_sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "pattern": "^skill-lock-history/[0-9a-f]{64}\\.json$"
+        },
+        "value": {
+          "type": "object"
+        },
+        "value_sha256": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "postState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock",
+        "lifecycle",
+        "active",
+        "cas_bundles",
+        "lock_history"
+      ],
+      "properties": {
+        "lock": {
+          "$ref": "#/$defs/document"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/document"
+        },
+        "active": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/activeRecord"
+          }
+        },
+        "cas_bundles": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/casRecord"
+          }
+        },
+        "lock_history": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/historyRecord"
+          }
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_identity_sha256",
+        "task_generation_sha256",
+        "task_generation_id",
+        "gate",
+        "artifact_sha256",
+        "decision_id"
+      ],
+      "properties": {
+        "project_identity_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "task_generation_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "task_generation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "gate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "recordTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "path",
+        "sha256",
+        "bytes",
+        "decision_id",
+        "authority",
+        "adapter_path",
+        "adapter_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "agent-human-decision-receipt/v1"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "authority": {
+          "const": "provider-signed-user-message"
+        },
+        "adapter_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "adapter_sha256": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "consumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_identity_sha256",
+        "task_generation_sha256",
+        "task_generation_id",
+        "gate",
+        "artifact_sha256",
+        "decision_id",
+        "binding_sha256",
+        "sequence"
+      ],
+      "properties": {
+        "project_identity_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "task_generation_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "task_generation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "gate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "consumedRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "path",
+        "sha256",
+        "bytes",
+        "decision_id",
+        "authority",
+        "adapter_path",
+        "adapter_sha256",
+        "provider_consumption"
+      ],
+      "properties": {
+        "schema": {
+          "const": "agent-human-decision-receipt/v1"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "authority": {
+          "const": "provider-signed-user-message"
+        },
+        "adapter_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "adapter_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "provider_consumption": {
+          "$ref": "#/$defs/consumption"
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "path",
+        "raw_base64",
+        "sha256",
+        "bytes",
+        "decision_id",
+        "authority",
+        "adapter_path",
+        "adapter_sha256",
+        "binding",
+        "binding_sha256",
+        "record",
+        "request_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "agent-human-decision-consumption-request/v1"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "raw_base64": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1398104,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "authority": {
+          "const": "provider-signed-user-message"
+        },
+        "adapter_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "adapter_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "record": {
+          "$ref": "#/$defs/recordTemplate"
+        },
+        "request_sha256": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "providerApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "request"
+      ],
+      "properties": {
+        "kind": {
+          "const": "provider-human-decision"
+        },
+        "request": {
+          "$ref": "#/$defs/request"
+        }
+      }
+    },
+    "securityApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "incident_source"
+      ],
+      "properties": {
+        "kind": {
+          "const": "security-emergency-containment"
+        },
+        "incident_source": {
+          "type": "string",
+          "pattern": "^security:.{1,503}$",
+          "minLength": 10,
+          "maxLength": 512
+        }
+      }
+    },
+    "providerAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "status",
+        "sequence",
+        "binding_sha256",
+        "receipt_sha256",
+        "confirmed_via",
+        "recorded_at",
+        "record"
+      ],
+      "properties": {
+        "kind": {
+          "const": "provider-human-decision"
+        },
+        "status": {
+          "const": "consumed"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "receipt_sha256": {
+          "$ref": "#/$defs/sha"
+        },
+        "confirmed_via": {
+          "enum": [
+            "consume-human-decision",
+            "status-human-decision"
+          ]
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/time"
+        },
+        "record": {
+          "$ref": "#/$defs/consumedRecord"
+        }
+      }
+    },
+    "securityAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "status",
+        "incident_source",
+        "recorded_at"
+      ],
+      "properties": {
+        "kind": {
+          "const": "security-emergency-containment"
+        },
+        "status": {
+          "const": "authorized"
+        },
+        "incident_source": {
+          "type": "string",
+          "pattern": "^security:.{1,503}$",
+          "minLength": 10,
+          "maxLength": 512
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/time"
+        }
+      }
+    }
+  }
+}

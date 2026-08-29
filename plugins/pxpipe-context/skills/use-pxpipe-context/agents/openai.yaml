@@ -1,6 +1,6 @@
 interface:
-  display_name: "Use pxpipe Context"
-  short_description: "Load approved cold references as images"
-  default_prompt: "Use $use-pxpipe-context to analyze selected cold reference files, explain the lossy boundary, and render them only after explicit approval."
+  display_name: "pxpipe Context (Quarantined)"
+  short_description: "Unavailable until verified provenance is restored"
+  default_prompt: "Explain that pxpipe is quarantined; do not invoke its MCP or bypass its integrity gate."
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

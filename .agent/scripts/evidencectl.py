@@ -20,13 +20,14 @@ structured `referenced_evidence` list and are NEVER textually scanned:
       "decision_receipt": <object|null>,
       "task": {"sha256": <hex64>, "bytes": <int>, "utf8": <str>},
       "requirement_contract": {"sha256": <hex64>, "bytes": <int>, "utf8": <str>} | null,
+      "skill_activation": {"sha256": <hex64>, "bytes": <int>, "utf8": <str>} | null,
+      "delivery": {"sha256": <hex64>, "bytes": <int>, "utf8": <str>} | null,
       "referenced_evidence": [<hex64>, ...],
       "previous": <agent-task-archive-head/v1 | null>
     }
 
 Contract rules:
-- `task.utf8` / `requirement_contract.utf8` remain the exact archived bytes
-  (each digest-bound by its own sha256); v2 never rewrites embedded text.
+- Current archives bind exact `task`, requirement, Skill activation, and delivery bytes. A migrated v1 archive uses `skill_activation: null` only when its embedded legacy task declared no activation; migration never fabricates reviewed Skill bytes.
 - `referenced_evidence` holds ONLY sha256 digests of the active evidence
   files the archived text referenced at archive time — never literal paths.
   A digest protects every active evidence file whose bytes match it, exactly
@@ -60,8 +61,8 @@ docs, plugins and the top-level guidance files).
 Operator escape hatches (both refuse to run implicitly):
 - `compact --include-task-history --source user:<decision>` deep-archives
   the task-archive head chain too; it requires a human decision record via
-  humandecision (provider-signed receipt for policy-v1 tasks, local
-  user-message approval otherwise) and clears the dangling TASK head.
+  humandecision using a provider-signed receipt for every task policy and
+  clears the dangling TASK head. Caller text alone is never authority.
 - `compact --gc-orphans` removes the unindexed archive files that `verify`
   reports (crash-leftover temporaries and unindexed ZIPs), after a full
   deep verification of the index they escaped. Orphans are evidence until
@@ -71,23 +72,70 @@ Operator escape hatches (both refuse to run implicitly):
 from pathlib import Path
 import argparse
 import copy
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
 import json
 import os
 import re
-import tempfile
+import secrets
+import stat
+import struct
 import time
 import zipfile
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import humandecision
+from workflowlib import boundedio
 
 try:
     import contexttx
 except ImportError:  # reduced harnesses ship an evidence-only script subset
     contexttx = None
+
+
+MAX_EVIDENCE_TREE_ENTRIES=32768
+MAX_EVIDENCE_TREE_FILES=16384
+MAX_EVIDENCE_FILE_BYTES=32*1024*1024
+MAX_REFERENCE_FILE_BYTES=16*1024*1024
+MAX_ARCHIVE_RECORDS=32768
+MAX_TASK_ARCHIVES=256
+MAX_ARCHIVE_DIRECTORY_ENTRIES=65536
+MAX_ACTIVE_EVIDENCE_INPUT_BYTES=512*1024*1024
+MAX_REFERENCE_INPUT_BYTES=256*1024*1024
+MAX_ARCHIVED_MEMBER_BYTES=MAX_REFERENCE_FILE_BYTES
+MAX_ARCHIVE_SOURCE_BYTES=MAX_ARCHIVED_MEMBER_BYTES
+MAX_ARCHIVE_CONTAINER_BYTES=32*1024*1024
+MAX_ARCHIVE_MANIFEST_BYTES=4*1024*1024
+MAX_ARCHIVE_ENTRY_METADATA_BYTES=128
+MAX_COMPACTION_SELECTED_BYTES=MAX_ARCHIVE_SOURCE_BYTES
+
+
+def bounded_read(path: Path,label: str,maximum: int=MAX_EVIDENCE_FILE_BYTES) -> bytes:
+    try: return boundedio.read_bytes(path,maximum=maximum,label=label)
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+
+
+def bounded_tree(root: Path,label: str,state=None):
+    state=state if state is not None else {"entries":0,"files":0}; stack=[root]
+    while stack:
+        directory=stack.pop()
+        try:
+            with os.scandir(directory) as scanner:
+                batch=[]
+                for entry in scanner:
+                    state["entries"]+=1
+                    if state["entries"]>MAX_EVIDENCE_TREE_ENTRIES: raise SystemExit(f"{label} entry limit exceeded")
+                    batch.append(entry)
+        except OSError as error: raise SystemExit(f"{label} traversal failed") from error
+        for entry in sorted(batch,key=lambda item:os.fsencode(item.name),reverse=True):
+            metadata=entry.stat(follow_symlinks=False); path=Path(entry.path)
+            if stat.S_ISDIR(metadata.st_mode): stack.append(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                state["files"]+=1
+                if state["files"]>MAX_EVIDENCE_TREE_FILES: raise SystemExit(f"{label} file limit exceeded")
+            yield path,metadata
 
 
 def find_agent_dir() -> Path:
@@ -129,24 +177,25 @@ DEFAULT_REFERENCE_ROOTS = [
 
 
 def load_json(path: Path) -> Dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(bounded_read(path,"evidence JSON").decode("utf-8"))
     if not isinstance(value, dict):
         raise SystemExit(f"JSON object required: {path}")
     return value
 
 
 def atomic_json(path: Path, value: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    temporary = Path(raw)
+    directory=private_directory_fd(path.parent,"evidence state",True); temporary=f".{path.name}.{secrets.token_hex(16)}"; descriptor=None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
+        with os.fdopen(descriptor,"w",encoding="utf-8") as handle:
+            descriptor=None; json.dump(value,handle,ensure_ascii=False,indent=2); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+        os.rename(temporary,path.name,src_dir_fd=directory,dst_dir_fd=directory); temporary=""; os.fsync(directory)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if descriptor is not None: os.close(descriptor)
+        if temporary:
+            try: os.unlink(temporary,dir_fd=directory)
+            except FileNotFoundError: pass
+        os.close(directory)
 
 
 def digest(data: bytes) -> str:
@@ -214,8 +263,8 @@ def load_index() -> Dict[str, object]:
     value = load_json(INDEX)
     if set(value) != {"schema", "archives", "archive_page", "updated_at"} or value.get("schema") != INDEX_SCHEMA:
         raise SystemExit("evidence index schema is invalid")
-    if not isinstance(value.get("archives"), list):
-        raise SystemExit("evidence index archives must be a list")
+    if not isinstance(value.get("archives"),list) or len(value["archives"])>MAX_ARCHIVE_RECORDS:
+        raise SystemExit("evidence index archives must be one bounded list")
     if value.get("archive_page") is not None and not isinstance(value.get("archive_page"), dict):
         raise SystemExit("evidence index archive_page must be an object or null")
     if value.get("updated_at") is not None and not isinstance(value.get("updated_at"), str):
@@ -223,38 +272,186 @@ def load_index() -> Dict[str, object]:
     return value
 
 
-def archive_path(record: Dict[str, object]) -> Path:
-    path = (ROOT / str(record.get("path", ""))).resolve()
+def private_directory_fd(path: Path,label: str,create: bool=True) -> int:
+    try: relative=path.relative_to(ROOT)
+    except ValueError as error: raise SystemExit(f"{label} escapes the repository") from error
+    if not relative.parts or any(part in {"",".",".."} for part in relative.parts): raise SystemExit(f"{label} is not lexical and safe")
+    try: current=boundedio.open_nofollow(ROOT,label)
+    except (OSError,RuntimeError) as error: raise SystemExit(f"{label} repository root is unsafe") from error
+    flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
     try:
-        path.relative_to(ARCHIVES.resolve())
-    except ValueError:
+        for part in relative.parts:
+            try: following=os.open(part,flags,dir_fd=current)
+            except FileNotFoundError:
+                if not create: raise
+                try: os.mkdir(part,0o700,dir_fd=current); following=os.open(part,flags,dir_fd=current)
+                except OSError as error: raise SystemExit(f"{label} directory is unsafe") from error
+            except OSError as error: raise SystemExit(f"{label} directory is unsafe") from error
+            metadata=os.fstat(following)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.geteuid() or stat.S_IMODE(metadata.st_mode)&0o022:
+                os.close(following); raise SystemExit(f"{label} directory is unsafe")
+            os.close(current); current=following
+        return current
+    except BaseException:
+        os.close(current); raise
+
+
+def descriptor_digest(descriptor: int,maximum: int,label: str):
+    opened=os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink<1 or opened.st_size<0 or opened.st_size>maximum: raise SystemExit(f"{label} is unsafe or oversized")
+    identity=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns,opened.st_mode,opened.st_uid,opened.st_nlink)
+    hasher=hashlib.sha256(); total=0; os.lseek(descriptor,0,os.SEEK_SET)
+    while True:
+        chunk=os.read(descriptor,min(1024*1024,maximum-total+1))
+        if not chunk: break
+        total+=len(chunk)
+        if total>maximum: raise SystemExit(f"{label} exceeds its byte limit")
+        hasher.update(chunk)
+    final=os.fstat(descriptor); final_identity=(final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns,final.st_ctime_ns,final.st_mode,final.st_uid,final.st_nlink)
+    if total!=opened.st_size or final_identity!=identity: raise SystemExit(f"{label} changed while hashing")
+    return total,hasher.hexdigest()
+
+
+def open_regular_at(directory: int,name: str,label: str) -> int:
+    if not name or "/" in name or name in {".",".."}: raise SystemExit(f"{label} name is unsafe")
+    try: descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+    except OSError as error: raise SystemExit(f"{label} cannot be opened safely") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode): os.close(descriptor); raise SystemExit(f"{label} is not regular")
+    return descriptor
+
+
+def publish_content_addressed(directory_path: Path,name: str,data: bytes,label: str) -> None:
+    directory=private_directory_fd(directory_path,label,True); temporary=f".{label.replace(' ','-')}.{secrets.token_hex(16)}"; descriptor=None
+    expected=digest(data)
+    try:
+        try: existing=open_regular_at(directory,name,label)
+        except SystemExit:
+            try: os.stat(name,dir_fd=directory,follow_symlinks=False)
+            except FileNotFoundError: existing=None
+            else: raise
+        if existing is not None:
+            try:
+                size,value=descriptor_digest(existing,MAX_EVIDENCE_FILE_BYTES,label)
+                if size!=len(data) or value!=expected: raise SystemExit(f"{label} digest collision")
+                return
+            finally: os.close(existing)
+        descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=directory)
+        view=memoryview(data); offset=0
+        while offset<len(view):
+            written=os.write(descriptor,view[offset:])
+            if written<=0: raise OSError(f"short {label} write")
+            offset+=written
+        os.fsync(descriptor); os.fchmod(descriptor,0o444)
+        try: os.link(temporary,name,src_dir_fd=directory,dst_dir_fd=directory,follow_symlinks=False)
+        except FileExistsError:
+            collision=open_regular_at(directory,name,label)
+            try:
+                size,value=descriptor_digest(collision,MAX_EVIDENCE_FILE_BYTES,label)
+                if size!=len(data) or value!=expected: raise SystemExit(f"{label} digest collision")
+            finally: os.close(collision)
+        os.unlink(temporary,dir_fd=directory); temporary=""; os.fsync(directory)
+    finally:
+        if descriptor is not None: os.close(descriptor)
+        if temporary:
+            try: os.unlink(temporary,dir_fd=directory)
+            except FileNotFoundError: pass
+        os.close(directory)
+
+
+def archive_path(record: Dict[str, object]) -> Path:
+    relative=Path(str(record.get("path","")))
+    expected_prefix=Path(".agent/state/evidence-archives")
+    if relative.is_absolute() or relative.parent!=expected_prefix or any(part in {"",".",".."} for part in relative.parts):
         raise SystemExit("evidence archive path escapes the private archive directory")
-    return path
+    return ROOT/relative
 
 
-def manifest_from_archive(record: Dict[str, object], deep: bool = False) -> Dict[str, object]:
+def bounded_zip_entry_count(descriptor: int,size: int) -> int:
+    tail_size=min(size,65557); os.lseek(descriptor,size-tail_size,os.SEEK_SET); tail=b""
+    while len(tail)<tail_size:
+        chunk=os.read(descriptor,tail_size-len(tail))
+        if not chunk: break
+        tail+=chunk
+    offset=tail.rfind(b"PK\x05\x06")
+    if offset<0 or offset+22>len(tail): raise SystemExit("evidence archive end record is missing")
+    signature,disk,central_disk,disk_entries,total_entries,central_size,central_offset,comment_size=struct.unpack_from("<4s4H2LH",tail,offset)
+    absolute_offset=size-tail_size+offset
+    if signature!=b"PK\x05\x06" or disk or central_disk or disk_entries!=total_entries or total_entries==0xffff or absolute_offset+22+comment_size!=size:
+        raise SystemExit("evidence archive is split, ZIP64, or malformed")
+    if total_entries<1 or total_entries>MAX_EVIDENCE_TREE_FILES+1 or central_size>size or central_offset+central_size>absolute_offset:
+        raise SystemExit("evidence archive entry inventory exceeds its bound")
+    return total_entries
+
+
+def stream_zip_member(handle,name,maximum,label,sink=None):
+    info=handle.getinfo(name)
+    if info.is_dir() or info.flag_bits&1 or info.file_size<0 or info.file_size>maximum: raise SystemExit(f"{label} is unsafe or oversized")
+    total=0; hasher=hashlib.sha256()
+    with handle.open(info,"r") as source:
+        while True:
+            chunk=source.read(min(1024*1024,maximum-total+1))
+            if not chunk: break
+            total+=len(chunk)
+            if total>maximum: raise SystemExit(f"{label} exceeds its byte limit")
+            hasher.update(chunk)
+            if sink is not None: sink(chunk)
+    if total!=info.file_size: raise SystemExit(f"{label} changed while reading")
+    return total,hasher.hexdigest()
+
+
+def bounded_manifest_member(handle,name,maximum,label):
+    chunks=[]; total,_value=stream_zip_member(handle,name,maximum,label,chunks.append); data=b"".join(chunks)
+    if len(data)!=total: raise SystemExit(f"{label} materialization drifted")
+    return data
+
+
+@contextlib.contextmanager
+def verified_archive_zip(archive: Path,record: Dict[str,object],archive_digest: str):
+    try: before=os.lstat(archive); descriptor=boundedio.open_nofollow(archive,"evidence archive")
+    except (OSError,RuntimeError) as error: raise SystemExit("evidence archive cannot be opened safely") from error
+    identity=lambda item:(item.st_dev,item.st_ino,item.st_size,item.st_mtime_ns,item.st_ctime_ns,item.st_mode,item.st_uid,item.st_nlink)
+    opened=os.fstat(descriptor)
+    try:
+        if identity(before)!=identity(opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1 or opened.st_size!=record["bytes"]: raise SystemExit("evidence archive changed while opening")
+        hasher=hashlib.sha256(); total=0; os.lseek(descriptor,0,os.SEEK_SET)
+        while True:
+            chunk=os.read(descriptor,min(1024*1024,MAX_ARCHIVE_CONTAINER_BYTES-total+1))
+            if not chunk: break
+            total+=len(chunk)
+            if total>MAX_ARCHIVE_CONTAINER_BYTES: raise SystemExit("evidence archive exceeds its byte limit")
+            hasher.update(chunk)
+        if total!=opened.st_size or hasher.hexdigest()!=archive_digest: raise SystemExit("evidence archive bytes drifted")
+        expected_count=bounded_zip_entry_count(descriptor,total); os.lseek(descriptor,0,os.SEEK_SET)
+        stream=os.fdopen(os.dup(descriptor),"rb")
+        try:
+            with zipfile.ZipFile(stream,"r") as handle: yield handle,expected_count
+        finally: stream.close()
+        if identity(os.fstat(descriptor))!=identity(opened): raise SystemExit("evidence archive changed while verifying")
+    finally: os.close(descriptor)
+
+
+def manifest_from_archive(record: Dict[str, object],deep: bool=False):
     if set(record) != ARCHIVE_FIELDS or record.get("schema") != HEAD_SCHEMA:
         raise SystemExit("evidence archive head fields are invalid")
-    archive = archive_path(record); archive_digest = str(record.get("sha256", ""))
-    expected = ARCHIVES / f"{archive_digest}.zip"
+    archive_digest=str(record.get("sha256","")); expected=ARCHIVES/f"{archive_digest}.zip"; archive=expected
+    expected_relative=str(expected.relative_to(ROOT))
     if (
-        SHA.fullmatch(archive_digest) is None or archive != expected.resolve()
-        or not isinstance(record.get("bytes"), int) or record["bytes"] < 1
-        or not isinstance(record.get("file_count"), int) or record["file_count"] < 1
-        or not isinstance(record.get("source_bytes"), int) or record["source_bytes"] < 0
+        SHA.fullmatch(archive_digest) is None or record.get("path")!=expected_relative
+        or not isinstance(record.get("bytes"),int) or isinstance(record.get("bytes"),bool) or not 1<=record["bytes"]<=MAX_ARCHIVE_CONTAINER_BYTES
+        or not isinstance(record.get("file_count"),int) or isinstance(record.get("file_count"),bool) or not 1<=record["file_count"]<=MAX_EVIDENCE_TREE_FILES
+        or not isinstance(record.get("source_bytes"),int) or isinstance(record.get("source_bytes"),bool) or not 0<=record["source_bytes"]<=MAX_ARCHIVE_SOURCE_BYTES
         or not isinstance(record.get("manifest_sha256"), str)
         or not isinstance(record.get("created_at"), str)
         or not archive.is_file() or archive.is_symlink()
     ):
         raise SystemExit("evidence archive head is invalid or missing")
-    data = archive.read_bytes()
-    if len(data) != record["bytes"] or digest(data) != archive_digest:
-        raise SystemExit("evidence archive bytes drifted")
     try:
-        with zipfile.ZipFile(archive, "r") as handle:
-            if "MANIFEST.json" not in handle.namelist():
-                raise SystemExit("evidence archive manifest is missing")
-            manifest_bytes = handle.read("MANIFEST.json")
+        with verified_archive_zip(archive,record,archive_digest) as (handle,expected_zip_entries):
+            infos=handle.infolist()
+            if len(infos)!=expected_zip_entries: raise SystemExit("evidence archive central inventory drifted")
+            zip_names=[info.filename for info in infos]
+            if "MANIFEST.json" not in zip_names: raise SystemExit("evidence archive manifest is missing")
+            manifest_bytes=bounded_manifest_member(handle,"MANIFEST.json",MAX_ARCHIVE_MANIFEST_BYTES,"evidence archive manifest")
             manifest = json.loads(manifest_bytes)
             entries = manifest.get("entries") if isinstance(manifest, dict) else None
             if (
@@ -271,20 +468,22 @@ def manifest_from_archive(record: Dict[str, object], deep: bool = False) -> Dict
             if len(names) != len(entries) or len(names) != len(set(names)) or names != sorted(names):
                 raise SystemExit("evidence archive entry paths are invalid")
             expected_names = {"MANIFEST.json", *names}
-            if set(handle.namelist()) != expected_names:
+            if len(zip_names)!=len(set(zip_names)) or set(zip_names)!=expected_names:
                 raise SystemExit("evidence archive ZIP entries differ from its manifest")
             for entry in entries:
                 if (
                     not isinstance(entry, dict) or set(entry) != {"path", "sha256", "bytes"}
                     or not isinstance(entry.get("path"), str)
                     or not str(entry["path"]).startswith(".agent/state/evidence/")
-                    or SHA.fullmatch(str(entry.get("sha256", ""))) is None
-                    or not isinstance(entry.get("bytes"), int) or entry["bytes"] < 0
-                ):
-                    raise SystemExit("evidence archive entry receipt is invalid")
+                    or SHA.fullmatch(str(entry.get("sha256",""))) is None
+                    or not isinstance(entry.get("bytes"),int) or isinstance(entry.get("bytes"),bool) or not 0<=entry["bytes"]<=MAX_ARCHIVED_MEMBER_BYTES
+                ): raise SystemExit("evidence archive entry receipt is invalid")
+                relative_path=Path(entry["path"])
+                if relative_path.is_absolute() or relative_path.parts[:3]!=(".agent","state","evidence") or any(part in {"",".",".."} for part in relative_path.parts):
+                    raise SystemExit("evidence archive entry path is unsafe")
                 if deep:
-                    member = handle.read(str(entry["path"]))
-                    if len(member) != entry["bytes"] or digest(member) != entry["sha256"]:
+                    member_bytes,member_sha=stream_zip_member(handle,str(entry["path"]),min(MAX_ARCHIVED_MEMBER_BYTES,entry["bytes"]),"archived evidence member")
+                    if member_bytes!=entry["bytes"] or member_sha!=entry["sha256"]:
                         raise SystemExit(f"archived evidence drifted: {entry['path']}")
             return manifest
     except (OSError, zipfile.BadZipFile, json.JSONDecodeError, KeyError) as error:
@@ -293,9 +492,10 @@ def manifest_from_archive(record: Dict[str, object], deep: bool = False) -> Dict
 
 def page_records(head: object) -> List[Dict[str, object]]:
     required = {"schema", "path", "sha256", "bytes", "total_archives", "depth"}
-    chain: List[Tuple[Dict[str, object], List[Dict[str, object]]]] = []
-    current = head; seen: Set[str] = set()
+    chain: List[Tuple[Dict[str,object],List[Dict[str,object]]]]=[]
+    current=head; seen: Set[str]=set(); record_count=0
     while current is not None:
+        if len(chain)>=4096: raise SystemExit("evidence archive page chain exceeds its depth limit")
         if not isinstance(current, dict) or set(current) != required:
             raise SystemExit("evidence archive page head fields are invalid")
         value_sha = str(current.get("sha256", ""))
@@ -310,7 +510,7 @@ def page_records(head: object) -> List[Dict[str, object]]:
             or not path.is_file() or path.is_symlink()
         ):
             raise SystemExit("evidence archive page head is invalid or missing")
-        seen.add(value_sha); data = path.read_bytes()
+        seen.add(value_sha); data = bounded_read(path,"evidence file")
         if len(data) != current["bytes"] or digest(data) != value_sha:
             raise SystemExit("evidence archive page bytes drifted")
         value = json.loads(data)
@@ -318,11 +518,13 @@ def page_records(head: object) -> List[Dict[str, object]]:
         previous = value.get("previous") if isinstance(value, dict) else None
         if (
             not isinstance(value, dict) or set(value) != {"schema", "previous", "archives"}
-            or value.get("schema") != PAGE_SCHEMA or not isinstance(records, list) or not records
+            or value.get("schema")!=PAGE_SCHEMA or not isinstance(records,list) or not records or len(records)>MAX_ARCHIVE_RECORDS
             or any(not isinstance(record, dict) for record in records)
         ):
             raise SystemExit("evidence archive page content is invalid")
-        chain.append((current, records)); current = previous
+        record_count+=len(records)
+        if record_count>MAX_ARCHIVE_RECORDS: raise SystemExit("evidence archive page records exceed their limit")
+        chain.append((current,records)); current=previous
     flattened: List[Dict[str, object]] = []
     for depth, (page_head, records) in enumerate(reversed(chain), start=1):
         flattened.extend(records)
@@ -359,17 +561,26 @@ def verify_index(deep: bool = False) -> Tuple[Dict[str, object], Dict[str, List[
     return index, archived
 
 
-def orphan_archives(index: Dict[str, object]) -> List[Path]:
-    """Files inside the private archive directory that no index record binds.
+def open_archive_directory() -> Optional[int]:
+    try: return private_directory_fd(ARCHIVES,"evidence archive root",False)
+    except FileNotFoundError: return None
 
-    These are crash-leftover temporaries or unindexed ZIPs. They are still
-    potential evidence, so `verify` only reports them; removal requires the
-    explicit `compact --gc-orphans` operator pass.
-    """
-    if not ARCHIVES.is_dir():
-        return []
-    indexed = {f"{record.get('sha256')}.zip" for record in all_records(index)}
-    return [path for path in sorted(ARCHIVES.iterdir()) if path.name not in indexed]
+
+def orphan_archive_names(index: Dict[str,object],descriptor: int) -> List[str]:
+    indexed={f"{record.get('sha256')}.zip" for record in all_records(index)}; names=[]; observed=0
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            observed+=1
+            if observed>MAX_ARCHIVE_DIRECTORY_ENTRIES: raise SystemExit("evidence archive inventory exceeds its entry limit")
+            if entry.name not in indexed: names.append(entry.name)
+    return sorted(names,key=os.fsencode)
+
+
+def orphan_archives(index: Dict[str, object]) -> List[Path]:
+    descriptor=open_archive_directory()
+    if descriptor is None: return []
+    try: return [ARCHIVES/name for name in orphan_archive_names(index,descriptor)]
+    finally: os.close(descriptor)
 
 
 def publish_page(previous: object, records: List[Dict[str, object]]) -> Dict[str, object]:
@@ -379,20 +590,8 @@ def publish_page(previous: object, records: List[Dict[str, object]]) -> Dict[str
     prior_depth = int(previous.get("depth", 0)) if isinstance(previous, dict) else 0
     value = {"schema": PAGE_SCHEMA, "previous": previous, "archives": records}
     data = canonical(value); value_sha = digest(data)
-    ARCHIVE_PAGES.mkdir(parents=True, exist_ok=True)
     target = ARCHIVE_PAGES / f"{value_sha}.json"
-    if target.exists():
-        if target.is_symlink() or target.read_bytes() != data:
-            raise SystemExit("evidence archive page digest collision")
-    else:
-        descriptor, raw = tempfile.mkstemp(prefix=".archive-page.", dir=str(ARCHIVE_PAGES))
-        temporary = Path(raw)
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(data); output.flush(); os.fsync(output.fileno())
-            os.replace(temporary, target); target.chmod(0o444)
-        finally:
-            if temporary.exists(): temporary.unlink()
+    publish_content_addressed(ARCHIVE_PAGES,target.name,data,"evidence archive page")
     return {
         "schema": PAGE_HEAD_SCHEMA,
         "path": str(target.relative_to(ROOT)),
@@ -404,13 +603,17 @@ def publish_page(previous: object, records: List[Dict[str, object]]) -> Dict[str
 
 
 def evidence_files() -> Dict[str, Path]:
-    EVIDENCE.mkdir(parents=True, exist_ok=True)
+    evidence_directory=private_directory_fd(EVIDENCE,"active evidence root",True); os.close(evidence_directory)
     result: Dict[str, Path] = {}
-    for path in sorted(EVIDENCE.rglob("*")):
-        if path.is_symlink():
-            raise SystemExit(f"evidence symlink is forbidden: {path.relative_to(ROOT)}")
-        if path.is_file():
-            result[str(path.relative_to(ROOT))] = path
+    entries=list(bounded_tree(EVIDENCE,"active evidence inventory"))
+    total_bytes=0
+    for path,metadata in sorted(entries,key=lambda item:item[0].relative_to(EVIDENCE).as_posix().encode()):
+        if stat.S_ISLNK(metadata.st_mode): raise SystemExit(f"evidence symlink is forbidden: {path.relative_to(ROOT)}")
+        if stat.S_ISREG(metadata.st_mode):
+            total_bytes+=metadata.st_size
+            if total_bytes>MAX_ACTIVE_EVIDENCE_INPUT_BYTES: raise SystemExit("active evidence aggregate byte limit exceeded")
+            result[str(path.relative_to(ROOT))]=path
+        elif not stat.S_ISDIR(metadata.st_mode): raise SystemExit(f"evidence special file is forbidden: {path.relative_to(ROOT)}")
     return result
 
 
@@ -420,11 +623,9 @@ def active_bytes() -> int:
 
 def textual_references(path: Path, known: Set[str], digests: Dict[str, List[str]]) -> Set[str]:
     try:
-        data = path.read_bytes()
+        data=bounded_read(path,"reference source",MAX_REFERENCE_FILE_BYTES)
     except OSError:
         return set()
-    if len(data) > 16 * 1024 * 1024:
-        raise SystemExit(f"reference source is too large for safe evidence compaction: {path.relative_to(ROOT)}")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -456,37 +657,39 @@ def textual_references(path: Path, known: Set[str], digests: Dict[str, List[str]
 
 
 def root_reference_files() -> Iterable[Path]:
-    seen: Set[Path] = set()
-    candidates: List[Path] = []
+    seen: Set[Tuple[int,int]]=set(); candidates: List[Path]=[]; state={"entries":0,"files":0}
+    def include(path):
+        if len(candidates)>=MAX_EVIDENCE_TREE_ENTRIES: raise SystemExit("reference-root candidate limit exceeded")
+        candidates.append(path)
     for entry in reference_roots():
         if any(char in entry for char in "*?["):
-            candidates.extend(sorted(ROOT.glob(entry)))
+            if "**" in entry: raise SystemExit("recursive reference-root globs are forbidden; declare the root directory")
+            for candidate in ROOT.glob(entry): include(candidate)
             continue
         base = ROOT / entry
-        if base.is_dir():
-            candidates.extend(sorted(base.rglob("*")))
-        else:
-            candidates.append(base)
-    for path in candidates:
+        if base.is_dir() and not base.is_symlink():
+            for candidate,_metadata in bounded_tree(base,"reference roots",state): include(candidate)
+        else: include(base)
+    total_bytes=0
+    for path in sorted(candidates,key=lambda item:os.fsencode(str(item))):
         if not path.exists():
             continue
         if path.is_symlink():
             raise SystemExit(f"reference source symlink is forbidden: {path.relative_to(ROOT)}")
         if not path.is_file():
             continue
-        resolved = path.resolve()
-        # Active evidence, deep archives and the index itself never act as
-        # reference roots (the evidence tree is traversed transitively).
-        if EVIDENCE in resolved.parents or ARCHIVES in resolved.parents or resolved == INDEX:
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
+        # Active evidence, deep archives and the index itself never act as reference roots.
+        if EVIDENCE in path.parents or ARCHIVES in path.parents or path==INDEX: continue
+        metadata=os.lstat(path); identity=(metadata.st_dev,metadata.st_ino)
+        if identity in seen: continue
+        total_bytes+=metadata.st_size
+        if total_bytes>MAX_REFERENCE_INPUT_BYTES: raise SystemExit("reference-root aggregate byte limit exceeded")
+        seen.add(identity)
         yield path
 
 
 def matching_receipt(path: Path, versions: Iterable[Dict[str, object]]) -> Optional[Dict[str, object]]:
-    data = path.read_bytes(); size = len(data); value = digest(data)
+    data = bounded_read(path,"evidence file"); size = len(data); value = digest(data)
     return next(
         (entry for entry in versions if entry.get("bytes") == size and entry.get("sha256") == value),
         None,
@@ -498,7 +701,7 @@ def task_archive_payload(path: Path) -> Optional[Dict[str, object]]:
     if TASK_ARCHIVES not in path.parents:
         return None
     try:
-        value = json.loads(path.read_bytes())
+        value = json.loads(bounded_read(path,"evidence file"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
@@ -508,7 +711,7 @@ def reachable_evidence(files: Dict[str, Path]) -> Set[str]:
     known = set(files)
     digests: Dict[str, List[str]] = {}
     for relative, path in files.items():
-        digests.setdefault(digest(path.read_bytes()), []).append(relative)
+        digests.setdefault(digest(bounded_read(path,"evidence file")), []).append(relative)
     reachable: Set[str] = set(); queue: List[str] = []
 
     def absorb(reference: str) -> None:
@@ -583,7 +786,14 @@ def plan(min_age_hours: int, force: bool = False, include_task_history: bool = F
         force or include_task_history or active_bytes > int(retention["active_max_bytes"])
         or candidate_bytes >= int(retention["min_archive_bytes"])
     )
-    selected = candidates if should_archive else []
+    selected=[]; selected_total=0; selected_manifest_budget=0
+    if should_archive:
+        for relative in candidates:
+            size=files[relative].stat().st_size
+            entry_budget=len(relative.encode("utf-8"))+MAX_ARCHIVE_ENTRY_METADATA_BYTES
+            if selected_total+size>MAX_COMPACTION_SELECTED_BYTES or selected_manifest_budget+entry_budget>MAX_ARCHIVE_MANIFEST_BYTES: break
+            selected.append(relative); selected_total+=size; selected_manifest_budget+=entry_budget
+        if candidates and not selected: raise SystemExit("one evidence candidate exceeds the compaction aggregate byte limit")
     return {
         "schema": "agent-evidence-compaction-plan/v1",
         "active_files": len(files), "active_bytes": active_bytes,
@@ -604,67 +814,89 @@ def zip_info(name: str) -> zipfile.ZipInfo:
     return info
 
 
-def publish_archive(selected: List[str], files: Dict[str, Path]) -> Dict[str, object]:
-    entries = []
-    payloads: Dict[str, bytes] = {}
-    for relative in sorted(selected):
-        data = files[relative].read_bytes(); payloads[relative] = data
-        entries.append({"path": relative, "sha256": digest(data), "bytes": len(data)})
-    manifest = {"schema": ARCHIVE_SCHEMA, "entries": entries}
-    manifest_bytes = canonical(manifest)
-    ARCHIVES.mkdir(parents=True, exist_ok=True)
-    descriptor, raw = tempfile.mkstemp(prefix=".evidence-archive.", suffix=".zip", dir=str(ARCHIVES))
-    os.close(descriptor); temporary = Path(raw)
+def stream_evidence_to_zip(path: Path,handle,name: str,maximum: int):
+    try: before=os.lstat(path); descriptor=boundedio.open_nofollow(path,"active evidence")
+    except (OSError,RuntimeError) as error: raise SystemExit("active evidence cannot be opened safely") from error
+    identity=lambda item:(item.st_dev,item.st_ino,item.st_size,item.st_mtime_ns,item.st_ctime_ns,item.st_mode,item.st_uid,item.st_nlink)
+    opened=os.fstat(descriptor); total=0; hasher=hashlib.sha256()
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
-            handle.writestr(zip_info("MANIFEST.json"), manifest_bytes)
-            for relative in sorted(payloads):
-                handle.writestr(zip_info(relative), payloads[relative])
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
-        archive_bytes = temporary.read_bytes(); archive_digest = digest(archive_bytes)
-        target = ARCHIVES / f"{archive_digest}.zip"
-        if target.exists():
-            if target.is_symlink() or target.read_bytes() != archive_bytes:
-                raise SystemExit("evidence archive digest collision")
-            temporary.unlink()
+        if identity(before)!=identity(opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1 or opened.st_size>maximum: raise SystemExit("active evidence is unsafe or oversized")
+        with handle.open(zip_info(name),"w") as target:
+            while True:
+                chunk=os.read(descriptor,min(1024*1024,maximum-total+1))
+                if not chunk: break
+                total+=len(chunk)
+                if total>maximum: raise SystemExit("active evidence exceeds its byte limit")
+                hasher.update(chunk); target.write(chunk)
+        if total!=opened.st_size or identity(os.fstat(descriptor))!=identity(opened): raise SystemExit("active evidence changed while archiving")
+        return total,hasher.hexdigest()
+    finally: os.close(descriptor)
+
+
+def publish_archive(selected: List[str], files: Dict[str, Path]) -> Dict[str, object]:
+    entries=[]; directory=private_directory_fd(ARCHIVES,"evidence archive root",True)
+    temporary=f".evidence-archive.{secrets.token_hex(16)}.zip"; descriptor=None
+    try:
+        descriptor=os.open(temporary,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=directory)
+        selected_total=0
+        stream=os.fdopen(os.dup(descriptor),"w+b")
+        try:
+            with zipfile.ZipFile(stream,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=9) as handle:
+                for relative in sorted(selected):
+                    size,value=stream_evidence_to_zip(files[relative],handle,relative,MAX_ARCHIVED_MEMBER_BYTES)
+                    selected_total+=size
+                    if selected_total>MAX_COMPACTION_SELECTED_BYTES: raise SystemExit("compaction aggregate byte limit exceeded")
+                    entries.append({"path":relative,"sha256":value,"bytes":size})
+                manifest={"schema":ARCHIVE_SCHEMA,"entries":entries}; manifest_bytes=canonical(manifest)
+                if len(manifest_bytes)>MAX_ARCHIVE_MANIFEST_BYTES: raise SystemExit("evidence archive manifest exceeds its byte limit")
+                handle.writestr(zip_info("MANIFEST.json"),manifest_bytes)
+            stream.flush()
+        finally: stream.close()
+        os.fsync(descriptor); archive_size,archive_digest=descriptor_digest(descriptor,MAX_ARCHIVE_CONTAINER_BYTES,"temporary evidence archive")
+        target_name=f"{archive_digest}.zip"; target=ARCHIVES/target_name
+        try: existing=os.open(target_name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+        except FileNotFoundError: existing=None
+        except OSError as error: raise SystemExit("evidence archive digest collision") from error
+        if existing is not None:
+            try:
+                target_size,target_digest=descriptor_digest(existing,MAX_ARCHIVE_CONTAINER_BYTES,"evidence archive target")
+                if target_size!=archive_size or target_digest!=archive_digest: raise SystemExit("evidence archive digest collision")
+            finally: os.close(existing)
         else:
-            os.replace(temporary, target); target.chmod(0o444)
-        record = {
-            "schema": HEAD_SCHEMA,
-            "path": str(target.relative_to(ROOT)),
-            "sha256": archive_digest,
-            "bytes": len(archive_bytes),
-            "file_count": len(entries),
-            "source_bytes": sum(entry["bytes"] for entry in entries),
-            "created_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
-            "manifest_sha256": digest(manifest_bytes),
+            os.fchmod(descriptor,0o444)
+            try: os.link(temporary,target_name,src_dir_fd=directory,dst_dir_fd=directory,follow_symlinks=False)
+            except FileExistsError:
+                collision=open_regular_at(directory,target_name,"evidence archive target")
+                try:
+                    target_size,target_digest=descriptor_digest(collision,MAX_ARCHIVE_CONTAINER_BYTES,"evidence archive target")
+                    if target_size!=archive_size or target_digest!=archive_digest: raise SystemExit("evidence archive digest collision")
+                finally: os.close(collision)
+        os.unlink(temporary,dir_fd=directory); temporary=""; os.fsync(directory)
+        record={
+            "schema":HEAD_SCHEMA,"path":str(target.relative_to(ROOT)),"sha256":archive_digest,"bytes":archive_size,
+            "file_count":len(entries),"source_bytes":sum(entry["bytes"] for entry in entries),
+            "created_at":dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),"manifest_sha256":digest(manifest_bytes),
         }
-        manifest_from_archive(record, deep=True)
-        return record
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if descriptor is not None: os.close(descriptor)
+        if temporary:
+            try: os.unlink(temporary,dir_fd=directory)
+            except FileNotFoundError: pass
+        os.close(directory)
+    manifest_from_archive(record,deep=True)
+    return record
 
 
 def remove_exact(relative_paths: Iterable[str], receipts: Dict[str, Dict[str, object]]) -> int:
     removed = 0
     for relative in sorted(set(relative_paths)):
-        path = (ROOT / relative).resolve()
-        try:
-            path.relative_to(EVIDENCE.resolve())
-        except ValueError:
-            raise SystemExit("evidence removal target escapes active evidence")
-        receipt = receipts.get(relative)
-        if receipt is None or not path.is_file() or path.is_symlink():
-            raise SystemExit(f"evidence removal lacks verified archive authority: {relative}")
-        data = path.read_bytes()
-        if len(data) != receipt["bytes"] or digest(data) != receipt["sha256"]:
-            raise SystemExit(f"evidence changed before archive removal: {relative}")
-        path.unlink(); removed += 1
-    for directory in sorted((path for path in EVIDENCE.rglob("*") if path.is_dir()), reverse=True):
-        if not any(directory.iterdir()):
-            directory.rmdir()
+        receipt=receipts.get(relative)
+        if receipt is None: raise SystemExit(f"evidence removal lacks verified archive authority: {relative}")
+        remove_evidence_target(relative,receipt); removed+=1
+    directories=[path for path,metadata in bounded_tree(EVIDENCE,"evidence directory cleanup") if stat.S_ISDIR(metadata.st_mode)]
+    for directory in sorted(directories,key=lambda item:(len(item.parts),os.fsencode(str(item))),reverse=True):
+        with os.scandir(directory) as scanner: empty=next(scanner,None) is None
+        if empty: directory.rmdir()
     return removed
 
 
@@ -676,24 +908,25 @@ def task_history_decision(selected: List[str], source: Optional[str], receipt: O
     packet_sha256 = digest(canonical(packet))
     task = load_json(TASK) if TASK.is_file() else {}
     config = load_json(CONFIG)
-    if task.get("decision_policy_version") == humandecision.PROVIDER_POLICY_VERSION:
-        if not receipt:
-            raise SystemExit("task-history compaction requires a provider-signed human decision receipt")
-        return humandecision.verify(
-            ROOT, config, task, gate=TASK_HISTORY_DECISION_GATE,
-            artifact_sha256=packet_sha256, source=str(source), receipt=receipt,
-        )
-    if receipt:
-        raise SystemExit("local task-history approval does not accept an unaudited provider receipt")
-    # Bind the same routing profile the provider receipts bind: a local
-    # approval without `task` is a 3-key record that bypasses the routing
-    # profile check (see workflowctl command_approve).
-    return humandecision.local_approval(str(source), packet_sha256, task)
+    if not receipt:
+        raise SystemExit("task-history compaction requires a provider-signed human decision receipt")
+    return humandecision.verify(
+        ROOT, config, task, gate=TASK_HISTORY_DECISION_GATE,
+        artifact_sha256=packet_sha256, source=str(source), receipt=receipt,
+    )
+
+
+def clear_compacted_task_head():
+    if not TASK.is_file(): return
+    before_task=load_json(TASK)
+    if before_task.get("task_archive") is None: return
+    after_task=copy.deepcopy(before_task); after_task["task_archive"]=None
+    commit_task_head(before_task,after_task,reason="evidence-task-history-compacted",
+        summary="cleared the archived task-history head after human-approved compaction")
 
 
 def command_compact(args: argparse.Namespace) -> int:
-    LOCK.parent.mkdir(parents=True, exist_ok=True); LOCK.touch(exist_ok=True)
-    with LOCK.open("r+") as handle:
+    with evidence_lock_handle() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         retention = policy()
         age = int(retention["min_age_hours"]) if args.min_age_hours is None else args.min_age_hours
@@ -702,24 +935,26 @@ def command_compact(args: argparse.Namespace) -> int:
             # deep verification of the index they escaped. Every removal is
             # listed; --dry-run lists without touching anything.
             index, _ = verify_index(deep=True)
-            orphans = orphan_archives(index)
-            if args.dry_run:
-                print(json.dumps({
-                    "schema": "agent-evidence-orphan-gc-plan/v1",
-                    "orphans": [str(path.relative_to(ROOT)) for path in orphans],
-                }, ensure_ascii=False, indent=2))
+            descriptor=open_archive_directory()
+            if descriptor is None:
+                names=[]
+                if args.dry_run: print(json.dumps({"schema":"agent-evidence-orphan-gc-plan/v1","orphans":[]},indent=2))
+                else: print("EVIDENCE ORPHAN GC: removed=0")
                 return 0
-            removed = 0
-            for orphan in orphans:
-                if orphan.is_symlink():
-                    raise SystemExit(f"evidence orphan symlink is forbidden: {orphan.relative_to(ROOT)}")
-                if not orphan.is_file():
-                    print(f"EVIDENCE ORPHAN SKIPPED: {orphan.relative_to(ROOT)}")
-                    continue
-                print(f"EVIDENCE ORPHAN REMOVED: {orphan.relative_to(ROOT)}")
-                orphan.unlink(); removed += 1
-            print(f"EVIDENCE ORPHAN GC: removed={removed}")
-            return 0
+            try:
+                names=orphan_archive_names(index,descriptor)
+                if args.dry_run:
+                    print(json.dumps({"schema":"agent-evidence-orphan-gc-plan/v1",
+                        "orphans":[str((ARCHIVES/name).relative_to(ROOT)) for name in names]},ensure_ascii=False,indent=2))
+                    return 0
+                removed=0
+                for name in names:
+                    observed=os.stat(name,dir_fd=descriptor,follow_symlinks=False); relative=(ARCHIVES/name).relative_to(ROOT)
+                    if stat.S_ISLNK(observed.st_mode): raise SystemExit(f"evidence orphan symlink is forbidden: {relative}")
+                    if not stat.S_ISREG(observed.st_mode): print(f"EVIDENCE ORPHAN SKIPPED: {relative}"); continue
+                    os.unlink(name,dir_fd=descriptor); print(f"EVIDENCE ORPHAN REMOVED: {relative}"); removed+=1
+                print(f"EVIDENCE ORPHAN GC: removed={removed}"); return 0
+            finally: os.close(descriptor)
         current_plan = plan(age, force=args.force, include_task_history=args.include_task_history)
         if args.dry_run:
             print(json.dumps(current_plan, ensure_ascii=False, indent=2)); return 0
@@ -728,8 +963,9 @@ def command_compact(args: argparse.Namespace) -> int:
         # duplicate-reconciliation path were deep-verified.
         index, archived = verify_index(deep=True); files = evidence_files()
         selected = list(current_plan["selected"])
+        duplicate_paths = list(current_plan["archived_duplicates"])
         history = {relative for relative, path in files.items() if TASK_ARCHIVES in path.parents}
-        history_selected = sorted(set(selected) & history)
+        history_selected = sorted((set(selected)|set(duplicate_paths)) & history)
         if history_selected and not args.include_task_history:
             raise SystemExit(
                 "task-history evidence is selected for archival; rerun with "
@@ -738,8 +974,8 @@ def command_compact(args: argparse.Namespace) -> int:
         if history_selected:
             decision = task_history_decision(history_selected, args.source, args.human_decision_receipt)
             print(f"TASK HISTORY DECISION: {json.dumps(decision, ensure_ascii=False, sort_keys=True)}")
-        duplicate_paths = list(current_plan["archived_duplicates"])
         if duplicate_paths:
+            if set(duplicate_paths)&set(history_selected): clear_compacted_task_head()
             duplicate_receipts: Dict[str, Dict[str, object]] = {}
             for relative in duplicate_paths:
                 receipt = matching_receipt(files[relative], archived.get(relative, []))
@@ -774,21 +1010,10 @@ def command_compact(args: argparse.Namespace) -> int:
         }
         atomic_json(INDEX, updated)
         receipts = {str(entry["path"]): entry for entry in manifest["entries"]}
+        # Publication and capsule rebind precede destructive GC. A crash before
+        # this point leaves only safe duplicates; a retry rebinds before removal.
+        if set(selected)&set(history_selected): clear_compacted_task_head()
         removed = remove_exact(selected, receipts)
-        if history_selected and TASK.is_file():
-            # The head chain now lives only inside the deep archive; drop the
-            # dangling active head pointer so later archival starts fresh.
-            # The head is a capsule-bound TASK invariant: move it through the
-            # canonical transition so the capsule is re-bound atomically.
-            before_task = load_json(TASK)
-            if before_task.get("task_archive") is not None:
-                after_task = copy.deepcopy(before_task)
-                after_task["task_archive"] = None
-                commit_task_head(
-                    before_task, after_task,
-                    reason="evidence-task-history-compacted",
-                    summary="cleared the archived task-history head after human-approved compaction",
-                )
         print(
             f"EVIDENCE COMPACTED: files={removed} source_bytes={record['source_bytes']} "
             f"archive_bytes={record['bytes']} archive={record['sha256']}"
@@ -817,11 +1042,142 @@ def command_status(args: argparse.Namespace) -> int:
     print(json.dumps(plan(age, force=False), ensure_ascii=False, indent=2)); return 0
 
 
+def evidence_target_parts(relative: str):
+    value=Path(relative)
+    if value.is_absolute() or len(value.parts)<4 or value.parts[:3]!=(".agent","state","evidence") or any(part in {"",".",".."} for part in value.parts):
+        raise SystemExit("evidence target escapes active evidence")
+    return value.parts
+
+
+def open_evidence_parent(relative: str,create: bool):
+    parts=evidence_target_parts(relative); flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+    current=os.open(ROOT,flags)
+    try:
+        for part in parts[:-1]:
+            try: following=os.open(part,flags,dir_fd=current)
+            except FileNotFoundError:
+                if not create: raise
+                os.mkdir(part,0o700,dir_fd=current); following=os.open(part,flags,dir_fd=current)
+            metadata=os.fstat(following)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.geteuid() or stat.S_IMODE(metadata.st_mode)&0o022:
+                os.close(following); raise SystemExit("evidence target parent is unsafe")
+            os.close(current); current=following
+        return current,parts[-1]
+    except BaseException:
+        os.close(current); raise
+
+
+def bounded_descriptor_read(descriptor: int,label: str,maximum: int=MAX_EVIDENCE_FILE_BYTES):
+    opened=os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1 or opened.st_size<0 or opened.st_size>maximum:
+        raise SystemExit(f"{label} is unsafe or exceeds its byte limit")
+    identity=(opened.st_dev,opened.st_ino,stat.S_IMODE(opened.st_mode),opened.st_nlink,opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns)
+    chunks=[]; total=0
+    while True:
+        chunk=os.read(descriptor,min(1024*1024,maximum-total+1))
+        if not chunk: break
+        chunks.append(chunk); total+=len(chunk)
+        if total>maximum: raise SystemExit(f"{label} exceeds its byte limit")
+    final=os.fstat(descriptor)
+    final_identity=(final.st_dev,final.st_ino,stat.S_IMODE(final.st_mode),final.st_nlink,final.st_size,final.st_mtime_ns,final.st_ctime_ns)
+    if final_identity!=identity or total!=opened.st_size: raise SystemExit(f"{label} changed while reading")
+    return b"".join(chunks),identity
+
+
+def read_evidence_target_at(parent: int,name: str):
+    try: descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+    except FileNotFoundError: return None
+    try: data,_identity=bounded_descriptor_read(descriptor,"evidence archive target")
+    finally: os.close(descriptor)
+    return data
+
+
+def read_evidence_target(relative: str):
+    try: parent,name=open_evidence_parent(relative,False)
+    except FileNotFoundError: return None
+    try: return read_evidence_target_at(parent,name)
+    except OSError as error: raise SystemExit("evidence archive target is unsafe") from error
+    finally: os.close(parent)
+
+
+def remove_evidence_target(relative: str,receipt: Dict[str,object]) -> None:
+    try: parent,name=open_evidence_parent(relative,False)
+    except FileNotFoundError as error: raise SystemExit(f"evidence removal target is missing: {relative}") from error
+    try:
+        descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+        try: data,identity=bounded_descriptor_read(descriptor,"evidence file")
+        finally: os.close(descriptor)
+        current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        current_identity=(current.st_dev,current.st_ino,stat.S_IMODE(current.st_mode),current.st_nlink,current.st_size,current.st_mtime_ns,current.st_ctime_ns)
+        if current_identity!=identity or len(data)!=receipt["bytes"] or digest(data)!=receipt["sha256"]:
+            raise SystemExit(f"evidence changed before archive removal: {relative}")
+        os.unlink(name,dir_fd=parent); os.fsync(parent)
+        if read_evidence_target(relative) is not None: raise SystemExit(f"removed evidence target remains reachable: {relative}")
+    except OSError as error: raise SystemExit(f"evidence removal target is unsafe: {relative}") from error
+    finally: os.close(parent)
+
+
+def evidence_target_receipt_at(parent: int,name: str):
+    try: descriptor=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+    except FileNotFoundError: return None
+    hasher=hashlib.sha256(); total=0
+    try:
+        opened=os.fstat(descriptor); identity=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns,opened.st_mode,opened.st_uid,opened.st_nlink)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink!=1 or opened.st_size>MAX_ARCHIVED_MEMBER_BYTES: raise SystemExit("evidence archive target is unsafe")
+        while True:
+            chunk=os.read(descriptor,min(1024*1024,MAX_ARCHIVED_MEMBER_BYTES-total+1))
+            if not chunk: break
+            total+=len(chunk)
+            if total>MAX_ARCHIVED_MEMBER_BYTES: raise SystemExit("evidence archive target exceeds its byte limit")
+            hasher.update(chunk)
+        final=os.fstat(descriptor); final_identity=(final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns,final.st_ctime_ns,final.st_mode,final.st_uid,final.st_nlink)
+        if identity!=final_identity or total!=opened.st_size: raise SystemExit("evidence archive target changed while hashing")
+        return {"bytes":total,"sha256":hasher.hexdigest()}
+    finally: os.close(descriptor)
+
+
+def install_archive_member(handle,entry: Dict[str,object]) -> bool:
+    relative=str(entry["path"]); parent,name=open_evidence_parent(relative,True); temporary=f".{name}.{secrets.token_hex(16)}"; descriptor=None
+    expected={"bytes":entry["bytes"],"sha256":entry["sha256"]}
+    try:
+        existing=evidence_target_receipt_at(parent,name)
+        if existing is not None:
+            if existing!=expected: raise SystemExit(f"restore collision: {relative}")
+            return False
+        descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=parent)
+        def write_chunk(chunk):
+            view=memoryview(chunk); offset=0
+            while offset<len(view):
+                written=os.write(descriptor,view[offset:])
+                if written<=0: raise OSError("short evidence restore write")
+                offset+=written
+        total,value=stream_zip_member(handle,relative,min(MAX_ARCHIVED_MEMBER_BYTES,entry["bytes"]),"archived evidence member",write_chunk)
+        if {"bytes":total,"sha256":value}!=expected: raise SystemExit(f"archived evidence drifted: {relative}")
+        os.fsync(descriptor); os.fchmod(descriptor,0o444); os.close(descriptor); descriptor=None
+        try: os.link(temporary,name,src_dir_fd=parent,dst_dir_fd=parent,follow_symlinks=False)
+        except FileExistsError:
+            if evidence_target_receipt_at(parent,name)!=expected: raise SystemExit(f"restore collision: {relative}")
+            return False
+        os.unlink(temporary,dir_fd=parent); temporary=""; os.fsync(parent)
+        if evidence_target_receipt_at(parent,name)!=expected: raise SystemExit("restored evidence target is not reachable through the governed hierarchy")
+        return True
+    finally:
+        if descriptor is not None: os.close(descriptor)
+        if temporary:
+            try: os.unlink(temporary,dir_fd=parent)
+            except FileNotFoundError: pass
+        os.close(parent)
+
+
+def evidence_lock_handle():
+    try: return boundedio.open_private_lock(LOCK,label="evidence lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+
+
 def command_restore(args: argparse.Namespace) -> int:
     # Restore mutates active evidence and must serialize with compaction and
     # migration exactly like every other evidence write path.
-    LOCK.parent.mkdir(parents=True, exist_ok=True); LOCK.touch(exist_ok=True)
-    with LOCK.open("r+") as handle:
+    with evidence_lock_handle() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         index, _ = verify_index(deep=True)
         selected = None
@@ -830,31 +1186,20 @@ def command_restore(args: argparse.Namespace) -> int:
                 selected = record; break
         if not isinstance(selected, dict):
             raise SystemExit("requested evidence archive is not indexed")
-        manifest = manifest_from_archive(selected, deep=True); archive = archive_path(selected)
-        with zipfile.ZipFile(archive, "r") as zip_handle:
-            payloads = {str(entry["path"]): zip_handle.read(str(entry["path"])) for entry in manifest["entries"]}
-        for relative, data in payloads.items():
-            target = (ROOT / relative).resolve()
-            try:
-                target.relative_to(EVIDENCE.resolve())
-            except ValueError:
-                raise SystemExit("restore target escapes active evidence")
-            if target.exists() and (target.is_symlink() or target.read_bytes() != data):
-                raise SystemExit(f"restore collision: {relative}")
-        restored = 0
-        for relative, data in payloads.items():
-            target = ROOT / relative
-            if target.exists():
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, raw = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
-            temporary = Path(raw)
-            try:
-                with os.fdopen(descriptor, "wb") as output:
-                    output.write(data); output.flush(); os.fsync(output.fileno())
-                os.replace(temporary, target); target.chmod(0o444); restored += 1
-            finally:
-                if temporary.exists(): temporary.unlink()
+        manifest=manifest_from_archive(selected,deep=True)
+        entries=manifest["entries"]; restored=0
+        archive_digest=str(selected["sha256"]); archive=ARCHIVES/f"{archive_digest}.zip"
+        with verified_archive_zip(archive,selected,archive_digest) as (archive_handle,_entry_count):
+            for entry in entries:
+                relative=str(entry["path"])
+                try: parent,name=open_evidence_parent(relative,False)
+                except FileNotFoundError: continue
+                try:
+                    existing=evidence_target_receipt_at(parent,name)
+                    if existing is not None and existing!={"bytes":entry["bytes"],"sha256":entry["sha256"]}: raise SystemExit(f"restore collision: {relative}")
+                finally: os.close(parent)
+            for entry in entries:
+                if install_archive_member(archive_handle,entry): restored+=1
         print(f"EVIDENCE RESTORED: files={restored} archive={selected['sha256']}")
         return 0
 
@@ -864,8 +1209,9 @@ def task_archive_chain(head: object) -> List[Tuple[Dict[str, object], Dict[str, 
     chain: List[Tuple[Dict[str, object], Dict[str, object], bytes]] = []
     current = head; seen: Set[str] = set()
     while current is not None:
+        if len(chain)>=MAX_TASK_ARCHIVES: raise SystemExit("task archive chain exceeds its limit")
         if (
-            not isinstance(current, dict) or set(current) != TASK_ARCHIVE_HEAD_FIELDS
+            not isinstance(current,dict) or set(current)!=TASK_ARCHIVE_HEAD_FIELDS
             or current.get("schema") != TASK_ARCHIVE_HEAD_SCHEMA
             or SHA.fullmatch(str(current.get("sha256", ""))) is None
             or not isinstance(current.get("bytes"), int) or current["bytes"] < 1
@@ -873,11 +1219,10 @@ def task_archive_chain(head: object) -> List[Tuple[Dict[str, object], Dict[str, 
         ):
             raise SystemExit("task archive head is invalid")
         value_sha = str(current["sha256"])
-        expected = TASK_ARCHIVES / f"{value_sha}.json"
-        path = (ROOT / str(current.get("path", ""))).resolve()
-        if path != expected.resolve() or value_sha in seen or not path.is_file() or path.is_symlink():
+        expected=TASK_ARCHIVES/f"{value_sha}.json"; path=expected
+        if current.get("path")!=str(expected.relative_to(ROOT)) or value_sha in seen or not path.is_file() or path.is_symlink():
             raise SystemExit("task archive head path is invalid or missing")
-        seen.add(value_sha); data = path.read_bytes()
+        seen.add(value_sha); data = bounded_read(path,"evidence file")
         if len(data) != current["bytes"] or digest(data) != value_sha:
             raise SystemExit("task archive bytes drifted")
         try:
@@ -892,34 +1237,22 @@ def task_archive_chain(head: object) -> List[Tuple[Dict[str, object], Dict[str, 
 
 
 def write_task_archive(target: Path, data: bytes) -> None:
-    TASK_ARCHIVES.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if target.is_symlink() or target.read_bytes() != data:
-            raise SystemExit("task archive digest collision")
-        return
-    descriptor, raw = tempfile.mkstemp(prefix=".task-archive.", dir=str(TASK_ARCHIVES))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(data); output.flush(); os.fsync(output.fileno())
-        os.replace(temporary, target); target.chmod(0o444)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    if target.parent!=TASK_ARCHIVES: raise SystemExit("task archive target directory is invalid")
+    publish_content_addressed(TASK_ARCHIVES,target.name,data,"task archive")
 
 
 def command_migrate_task_archives(args: argparse.Namespace) -> int:
     """Rewrite the legacy v1 task-archive chain to v2 (content-addressed).
 
     Referenced evidence paths are extracted from the embedded TASK/contract
-    text into `referenced_evidence` digests (only evidence still active can
+    text into `referenced_evidence` digests. Legacy payloads receive an explicit
+    null Skill activation instead of fabricated reviewed bytes (only evidence still active can
     be digest-bound; already-compacted evidence needs no protection). Heads
     are re-anchored oldest-first, the rewritten chain is fully verified
     BEFORE the TASK head pointer moves, and old v1 files are left in place
     as unreachable, compactable evidence.
     """
-    LOCK.parent.mkdir(parents=True, exist_ok=True); LOCK.touch(exist_ok=True)
-    with LOCK.open("r+") as handle:
+    with evidence_lock_handle() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         task = load_json(TASK) if TASK.is_file() else {}
         head = task.get("task_archive")
@@ -929,7 +1262,7 @@ def command_migrate_task_archives(args: argparse.Namespace) -> int:
         chain = task_archive_chain(head)
         files = evidence_files()
         known = set(files)
-        file_digests = {relative: digest(path.read_bytes()) for relative, path in files.items()}
+        file_digests = {relative: digest(bounded_read(path,"evidence file")) for relative, path in files.items()}
         rewritten: List[Tuple[Path, bytes]] = []
         new_head: Optional[Dict[str, object]] = None
         migrated_count = 0
@@ -939,11 +1272,13 @@ def command_migrate_task_archives(args: argparse.Namespace) -> int:
                 isinstance(new_head, dict) and isinstance(payload.get("previous"), dict)
                 and new_head.get("sha256") != payload["previous"].get("sha256")
             )
-            if payload.get("schema") == TASK_ARCHIVE_V2 and not previous_changed:
+            if (payload.get("schema") == TASK_ARCHIVE_V2 and "skill_activation" in payload
+                    and "delivery" in payload and not previous_changed):
                 new_head = {key: old_head[key] for key in TASK_ARCHIVE_HEAD_FIELDS}
                 continue
             if payload.get("schema") == TASK_ARCHIVE_V2:
                 migrated = dict(payload)
+                migrated.setdefault("skill_activation",None); migrated.setdefault("delivery",None)
                 migrated["previous"] = new_head
             else:
                 referenced: Set[str] = set()
@@ -963,6 +1298,7 @@ def command_migrate_task_archives(args: argparse.Namespace) -> int:
                     "decision_receipt": payload.get("decision_receipt"),
                     "task": payload.get("task"),
                     "requirement_contract": payload.get("requirement_contract"),
+                    "skill_activation":None,"delivery":None,
                     "referenced_evidence": sorted(referenced),
                     "previous": new_head,
                 }
@@ -1039,4 +1375,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

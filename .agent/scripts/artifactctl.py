@@ -9,11 +9,27 @@ import json
 import re
 import os
 import subprocess
+import stat
 import sys
 from typing import Dict, List, Optional
 
+def _reject_nonfinite_json(token):
+    raise json.JSONDecodeError(f"non-finite JSON number is forbidden: {token}",token,0)
+
+def strict_json_loads(raw,**kwargs):
+    return json.loads(raw,parse_constant=_reject_nonfinite_json,**kwargs)
+
+def strict_json_dumps(value,**kwargs):
+    kwargs["allow_nan"]=False
+    return json.dumps(value,**kwargs)
+
+
+from workflowlib import boundedio,boundedprocess
 from workflowlib.state import task_projection
 import testrun as supervised_test
+# Keep validation bootstrap-light: migration fixtures need no acceptance runner import.
+# self_test_schema_contracts.py binds this literal to blueprintacceptance.RECEIPT_SCHEMA.
+ADAPTIVE_ACCEPTANCE_RECEIPT_SCHEMA = "agent-blueprint-acceptance/v4"
 
 
 def root() -> Path:
@@ -39,7 +55,7 @@ def supervised_env() -> Dict[str, str]:
 
 
 def canonical_sha256(value: object) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    encoded = strict_json_dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -84,7 +100,7 @@ def delivery_control_members(
 
 
 def load(path: Path) -> Dict[str, object]:
-    try: value = json.loads(path.read_text(encoding="utf-8"))
+    try: value = strict_json_loads(boundedio.read_text(path,label="artifact JSON"))
     except (OSError, ValueError): return {}
     return value if isinstance(value, dict) else {}
 
@@ -95,7 +111,7 @@ def receipt(value: object, errors: List[str], label: str) -> Optional[Path]:
     try: path.relative_to(ROOT)
     except ValueError: errors.append(f"{label} escapes project"); return None
     if not path.is_file() or path.is_symlink(): errors.append(f"{label} is missing"); return None
-    data = path.read_bytes()
+    data = boundedio.read_bytes(path,label="artifact file")
     if hashlib.sha256(data).hexdigest() != value["sha256"] or len(data) != value["bytes"]: errors.append(f"{label} evidence drifted"); return None
     return path
 
@@ -110,12 +126,12 @@ def selected_adapter(task: Dict[str, object], errors: List[str]):
         blueprint = AGENT / "project/BLUEPRINT.json"; runner = AGENT / "scripts/blueprintacceptance.py"
         if not digest or not blueprint.is_file() or blueprint.is_symlink() or not runner.is_file() or runner.is_symlink():
             errors.append("release requires one legacy adapter or a confirmed blueprint acceptance contract"); return None
-        result = subprocess.run([sys.executable, str(AGENT / "scripts/blueprintctl.py"), "--root", str(ROOT), "check", "--require-confirmed", "--expect-design-sha256", digest],
+        result = boundedprocess.run([sys.executable, str(AGENT / "scripts/blueprintctl.py"), "--root", str(ROOT), "check", "--require-confirmed", "--expect-design-sha256", digest],
                                 cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=supervised_env())
         if result.returncode:
             errors.append("confirmed blueprint acceptance contract is stale"); return None
-        raw = blueprint.read_bytes()
-        return "adaptive-blueprint", {"implemented": True, "runner": str(runner.relative_to(ROOT)), "receipt_schema": "agent-blueprint-acceptance/v2"}, {
+        raw = boundedio.read_bytes(blueprint,label="project blueprint")
+        return "adaptive-blueprint", {"implemented": True, "runner": str(runner.relative_to(ROOT)), "receipt_schema": ADAPTIVE_ACCEPTANCE_RECEIPT_SCHEMA}, {
             "template_id": "adaptive-blueprint", "path": str(blueprint.relative_to(ROOT)),
             "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
         }
@@ -138,14 +154,14 @@ def validated_agent_ledger(errors: List[str]) -> Dict[str, object]:
         errors.append("release reviewer ledger or validator is missing")
         return {}
     try:
-        before = path.read_bytes()
-        result = subprocess.run(
+        before = boundedio.read_bytes(path,label="artifact file")
+        result = boundedprocess.run(
             [sys.executable, str(AGENT_LEDGER_TOOL), "validate"], cwd=str(ROOT),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, text=True,
             env=supervised_env(),
         )
-        after = path.read_bytes()
-        value = json.loads(after)
+        after = boundedio.read_bytes(path,label="artifact file")
+        value = strict_json_loads(after)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
         errors.append("release reviewer ledger validation failed")
         return {}
@@ -206,7 +222,7 @@ def review_report_attestation(
         errors.append(f"{label} lacks a zero-severity reviewer-authored PASS")
         return None
     try:
-        lines = evidence_path.read_text(encoding="utf-8").splitlines()
+        lines = boundedio.read_text(evidence_path,label="test evidence").splitlines()
     except (OSError, UnicodeDecodeError):
         errors.append(f"{label} report is not UTF-8 text")
         return None
@@ -214,7 +230,7 @@ def review_report_attestation(
         errors.append(f"{label} report lacks canonical verdict/attestation lines")
         return None
     try:
-        attestation = json.loads(lines[1][len("ATTESTATION "):])
+        attestation = strict_json_loads(lines[1][len("ATTESTATION "):])
     except json.JSONDecodeError:
         errors.append(f"{label} report attestation is invalid JSON")
         return None
@@ -222,7 +238,7 @@ def review_report_attestation(
         "schema", "role_type", "review_chain_id", "review_subject_sha256",
         "predecessor_result_sha256", "lenses", "clean_replays", "targeted_cases",
     }
-    canonical = "ATTESTATION " + json.dumps(attestation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    canonical = "ATTESTATION " + strict_json_dumps(attestation, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if (
         not isinstance(attestation, dict)
         or set(attestation) != required
@@ -258,7 +274,7 @@ def cross_scenario_receipt(
         errors.append("cross scenario receipt lacks its marker-bound report")
         return None, None
     try:
-        lines = report_path.read_text(encoding="utf-8").splitlines()
+        lines = boundedio.read_text(report_path,label="acceptance report").splitlines()
     except (OSError, UnicodeDecodeError):
         lines = []
     prefix = "SCENARIO_RECEIPT "
@@ -267,7 +283,7 @@ def cross_scenario_receipt(
         return None, None
     raw = lines[2][len(prefix):]
     try:
-        value = json.loads(raw)
+        value = strict_json_loads(raw)
     except json.JSONDecodeError:
         errors.append("cross scenario receipt is invalid JSON")
         return None, None
@@ -275,7 +291,7 @@ def cross_scenario_receipt(
     if (
         not isinstance(value, dict) or set(value) != required
         or value.get("schema") != "agent-role-scenario-receipt/v1"
-        or raw != json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        or raw != strict_json_dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         or value.get("review_chain_id") != member.get("review_chain_id")
         or value.get("review_subject_sha256") != member.get("review_subject_sha256")
         or value.get("reviewer_agent_id") != member.get("id")
@@ -356,10 +372,10 @@ def verify_test_receipt(
             case_ids.append(case["id"])
         expected_keys = {
             "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at", "exit_code",
-            "outcome", "cleanup", "output", "case_sha256",
+            "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
         }
         unsigned = {key: item for key, item in case.items() if key != "case_sha256"}
-        expected_sha = hashlib.sha256(json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        expected_sha = hashlib.sha256(strict_json_dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if (
             set(case) != expected_keys
             or not isinstance(case.get("id"), str) or not case.get("id")
@@ -368,7 +384,9 @@ def verify_test_receipt(
             or not isinstance(case.get("command"), list) or not case.get("command")
             or not all(isinstance(token, str) and token for token in case.get("command", []))
             or case.get("exit_code") != 0 or case.get("outcome") != "completed"
-            or case.get("cleanup") != "passed" or case.get("case_sha256") != expected_sha
+            or case.get("cleanup") != "passed"
+            or case.get("execution_boundary") != supervised_test.TEST_EXECUTION_BOUNDARY
+            or case.get("case_sha256") != expected_sha
         ):
             errors.append(f"{label} case {index} is not a clean completed replay")
         started_at = timestamp(case.get("started_at"), errors, f"{label} case {index} start")
@@ -412,7 +430,7 @@ def current_review_subject(member: Dict[str, object], task: Dict[str, object], e
     else:
         contract_path = AGENT / "state/REQUIREMENT_CONTRACT.md"
         if contract_path.is_file():
-            data = contract_path.read_bytes()
+            data = boundedio.read_bytes(contract_path,label="requirement contract")
             expected.append({
                 "path": ".agent/state/REQUIREMENT_CONTRACT.md",
                 "sha256": task.get("requirement_contract_sha256"), "bytes": len(data),
@@ -503,8 +521,17 @@ def resolved_implementer(
     return resolved
 
 
+def accepted_node_bytes(task: Dict[str,object], node: int, fallback: Path) -> bytes:
+    record=task.get("node_artifacts",{}).get(str(node),{}) if isinstance(task.get("node_artifacts"),dict) else {}
+    if node in task.get("node_artifact_capture_nodes",[]) and isinstance(record,dict):
+        path=AGENT/"state/evidence/node-artifact-captures"/f"{record.get('sha256')}.artifact"
+    else: path=fallback
+    try: return boundedio.read_bytes(path,maximum=16*1024*1024,label="accepted node snapshot")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+
+
 def implementation_attestation(
-    member: Dict[str, object], ledger: Dict[str, object], artifact_path: Path,
+    member: Dict[str, object], ledger: Dict[str, object], artifact_path: Path, artifact_data: bytes,
     value: Dict[str, object], errors: List[str],
 ) -> Optional[Dict[str, object]]:
     records = member.get("result_evidence")
@@ -518,7 +545,6 @@ def implementation_attestation(
         "schema", "agent_id", "root_task_id", "candidate_review_subject_sha256",
         "requirement_contract_sha256", "node6_artifact", "changes", "checks",
     }
-    artifact_data = artifact_path.read_bytes()
     expected_artifact = {
         "path": str(artifact_path.relative_to(ROOT)),
         "sha256": hashlib.sha256(artifact_data).hexdigest(), "bytes": len(artifact_data),
@@ -554,7 +580,7 @@ def implementation_attestation(
 
 
 def validate_impl(
-    value: Dict[str, object], task: Dict[str, object], artifact_path: Path, errors: List[str],
+    value: Dict[str, object], task: Dict[str, object], artifact_path: Path, artifact_data: bytes, errors: List[str],
 ) -> None:
     mode = task.get("mode")
     projected = mode == "fast" or task_projection(str(task.get("task_type")), str(mode)) == "lightweight"
@@ -569,6 +595,24 @@ def validate_impl(
             if changed is not None and str(changed.relative_to(ROOT)) in DYNAMIC_STATE:
                 errors.append(f"change {index} binds mutable workflow state; use its dedicated evidence field")
         if len({item.get("path") for item in changes if isinstance(item, dict)}) != len(changes): errors.append("changed artifacts must be unique")
+    snapshot=value.get("candidate_snapshot")
+    if not isinstance(snapshot,list) or not snapshot or len(snapshot)>8192:
+        errors.append("node 6 requires one bounded exact candidate snapshot")
+    else:
+        paths=[]; snapshot_records={}
+        for index,item in enumerate(snapshot):
+            if (not isinstance(item,dict) or set(item)!={"path","sha256","bytes","mode"}
+                    or not isinstance(item.get("mode"),int) or isinstance(item.get("mode"),bool)
+                    or item.get("mode")<0 or item.get("mode")>0o777):
+                errors.append(f"candidate snapshot {index} is invalid"); continue
+            paths.append(item["path"])
+            snapshot_records[item["path"]]={key:item[key] for key in ("path","sha256","bytes")}
+            receipt(snapshot_records[item["path"]],errors,f"candidate snapshot {index}")
+        if paths!=sorted(set(paths)): errors.append("candidate snapshot paths must be unique and sorted")
+        if isinstance(changes,list):
+            for index,item in enumerate(changes):
+                if isinstance(item,dict) and snapshot_records.get(item.get("path"))!=item:
+                    errors.append(f"change {index} is absent or differs in the exact candidate snapshot")
     if not isinstance(checks, list) or not checks: errors.append("node 6 requires observable checks")
     else:
         ids = []
@@ -586,7 +630,7 @@ def validate_impl(
         if state.get("schema") != "agent-runtime/v2" or not isinstance(state.get("baseline"), dict) or not isinstance(state["baseline"].get("project_processes"), list):
             errors.append("runtime cleanup lacks a project-process baseline attestation")
         else:
-            live = subprocess.run(
+            live = boundedprocess.run(
                 [sys.executable, str(AGENT / "scripts/agentctl.py"), "assert-clean"], cwd=str(ROOT),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, env=os.environ.copy(),
             )
@@ -605,7 +649,7 @@ def validate_impl(
                 or not member.get("handoff_envelope_sha256")
             ):
                 errors.append("release node 6 implementer is not completed and orchestrator-observed")
-            implementation_attestation(member, ledger, artifact_path, value, errors)
+            implementation_attestation(member, ledger, artifact_path, artifact_data, value, errors)
     elif implementer_id is not None:
         errors.append("fast/standard node 6 must not claim release implementer authority")
 
@@ -727,7 +771,9 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
             current_review_subject(selected_members[0], task, errors)
             node6_authority = task.get("node_artifacts", {}).get("6")
             node6_path = receipt(node6_authority, errors, "current node 6 implementer authority")
-            node6_value = load(node6_path) if node6_path else {}
+            node6_data = accepted_node_bytes(task,6,node6_path) if node6_path else b""
+            try: node6_value = strict_json_loads(node6_data.decode("utf-8")) if node6_data else {}
+            except (UnicodeError,json.JSONDecodeError): node6_value={}
             implementer = resolved_implementer(ledger, node6_value.get("implementer_agent_id"), errors)
             implementer_attestation = None
             if not isinstance(implementer, dict):
@@ -742,7 +788,7 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
                 errors.append("release implementer is not the distinct orchestrator-observed node 6 author")
             else:
                 implementer_attestation = implementation_attestation(
-                    implementer, ledger, node6_path, node6_value, errors,
+                    implementer, ledger, node6_path, node6_data, node6_value, errors,
                 )
             if (
                 implementer_attestation is not None
@@ -790,7 +836,7 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
                     if adaptive_release and path:
                         adaptive_receipt = load(path)
                         replay_id = adaptive_receipt.get("receipt_sha256")
-                        if adaptive_receipt.get("schema") != "agent-blueprint-acceptance/v2" or not SHA.fullmatch(str(replay_id or "")):
+                        if adaptive_receipt.get("schema") != ADAPTIVE_ACCEPTANCE_RECEIPT_SCHEMA or not SHA.fullmatch(str(replay_id or "")):
                             errors.append(f"integrator clean replay {index} is not an adaptive acceptance receipt")
                             replay_id = None
                         replay_ids.append(replay_id)
@@ -864,7 +910,7 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
                 errors.append("adaptive live gate lacks the current implementation candidate digest")
             else:
                 verify_command += ["--candidate-sha256", candidate_sha256]
-        result = subprocess.run(
+        result = boundedprocess.run(
             verify_command,
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
             env=supervised_env(),
@@ -877,11 +923,14 @@ def validate_accept(value: Dict[str, object], task: Dict[str, object], errors: L
             )
 
 
-def validate_node(node: int, path: Path) -> int:
-    errors: List[str] = []; task = load(AGENT / "state/TASK.json"); value = load(path)
+def validate_node(node: int, path: Path, artifact_data: bytes) -> int:
+    errors: List[str] = []; task = load(AGENT / "state/TASK.json")
+    try: value = strict_json_loads(artifact_data.decode("utf-8"))
+    except (UnicodeError,json.JSONDecodeError): value={}; errors.append(f"node {node} artifact snapshot is not strict UTF-8 JSON")
+    if not isinstance(value,dict): value={}; errors.append(f"node {node} artifact snapshot root is not an object")
     relative = str(path.relative_to(ROOT))
     if not re.fullmatch(rf"\.agent/state/artifacts/{node:02d}-[A-Za-z0-9._-]+", relative): errors.append(f"node {node} artifact must use its canonical prefix")
-    if node == 6: validate_impl(value, task, path, errors)
+    if node == 6: validate_impl(value, task, path, artifact_data, errors)
     elif node == 7: validate_accept(value, task, errors)
     elif node == 8:
         required_v2 = {
@@ -900,19 +949,19 @@ def validate_node(node: int, path: Path) -> int:
             errors.append("node 8 schema/fields are invalid")
         state_path = receipt(value.get("delivery_state"), errors, "delivery state")
         expected_state_path = AGENT / "state" / "delivery.json"
-        state_bytes = state_path.read_bytes() if state_path is not None else None
+        state_bytes = boundedio.read_bytes(state_path,label="artifact state") if state_path is not None else None
         if state_path != expected_state_path.resolve():
             errors.append("node 8 must bind the current .agent/state/delivery.json")
         elif state_bytes is not None:
             validator = AGENT / "scripts" / "deliveryctl.py"
             try:
-                result = subprocess.run(
+                result = boundedprocess.run(
                     [sys.executable, str(validator), "validate"], cwd=ROOT,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, text=True,
                     env=supervised_env(),
                 )
-                stable_bytes = state_path.read_bytes()
-                delivery = json.loads(state_bytes)
+                stable_bytes = boundedio.read_bytes(state_path,label="artifact state")
+                delivery = strict_json_loads(state_bytes)
             except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
                 result = None
                 stable_bytes = None
@@ -962,12 +1011,41 @@ def validate_node(node: int, path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(); parser.add_argument("--node", type=int, choices=(6, 7, 8), required=True); parser.add_argument("--path", required=True); args = parser.parse_args()
-    path = (ROOT / args.path).resolve()
-    try: path.relative_to(ROOT)
-    except ValueError: raise SystemExit("artifact escapes project")
-    if not path.is_file() or path.is_symlink(): raise SystemExit("artifact is missing")
-    return validate_node(args.node, path)
+    parser = argparse.ArgumentParser(); parser.add_argument("--node", type=int, choices=(6, 7, 8), required=True); parser.add_argument("--path", required=True); parser.add_argument("--snapshot-fd",type=int); args = parser.parse_args()
+    relative=Path(args.path)
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise SystemExit("artifact path must remain lexical and project-relative")
+    path=ROOT/relative
+    descriptor=args.snapshot_fd; owned=False
+    if descriptor is None:
+        if not hasattr(os,"O_NOFOLLOW") or not hasattr(os,"O_DIRECTORY"):
+            raise SystemExit("artifact validation requires POSIX descriptor-relative no-follow support")
+        descriptor=os.open(ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); owned=True
+        try:
+            for index,part in enumerate(relative.parts):
+                final=index==len(relative.parts)-1
+                child=os.open(part,os.O_RDONLY|os.O_NOFOLLOW|(0 if final else os.O_DIRECTORY),dir_fd=descriptor)
+                os.close(descriptor); descriptor=child
+        except BaseException:
+            os.close(descriptor); raise
+    metadata=os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink!=1 or metadata.st_size>16*1024*1024:
+        raise SystemExit("artifact snapshot descriptor is not one bounded single-link regular file")
+    identity=(metadata.st_dev,metadata.st_ino,metadata.st_mode,metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns)
+    chunks=[]; total=0
+    while True:
+        chunk=os.read(descriptor,min(1024*1024,16*1024*1024+1-total))
+        if not chunk: break
+        chunks.append(chunk); total+=len(chunk)
+        if total>16*1024*1024: raise SystemExit("artifact snapshot descriptor exceeds its byte limit")
+    final=os.fstat(descriptor)
+    if identity!=(final.st_dev,final.st_ino,final.st_mode,final.st_size,final.st_mtime_ns,final.st_ctime_ns) or total!=metadata.st_size:
+        if owned: os.close(descriptor)
+        raise SystemExit("artifact snapshot changed during semantic validation")
+    if owned: os.close(descriptor)
+    return validate_node(args.node, path, b"".join(chunks))
 
 
-if __name__ == "__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

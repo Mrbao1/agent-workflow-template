@@ -1,7 +1,7 @@
 {
   "schema": "agent-team/v9",
   "platform_limit": 4,
-  "default_model": "gpt-5.6-sol",
+  "default_model": null,
   "allow_model_fallback": false,
   "context_strategy": "long-window-capsule",
   "max_fork_turns": 10,

@@ -9,9 +9,9 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
-import tempfile
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -25,6 +25,7 @@ def find_agent_dir() -> Path:
 AGENT = find_agent_dir(); ROOT = AGENT.parent.resolve()
 sys.path.insert(0, str(AGENT / "scripts"))
 from workflowlib import budget as unified_budget
+from workflowlib import boundedio,boundedprocess
 import humandecision
 import testrun as supervised_test
 STATE = AGENT / "state/agents.json"; CONFIG = AGENT / "config.json"; TASK = AGENT / "state/TASK.json"
@@ -51,6 +52,8 @@ SCENARIO_RECEIPT_PREFIX = "SCENARIO_RECEIPT "
 SCENARIO_RECEIPT_SCHEMA = "agent-role-scenario-receipt/v1"
 REVIEW_CHAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 RUN_ID = re.compile(r"[0-9a-f]{32}")
+TEST_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
+TEST_EXECUTION_BOUNDARY = supervised_test.TEST_EXECUTION_BOUNDARY
 TIMESTAMP_SKEW_SECONDS = 5
 WATCHDOG_MAX_DELAY_SECONDS = 60
 PREPARED_DISPATCH_TTL_SECONDS = 300
@@ -60,6 +63,10 @@ PREPARED_DISPATCH_TTL_SECONDS = 300
 PREPARED_DISPATCH_VALIDATE_EXPIRY_SECONDS = 3600
 LOST_OBSERVATION_THRESHOLD = 3
 LEDGER_FORCE_ARCHIVE_SCHEMA = "agent-ledger-force-archive/v1"
+LEDGER_ARCHIVE_SCHEMA = "agent-ledger-archive/v2"
+LEDGER_RESET_PROOF_SCHEMA = "agent-ledger-reset-proof/v1"
+LEDGER_SNAPSHOT_LIMIT_BYTES = 8 * 1024 * 1024
+RESET_PROOF_MAX_AGE_SECONDS = 30
 CANONICAL_ROLE_TYPES = (
     "worker", "researcher", "documentation-worker", "implementer",
     "reviewer", "adversarial", "cross", "integrator",
@@ -105,7 +112,7 @@ def integer(value: object, default: int = -1) -> int:
 
 
 def load(path: Path) -> Dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(boundedio.read_text(path,label="ledger JSON"))
     if not isinstance(value, dict):
         raise SystemExit(f"JSON object required: {path}")
     return value
@@ -113,6 +120,70 @@ def load(path: Path) -> Dict[str, object]:
 
 def ledger_bytes(value: Dict[str, object]) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def bounded_regular_snapshot(path: Path, label: str, limit: int = LEDGER_SNAPSHOT_LIMIT_BYTES) -> Tuple[bytes, Tuple[int, int, int, int]]:
+    """Read one exact regular-file generation through a no-follow descriptor."""
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise SystemExit(f"{label} is unavailable") from error
+    if (
+        not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+        or before.st_size < 0 or before.st_size > limit
+    ):
+        raise SystemExit(f"{label} must be one bounded regular file")
+    try:
+        descriptor=boundedio.open_nofollow(Path(path),label)
+    except (OSError,RuntimeError) as error:
+        raise SystemExit(f"{label} could not be opened without following links") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            or opened.st_size < 0 or opened.st_size > limit
+        ):
+            raise SystemExit(f"{label} changed while opening")
+        chunks: List[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk); remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        if (
+            len(data) > limit or len(data) != opened.st_size
+            or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            raise SystemExit(f"{label} changed during its bounded snapshot")
+        return data, identity
+    finally:
+        os.close(descriptor)
+
+
+def require_unchanged_snapshot(path: Path, label: str, expected: Tuple[bytes, Tuple[int, int, int, int]]) -> None:
+    current = bounded_regular_snapshot(path, label)
+    if current != expected:
+        raise SystemExit(f"{label} changed after reset authorization; compare-and-swap refused")
+
+
+def strict_snapshot_object(snapshot: Tuple[bytes, Tuple[int, int, int, int]], label: str) -> Dict[str, object]:
+    try:
+        value = humandecision.strict_json_loads(snapshot[0].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"{label} is not valid strict UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise SystemExit(f"{label} must contain one JSON object")
+    return value
+
+
+def ledger_lock():
+    try: return boundedio.open_private_lock(LOCK,label="agent ledger lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def chain_upgrade(value: Dict[str, object], previous: Optional[bytes]) -> None:
@@ -130,29 +201,38 @@ def chain_upgrade(value: Dict[str, object], previous: Optional[bytes]) -> None:
     value["prev_sha256"] = hashlib.sha256(previous).hexdigest()
 
 
+def chain_journal_data(value: Dict[str, object], data: bytes) -> bytes:
+    entry={"revision":value["revision"],"prev_sha256":value["prev_sha256"],"file_sha256":hashlib.sha256(data).hexdigest()}
+    previous=boundedio.read_bytes(CHAIN_JOURNAL,label="agent ledger chain journal") if os.path.lexists(CHAIN_JOURNAL) else b""
+    return previous+(json.dumps(entry,sort_keys=True,separators=(",",":"))+"\n").encode("utf-8")
+
+
 def chain_journal_append(value: Dict[str, object], data: bytes) -> None:
-    entry = {
-        "revision": value["revision"], "prev_sha256": value["prev_sha256"],
-        "file_sha256": hashlib.sha256(data).hexdigest(),
-    }
-    with CHAIN_JOURNAL.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
-        handle.flush(); os.fsync(handle.fileno())
+    try: boundedio.atomic_write(CHAIN_JOURNAL,chain_journal_data(value,data),mode=0o600,label="agent ledger chain journal")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
-def save(value: Dict[str, object]) -> None:
-    chain_upgrade(value, STATE.read_bytes() if STATE.is_file() else None)
+def save(
+    value: Dict[str, object],
+    expected_previous: Optional[Tuple[bytes, Tuple[int, int, int, int]]] = None,
+    reset_dependencies: Optional[List[Tuple[Path, str, Tuple[bytes, Tuple[int, int, int, int]]]]] = None,
+) -> None:
+    previous = expected_previous[0] if expected_previous is not None else (boundedio.read_bytes(STATE,label="agent ledger state") if STATE.is_file() else None)
+    chain_upgrade(value, previous)
     data = ledger_bytes(value)
-    descriptor, raw = tempfile.mkstemp(prefix=".agents.", dir=str(STATE.parent))
-    temporary = Path(raw)
+    for path,label,snapshot in reset_dependencies or []: require_unchanged_snapshot(path,label,snapshot)
+    if expected_previous is not None: require_unchanged_snapshot(STATE,"legacy Agent ledger",expected_previous)
+    journal_existed=os.path.lexists(CHAIN_JOURNAL); journal_previous=boundedio.read_bytes(CHAIN_JOURNAL,label="agent ledger chain journal") if journal_existed else b""
+    journal_data=chain_journal_data(value,data)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary, STATE)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    chain_journal_append(value, data)
+        boundedio.atomic_write(CHAIN_JOURNAL,journal_data,mode=0o600,label="agent ledger chain journal")
+        boundedio.atomic_write(STATE,data,mode=0o600,label="agent ledger state")
+    except (OSError,RuntimeError) as error:
+        try:
+            if journal_existed: boundedio.atomic_write(CHAIN_JOURNAL,journal_previous,mode=0o600,label="agent ledger chain rollback")
+            else: boundedio.unlink_private(CHAIN_JOURNAL,missing_ok=True,label="agent ledger chain rollback")
+        except (OSError,RuntimeError): pass
+        raise SystemExit(str(error)) from error
 
 
 def commit_registered_ledger(state: Dict[str, object]) -> None:
@@ -173,14 +253,13 @@ def commit_registered_ledger(state: Dict[str, object]) -> None:
     try: after["budget_state"] = unified_budget.snapshot(after, load(CONFIG), state)["state"]
     except ValueError as error: raise SystemExit(str(error))
     after["updated"] = now().date().isoformat()
-    chain_upgrade(state, STATE.read_bytes() if STATE.is_file() else None)
+    chain_upgrade(state, boundedio.read_bytes(STATE,label="agent ledger state") if STATE.is_file() else None)
     data = ledger_bytes(state)
     contexttx.transition_task(
         before, after, mutator="agentledger", operation="register",
         reason="agent-registered", summary="automatically accounted a registered child Agent",
-        side_effects=[(STATE, data)],
+        side_effects=[(STATE,data),(CHAIN_JOURNAL,chain_journal_data(state,data))],
     )
-    chain_journal_append(state, data)
 
 
 def active(state: Dict[str, object]) -> List[Dict[str, object]]:
@@ -207,8 +286,17 @@ def required_clean_replays() -> int:
 
 
 def current_candidate_sha256() -> str:
-    """Use the canonical governed-product fingerprint, never a review payload hash."""
+    """Use live authority while active and checkpointed authority after completion."""
+    task=load(TASK); binding=task.get("completion_binding",{})
+    historical=binding.get("candidate_sha256") if isinstance(binding,dict) else None
+    if (task.get("status")=="accepted" and binding.get("schema")=="agent-completion-binding/v2"
+            and SHA.fullmatch(str(historical or "")) is not None):
+        return str(historical)
     return supervised_test.candidate_fingerprint(load(CONFIG))
+
+
+def valid_model_id(value: object) -> bool:
+    return isinstance(value,str) and value.lower() not in {"none","null","unset","unselected","default","model","model-id"} and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}",value) is not None
 
 
 def policy() -> Dict[str, object]:
@@ -538,7 +626,7 @@ def evidence(raw: str) -> Dict[str, object]:
         raise SystemExit("evidence path escapes project")
     if not path.is_file() or path.is_symlink():
         raise SystemExit(f"evidence is missing: {relative}")
-    data = path.read_bytes()
+    data = boundedio.read_bytes(path,label="ledger file")
     return {"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 
 
@@ -552,30 +640,11 @@ def immutable_platform_evidence(raw: str) -> Tuple[Path, Dict[str, object]]:
     """
     source_record = evidence(raw)
     source = ROOT / str(source_record["path"])
-    data = source.read_bytes()
+    data = boundedio.read_bytes(source,label="ledger source")
     digest = str(source_record["sha256"])
-    directory = AGENT / "state/evidence/platform-snapshots"
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{digest}.json"
-    if os.path.lexists(target):
-        if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-            raise SystemExit(f"immutable platform snapshot collision or mutation: {target.relative_to(ROOT)}")
-    else:
-        descriptor, raw_temporary = tempfile.mkstemp(prefix=".platform-snapshot.", dir=str(directory))
-        temporary = Path(raw_temporary)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise SystemExit(f"immutable platform snapshot collision or mutation: {target.relative_to(ROOT)}")
-            if target.is_file() and not target.is_symlink():
-                target.chmod(0o444)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+    directory=AGENT/"state/evidence/platform-snapshots"; target=directory/f"{digest}.json"
+    try: boundedio.publish_immutable(target,data,label="immutable platform snapshot")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     record = {"path": str(target.relative_to(ROOT)), "sha256": digest, "bytes": len(data)}
     return target, record
 
@@ -584,30 +653,11 @@ def immutable_blob_evidence(raw: str, directory_name: str, suffix: str, prefix: 
     """Copy caller bytes into a content-addressed immutable store."""
     source_record = evidence(raw)
     source = ROOT / str(source_record["path"])
-    data = source.read_bytes()
+    data = boundedio.read_bytes(source,label="ledger source")
     digest = str(source_record["sha256"])
-    directory = AGENT / f"state/evidence/{directory_name}"
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{digest}{suffix}"
-    if os.path.lexists(target):
-        if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-            raise SystemExit(f"immutable {prefix} collision or mutation: {target.relative_to(ROOT)}")
-    else:
-        descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{prefix}.", dir=str(directory))
-        temporary = Path(raw_temporary)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise SystemExit(f"immutable {prefix} collision or mutation: {target.relative_to(ROOT)}")
-            if target.is_file() and not target.is_symlink():
-                target.chmod(0o444)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+    directory=AGENT/f"state/evidence/{directory_name}"; target=directory/f"{digest}{suffix}"
+    try: boundedio.publish_immutable(target,data,label=f"immutable {prefix}")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     return {"path": str(target.relative_to(ROOT)), "sha256": digest, "bytes": len(data)}
 
 
@@ -659,26 +709,9 @@ def publish_generated_blob(value: Dict[str, object], directory_name: str,
     """Publish ledger-authored JSON bytes without trusting a caller timestamp."""
     data = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     digest = hashlib.sha256(data).hexdigest()
-    directory = AGENT / f"state/evidence/{directory_name}"
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{digest}{suffix}"
-    if os.path.lexists(target):
-        if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-            raise SystemExit(f"immutable {prefix} collision or mutation")
-    else:
-        descriptor, raw = tempfile.mkstemp(prefix=f".{prefix}.", dir=str(directory))
-        temporary = Path(raw)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise SystemExit(f"immutable {prefix} collision or mutation")
-            target.chmod(0o444)
-        finally:
-            if temporary.exists(): temporary.unlink()
+    directory=AGENT/f"state/evidence/{directory_name}"; target=directory/f"{digest}{suffix}"
+    try: boundedio.publish_immutable(target,data,label=f"immutable {prefix}")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     return {"path": str(target.relative_to(ROOT)), "sha256": digest, "bytes": len(data)}
 
 
@@ -687,7 +720,7 @@ def review_verdict_from_result(record: object) -> Optional[Dict[str, object]]:
     if not result_evidence_receipt(record):
         return None
     try:
-        data = (ROOT / str(record["path"])).read_bytes()
+        data = boundedio.read_bytes(ROOT/str(record["path"]),label="ledger evidence")
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError, TypeError, KeyError):
         return None
@@ -711,7 +744,7 @@ def review_attestation_from_result(record: object) -> Optional[Dict[str, object]
     if not result_evidence_receipt(record):
         return None
     try:
-        lines = (ROOT / str(record["path"])).read_text(encoding="utf-8").splitlines()
+        lines = boundedio.read_text(ROOT/str(record["path"]),label="ledger evidence").splitlines()
     except (OSError, UnicodeDecodeError, TypeError, KeyError):
         return None
     if len(lines) < 2 or not lines[1].startswith(REVIEW_ATTESTATION_PREFIX):
@@ -765,7 +798,7 @@ def cross_scenario_from_result(record: object, item: Dict[str, object]) \
     if not result_evidence_receipt(record):
         return None
     try:
-        lines = (ROOT / str(record["path"])).read_text(encoding="utf-8").splitlines()
+        lines = boundedio.read_text(ROOT/str(record["path"]),label="ledger evidence").splitlines()
     except (OSError, UnicodeDecodeError, TypeError, KeyError):
         return None
     if len(lines) < 3 or not lines[2].startswith(SCENARIO_RECEIPT_PREFIX):
@@ -858,7 +891,7 @@ def clean_replay_run_id(record: object, registered_at: dt.datetime,
         case_id = case.get("id") if isinstance(case, dict) else None
         required = {
             "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at", "exit_code",
-            "outcome", "cleanup", "output", "case_sha256",
+            "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
         }
         if (
             not isinstance(case, dict) or set(case) != required
@@ -868,7 +901,8 @@ def clean_replay_run_id(record: object, registered_at: dt.datetime,
             or case.get("outcome") != "completed" or case.get("cleanup") != "passed"
             or not isinstance(case.get("command"), list) or not case.get("command")
             or any(not isinstance(part, str) or not part for part in case.get("command", []))
-            or not valid_receipt(case.get("output"))
+            or not valid_test_execution_boundary(case.get("execution_boundary"))
+            or not valid_managed_test_output(case.get("output"))
         ):
             return None
         try:
@@ -1160,7 +1194,7 @@ def replay_run_authority(state: Dict[str, object], item: Dict[str, object], reco
             return None
         required_case = {
             "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at",
-            "exit_code", "outcome", "cleanup", "output", "case_sha256",
+            "exit_code", "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
         }
         if (
             set(case) != required_case
@@ -1172,6 +1206,7 @@ def replay_run_authority(state: Dict[str, object], item: Dict[str, object], reco
             or case.get("exit_code") != expected.get("expected_exit_code")
             or case.get("outcome") != expected.get("expected_outcome")
             or case.get("cleanup") != expected.get("expected_cleanup")
+            or not valid_test_execution_boundary(case.get("execution_boundary"))
             or not content_addressed_receipt(case.get("output"), "agent-replay-outputs", ".log")
         ):
             return None
@@ -1291,7 +1326,7 @@ def implementation_result_contract(item: Dict[str, object], records: List[Dict[s
         return None
     sealed_node6 = node6_inputs[0]
     try:
-        node6_data = (ROOT / str(sealed_node6["path"])).read_bytes()
+        node6_data = boundedio.read_bytes(ROOT/str(sealed_node6["path"]),label="sealed review artifact")
         node6 = json.loads(node6_data.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, TypeError, KeyError):
         return None
@@ -1307,7 +1342,7 @@ def implementation_result_contract(item: Dict[str, object], records: List[Dict[s
         return None
     if require_current:
         try:
-            current_data = (ROOT / NODE6_ARTIFACT_PATH).read_bytes()
+            current_data = boundedio.read_bytes(ROOT/NODE6_ARTIFACT_PATH,label="current review artifact")
         except OSError:
             return None
         current_receipt = {
@@ -1503,18 +1538,11 @@ def command_seal_payload(args: argparse.Namespace) -> int:
     except ValueError:
         raise SystemExit("sealed task payload output escapes project")
     data = (json.dumps(sealed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    if os.path.lexists(output) and (output.is_symlink() or not output.is_file() or output.read_bytes() != data):
+    if os.path.lexists(output) and (output.is_symlink() or not output.is_file() or boundedio.read_bytes(output,label="ledger output") != data):
         raise SystemExit("sealed task payload output already exists with different bytes")
     if not output.exists():
-        output.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, raw = tempfile.mkstemp(prefix=".sealed-task-payload.", dir=str(output.parent))
-        temporary = Path(raw)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            os.replace(temporary, output)
-        finally:
-            if temporary.exists(): temporary.unlink()
+        try: boundedio.atomic_write(output,data,mode=0o600,label="sealed task payload")
+        except RuntimeError as error: raise SystemExit(str(error)) from error
     print(f"SEALED TASK PAYLOAD: {output.relative_to(ROOT)} sha256={hashlib.sha256(data).hexdigest()}")
     return 0
 
@@ -1667,42 +1695,48 @@ def immutable_capacity_evidence(raw: str) -> Dict[str, object]:
     """Preserve each pre-registration capacity error before a retry overwrites it."""
     source_record = evidence(raw)
     source = ROOT / str(source_record["path"])
-    data = source.read_bytes()
+    data = boundedio.read_bytes(source,label="ledger source")
     digest = str(source_record["sha256"])
-    directory = AGENT / "state/evidence/capacity-failures"
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{digest}.err"
-    if os.path.lexists(target):
-        if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-            raise SystemExit(f"immutable capacity evidence collision or mutation: {target.relative_to(ROOT)}")
-    else:
-        descriptor, raw_temporary = tempfile.mkstemp(prefix=".capacity-failure.", dir=str(directory))
-        temporary = Path(raw_temporary)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise SystemExit(f"immutable capacity evidence collision or mutation: {target.relative_to(ROOT)}")
-            if target.is_file() and not target.is_symlink():
-                target.chmod(0o444)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+    directory=AGENT/"state/evidence/capacity-failures"; target=directory/f"{digest}.err"
+    try: boundedio.publish_immutable(target,data,label="immutable capacity evidence")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     return {"path": str(target.relative_to(ROOT)), "sha256": digest, "bytes": len(data)}
+
+
+def valid_test_execution_boundary(record: object) -> bool:
+    return isinstance(record, dict) and record == TEST_EXECUTION_BOUNDARY
+
+
+def valid_managed_test_output(record: object) -> bool:
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"path", "sha256", "bytes", "limit_bytes", "limit_exceeded"}
+        or record.get("limit_bytes") != TEST_OUTPUT_LIMIT_BYTES
+        or type(record.get("limit_exceeded")) is not bool
+        or type(record.get("bytes")) is not int
+        or not 0 <= int(record["bytes"]) <= TEST_OUTPUT_LIMIT_BYTES
+    ):
+        return False
+    path = (ROOT / str(record.get("path"))).resolve()
+    try:
+        path.relative_to(ROOT)
+    except ValueError:
+        return False
+    if not path.is_file() or path.is_symlink():
+        return False
+    data = boundedio.read_bytes(path,label="ledger file")
+    return len(data) == record["bytes"] and hashlib.sha256(data).hexdigest() == record.get("sha256")
 
 
 def valid_receipt(record: object) -> bool:
     if not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"}:
         return False
-    path = (ROOT / str(record["path"])).resolve()
-    try:
-        path.relative_to(ROOT)
-    except ValueError:
-        return False
-    return path.is_file() and not path.is_symlink() and hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"] and len(path.read_bytes()) == record["bytes"]
+    relative=Path(str(record["path"]))
+    if relative.is_absolute() or not relative.parts or any(part in {"",".",".."} for part in relative.parts): return False
+    path=ROOT/relative
+    try: data=boundedio.read_bytes(path,label="ledger receipt")
+    except RuntimeError: return False
+    return hashlib.sha256(data).hexdigest()==record["sha256"] and len(data)==record["bytes"]
 
 
 def content_addressed_receipt(record: object, directory: str, suffix: str) -> bool:
@@ -1809,8 +1843,12 @@ def completion_contract_errors(item: Dict[str, object], terminal_observed: dt.da
 
 
 def platform_snapshot(raw: str) -> Tuple[Dict[str, object], Dict[str, object], Dict[str, Dict[str, object]]]:
-    path, record = immutable_platform_evidence(raw)
-    value = load(path)
+    path,record=immutable_platform_evidence(raw)
+    snapshot_data,snapshot_identity=humandecision.receipt_snapshot(path)
+    try: value=json.loads(snapshot_data.decode("utf-8"))
+    except (UnicodeError,json.JSONDecodeError) as error: raise SystemExit("platform snapshot is not valid UTF-8 JSON") from error
+    if record.get("sha256")!=hashlib.sha256(snapshot_data).hexdigest() or record.get("bytes")!=len(snapshot_data):
+        raise SystemExit("immutable platform snapshot record does not bind its bytes")
     if value.get("schema") != PLATFORM_SCHEMA or not isinstance(value.get("members"), list):
         raise SystemExit("platform snapshot schema is invalid")
     try:
@@ -1825,14 +1863,16 @@ def platform_snapshot(raw: str) -> Tuple[Dict[str, object], Dict[str, object], D
     if mode == "release" and not adapter:
         raise SystemExit("release platform observation requires agent_control.platform_observer.signed_adapter")
     if adapter:
-        adapter = humandecision.adapter_path(ROOT, adapter)
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        result = subprocess.run(
-            [str(adapter), "verify-platform", "--snapshot", str(path)], cwd=str(ROOT), text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        adapter = humandecision.adapter_path(
+            ROOT, adapter, required_operations=("verify-platform",),
         )
+        digest=hashlib.sha256(snapshot_data).hexdigest()
+        result=humandecision.run_adapter(adapter,["verify-platform"],required_operations=("verify-platform",),timeout=30,receipt_raw=snapshot_data,receipt_option="--snapshot")
         if result.returncode or result.stdout.strip() != f"VERIFIED PLATFORM SNAPSHOT sha256={digest}":
             raise SystemExit("provider platform adapter rejected the snapshot")
+        after_data,after_identity=humandecision.receipt_snapshot(path)
+        if after_identity!=snapshot_identity or after_data!=snapshot_data:
+            raise SystemExit("platform snapshot changed during provider verification")
     members: Dict[str, Dict[str, object]] = {}
     for item in value["members"]:
         required = {
@@ -1908,7 +1948,6 @@ def publish_terminal_marker(state: Dict[str, object], item: Dict[str, object], s
                             final_message_sha256: Optional[str]) -> None:
     """Publish the complete reviewer result before the editable ledger changes."""
     marker = terminal_marker_path(state, str(item["id"]))
-    marker.parent.mkdir(parents=True, exist_ok=True)
     value = {
         "schema": TERMINAL_MARKER_SCHEMA, "ledger_epoch": state.get("epoch"),
         "agent_id": item.get("id"), "terminal_status": status,
@@ -1930,22 +1969,11 @@ def publish_terminal_marker(state: Dict[str, object], item: Dict[str, object], s
     }
     data = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     if os.path.lexists(marker):
-        if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != data:
+        if marker.is_symlink() or not marker.is_file() or boundedio.read_bytes(marker,label="terminal marker") != data:
             raise SystemExit("terminal marker collision or attempted terminal rewrite")
         return
-    descriptor, raw = tempfile.mkstemp(prefix=".terminal-marker.", dir=str(marker.parent))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data); handle.flush(); os.fsync(handle.fileno())
-        try:
-            os.link(temporary, marker)
-        except FileExistsError:
-            if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != data:
-                raise SystemExit("terminal marker collision or attempted terminal rewrite")
-        marker.chmod(0o444)
-    finally:
-        if temporary.exists(): temporary.unlink()
+    try: boundedio.publish_immutable(marker,data,label="terminal marker")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def read_terminal_marker(state: Dict[str, object], item: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -1969,8 +1997,16 @@ def orphan_terminal_marker_errors(state: Dict[str, object]) -> List[str]:
     member_ids = {
         str(item.get("id")) for item in state.get("members", []) if isinstance(item, dict)
     }
-    errors = []
-    for marker in sorted(directory.iterdir()):
+    errors=[]; markers=[]
+    try:
+        with os.scandir(directory) as scanner:
+            for entry in scanner:
+                if len(markers)>=4096:
+                    errors.append("terminal marker inventory exceeds 4096 entries"); return errors
+                markers.append(Path(entry.path))
+    except OSError:
+        return ["terminal marker inventory is unreadable"]
+    for marker in sorted(markers,key=lambda item:os.fsencode(item.name)):
         if marker.is_symlink() or not marker.is_file() or marker.suffix != ".json":
             errors.append(f"terminal marker entry is not a regular marker file: {marker.name}")
             continue
@@ -2002,7 +2038,7 @@ def ledger_chain_errors(state: Dict[str, object]) -> List[str]:
     elif not isinstance(previous, str) or SHA.fullmatch(previous) is None:
         return ["agent ledger chain predecessor hash is invalid"]
     try:
-        lines = CHAIN_JOURNAL.read_text(encoding="utf-8").splitlines() if CHAIN_JOURNAL.is_file() else []
+        lines = boundedio.read_text(CHAIN_JOURNAL,label="ledger chain journal").splitlines() if CHAIN_JOURNAL.is_file() else []
     except OSError:
         lines = []
     entries: List[object] = []
@@ -2056,6 +2092,122 @@ def ledger_chain_errors(state: Dict[str, object]) -> List[str]:
         index -= 1
 
 
+def configured_model() -> str:
+    value=policy().get("default_model")
+    if not valid_model_id(value):
+        raise SystemExit("child dispatch blocked: default model is unselected; bind one by starting the task with agentctl.py start --model <model-id> --title <task>")
+    return value
+
+
+def signed_ledger_reset_proof(
+    ledger_snapshot: Tuple[bytes, Tuple[int, int, int, int]],
+    snapshot_record: Dict[str, object],
+) -> Tuple[Dict[str, object], List[Tuple[Path, str, Tuple[bytes, Tuple[int, int, int, int]]]]]:
+    """Challenge the mandatory provider observer for one exact legacy reset."""
+    config_snapshot = bounded_regular_snapshot(CONFIG, "Agent configuration")
+    task_snapshot = bounded_regular_snapshot(TASK, "task generation")
+    config = strict_snapshot_object(config_snapshot, "Agent configuration")
+    task = strict_snapshot_object(task_snapshot, "task generation")
+    observer = platform_observer_policy()
+    raw_adapter = observer.get("signed_adapter")
+    if not raw_adapter:
+        raise SystemExit("legacy Agent-ledger reset requires signed platform observer authority")
+    task_generation_id = task.get("task_generation_id")
+    if (
+        not isinstance(task_generation_id, str)
+        or humandecision.DECISION_ID.fullmatch(task_generation_id) is None
+    ):
+        raise SystemExit("legacy Agent-ledger reset requires an exact task-generation identity")
+    adapter = humandecision.adapter_path(
+        ROOT, raw_adapter, required_operations=("verify-platform",),
+    )
+    ledger_data = ledger_snapshot[0]
+    ledger_sha256 = hashlib.sha256(ledger_data).hexdigest()
+    project_sha256 = humandecision.project_identity_sha256(ROOT, config)
+    generation_sha256 = humandecision.task_generation_sha256(task)
+    snapshot_sha256 = str(snapshot_record.get("sha256", ""))
+    snapshot_path = ROOT / str(snapshot_record.get("path", ""))
+    snapshot_data, snapshot_identity = bounded_regular_snapshot(
+        snapshot_path, "immutable reset platform snapshot", humandecision.MAX_RECEIPT_BYTES,
+    )
+    if (
+        SHA.fullmatch(snapshot_sha256) is None
+        or hashlib.sha256(snapshot_data).hexdigest() != snapshot_sha256
+        or len(snapshot_data) != snapshot_record.get("bytes")
+    ):
+        raise SystemExit("reset platform snapshot receipt does not bind its descriptor bytes")
+    try:
+        snapshot_value = humandecision.strict_json_loads(snapshot_data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit("reset platform snapshot is malformed") from error
+    if not isinstance(snapshot_value, dict) or snapshot_value.get("schema") != PLATFORM_SCHEMA:
+        raise SystemExit("reset platform snapshot schema is malformed")
+    nonce = os.urandom(32).hex()
+    challenged_at = now()
+    arguments = [
+        "verify-platform", "--ledger-reset-challenge", nonce,
+        "--project-identity-sha256", project_sha256,
+        "--task-generation-sha256", generation_sha256,
+        "--task-generation-id", task_generation_id,
+        "--legacy-ledger-sha256", ledger_sha256,
+        "--legacy-ledger-bytes", str(len(ledger_data)),
+        "--platform-snapshot-sha256", snapshot_sha256,
+    ]
+    result = humandecision.run_adapter(
+        adapter, arguments, required_operations=("verify-platform",), timeout=30,
+        receipt_raw=snapshot_data, receipt_option="--snapshot",
+    )
+    if result.returncode:
+        raise SystemExit("signed platform observer rejected the ledger reset challenge")
+    try:
+        proof = humandecision.strict_json_loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit("signed platform observer returned a malformed ledger reset proof") from error
+    required = {
+        "schema", "nonce", "authority", "status", "observed_at",
+        "project_identity_sha256", "task_generation_sha256", "task_generation_id",
+        "legacy_ledger_sha256", "legacy_ledger_bytes",
+        "platform_snapshot_sha256", "platform_observed_at",
+    }
+    if not isinstance(proof, dict) or set(proof) != required:
+        raise SystemExit("signed platform observer returned malformed ledger reset proof fields")
+    if (
+        proof.get("schema") != LEDGER_RESET_PROOF_SCHEMA
+        or proof.get("nonce") != nonce
+        or proof.get("authority") != "provider-signed-platform-observer"
+        or proof.get("status") != "approved-empty-platform"
+        or proof.get("project_identity_sha256") != project_sha256
+        or proof.get("task_generation_sha256") != generation_sha256
+        or proof.get("task_generation_id") != task_generation_id
+        or proof.get("legacy_ledger_sha256") != ledger_sha256
+        or proof.get("legacy_ledger_bytes") != len(ledger_data)
+        or proof.get("platform_snapshot_sha256") != snapshot_sha256
+        or proof.get("platform_observed_at") != snapshot_value.get("observed_at")
+    ):
+        raise SystemExit("signed ledger reset proof is stale, replayed, tampered, or misbound")
+    try:
+        proof_observed = parse(proof.get("observed_at"))
+    except (TypeError, ValueError) as error:
+        raise SystemExit("signed ledger reset proof observed_at is malformed") from error
+    age = (now() - proof_observed).total_seconds()
+    if (
+        age < -TIMESTAMP_SKEW_SECONDS or age > RESET_PROOF_MAX_AGE_SECONDS
+        or proof_observed < challenged_at - dt.timedelta(seconds=TIMESTAMP_SKEW_SECONDS)
+    ):
+        raise SystemExit("signed ledger reset proof is stale or predates its fresh nonce challenge")
+    after_snapshot = bounded_regular_snapshot(
+        snapshot_path, "immutable reset platform snapshot", humandecision.MAX_RECEIPT_BYTES,
+    )
+    if after_snapshot != (snapshot_data, snapshot_identity):
+        raise SystemExit("reset platform snapshot changed during signed authorization")
+    dependencies = [
+        (CONFIG, "Agent configuration", config_snapshot),
+        (TASK, "task generation", task_snapshot),
+        (snapshot_path, "immutable reset platform snapshot", (snapshot_data, snapshot_identity)),
+    ]
+    return proof, dependencies
+
+
 def command_init(args: argparse.Namespace) -> int:
     if not args.platform_snapshot:
         raise SystemExit("initialization requires a fresh platform snapshot")
@@ -2066,9 +2218,20 @@ def command_init(args: argparse.Namespace) -> int:
     if args.force and not args.archive_existing:
         raise SystemExit("--force only applies to init --archive-existing")
     if not args.force and (args.force_reason or args.source or args.receipt):
-        raise SystemExit("--force-reason/--source/--receipt require --force")
-    if STATE.is_file():
-        existing = load(STATE)
+        raise SystemExit("--force-reason/--source/--human-decision-receipt require --force")
+    reset_ledger_snapshot: Optional[Tuple[bytes, Tuple[int, int, int, int]]] = None
+    reset_dependencies: List[Tuple[Path, str, Tuple[bytes, Tuple[int, int, int, int]]]] = []
+    if args.archive_existing and not os.path.lexists(STATE):
+        raise SystemExit("init --archive-existing requires one existing legacy Agent ledger")
+    if os.path.lexists(STATE):
+        if args.archive_existing:
+            reset_ledger_snapshot = bounded_regular_snapshot(STATE, "legacy Agent ledger")
+            existing = strict_snapshot_object(reset_ledger_snapshot, "legacy Agent ledger")
+            if command_validate(argparse.Namespace(require_empty=False)):
+                raise SystemExit("archive-reset refuses a ledger that fails full structural, chain, policy, receipt, and identity validation")
+            require_unchanged_snapshot(STATE,"legacy Agent ledger",reset_ledger_snapshot)
+        else:
+            existing = load(STATE)
         non_terminal = [
             item for item in existing.get("members", [])
             if isinstance(item, dict) and item.get("status") not in TERMINAL
@@ -2078,55 +2241,54 @@ def command_init(args: argparse.Namespace) -> int:
         if non_terminal and not args.force:
             raise SystemExit(
                 "cannot archive-reset a ledger with non-terminal members; close every child first, "
-                "or pass --force --force-reason <why> --source user:<message> to bind a human decision "
-                "(gate ledger-force-reset)"
+                "or pass --force --force-reason <why> --source <provider-bound-source> "
+                "--human-decision-receipt <path> (gate ledger-force-reset)"
             )
         if args.archive_existing:
-            data = STATE.read_bytes()
+            if reset_ledger_snapshot is None:
+                raise SystemExit("legacy Agent ledger snapshot is unavailable")
+            data = reset_ledger_snapshot[0]
             digest = hashlib.sha256(data).hexdigest()
-            payload = data
+            reset_proof, reset_dependencies = signed_ledger_reset_proof(
+                reset_ledger_snapshot, snapshot_record,
+            )
+            envelope: Dict[str, object] = {
+                "schema": LEDGER_ARCHIVE_SCHEMA, "archived_at": iso(now()),
+                "ledger_sha256": digest, "ledger_bytes": len(data),
+                "reset_proof": reset_proof, "ledger": existing,
+            }
             if args.force:
                 if not args.force_reason or not args.force_reason.strip():
                     raise SystemExit("forced ledger reset requires an explicit --force-reason")
                 if not args.source:
-                    raise SystemExit("forced ledger reset requires --source user:<message> or a provider receipt")
+                    raise SystemExit("forced ledger reset requires a provider-bound --source and --human-decision-receipt")
                 approval = humandecision.record_decision_approval(
                     ROOT, load(CONFIG), load(TASK), gate="ledger-force-reset",
                     artifact_sha256=digest, source=args.source, receipt=args.receipt,
                 )
-                envelope = {
-                    "schema": LEDGER_FORCE_ARCHIVE_SCHEMA, "archived_at": iso(now()),
+                envelope.update({
+                    "schema": LEDGER_FORCE_ARCHIVE_SCHEMA,
                     "force_reason": args.force_reason.strip(),
-                    "ledger_sha256": digest, "ledger_bytes": len(data),
                     "decision": {
                         "gate": "ledger-force-reset", "artifact_sha256": digest,
                         "source": args.source, "approval": approval,
                     },
-                    "ledger": json.loads(data.decode("utf-8")),
-                }
-                payload = (json.dumps(envelope, ensure_ascii=False, indent=2) + "\n").encode()
-            archive = AGENT / "state" / "evidence" / f"agent-ledger-archive-{digest[:16]}.json"
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            if archive.exists():
-                if not args.force and archive.read_bytes() != data:
-                    raise SystemExit("ledger migration archive path collision")
-                if args.force:
-                    try:
-                        prior = load(archive)
-                    except SystemExit:
-                        raise SystemExit("ledger migration archive path collision")
-                    if prior.get("schema") != LEDGER_FORCE_ARCHIVE_SCHEMA or prior.get("ledger_sha256") != digest:
-                        raise SystemExit("ledger migration archive path collision")
-            if not archive.exists():
-                descriptor, raw = tempfile.mkstemp(prefix=".agent-ledger-archive.", dir=str(archive.parent))
-                temporary = Path(raw)
-                try:
-                    with os.fdopen(descriptor, "wb") as handle:
-                        handle.write(payload); handle.flush(); os.fsync(handle.fileno())
-                    os.replace(temporary, archive)
-                finally:
-                    if temporary.exists(): temporary.unlink()
-            final = archive.read_bytes()
+                })
+            payload = (json.dumps(envelope, ensure_ascii=False, indent=2) + "\n").encode()
+            proof_digest = hashlib.sha256(
+                humandecision.canonical(reset_proof)
+            ).hexdigest()
+            archive = AGENT / "state" / "evidence" / (
+                f"agent-ledger-archive-{digest[:16]}-{proof_digest[:16]}.json"
+            )
+            if os.path.lexists(archive): raise SystemExit("fresh ledger reset proof collided with an existing migration archive")
+            try: boundedio.publish_immutable(archive,payload,maximum=LEDGER_SNAPSHOT_LIMIT_BYTES,label="ledger migration archive")
+            except RuntimeError as error: raise SystemExit(str(error)) from error
+            final, _archive_identity = bounded_regular_snapshot(
+                archive, "ledger migration archive", LEDGER_SNAPSHOT_LIMIT_BYTES,
+            )
+            if final != payload:
+                raise SystemExit("ledger migration archive differs from authorized reset bytes")
             migration_source = {
                 "path": str(archive.relative_to(ROOT)),
                 "sha256": hashlib.sha256(final).hexdigest(), "bytes": len(final),
@@ -2147,9 +2309,19 @@ def command_init(args: argparse.Namespace) -> int:
     if stall_timeout < 120 or stall_timeout > 1800 or stall_timeout <= interval + monitor_grace:
         raise SystemExit("stall timeout must be bounded to 120-1800 seconds and exceed the monitor gap")
     token_budget, _ = mode_token_budget()
+    task_authority=load(TASK); configured_default=config.get("default_model")
+    if valid_model_id(configured_default):
+        initialized_model=configured_default
+    elif configured_default is None and task_authority.get("status") in {"idle","accepted"}:
+        # Archival reset between task generations must preserve the invariant
+        # that inactive config/ledger authority is null. The next explicit
+        # agentctl start atomically binds its own model.
+        initialized_model=None
+    else:
+        initialized_model=configured_model()
     value: Dict[str, object] = {
         "schema": SCHEMA, "platform_limit": int(config["platform_limit"]),
-        "default_model": str(config["default_model"]),
+        "default_model": initialized_model,
         "allow_model_fallback": bool(config["allow_model_fallback"]),
         "context_strategy": str(config["context_strategy"]),
         "max_fork_turns": int(config["max_fork_turns"]),
@@ -2175,7 +2347,10 @@ def command_init(args: argparse.Namespace) -> int:
         "last_platform_snapshot": snapshot_record, "platform_empty_verified": True,
         "migration_source": migration_source, "updated_at": iso(now()),
     }
-    save(value); print("AGENT LEDGER INITIALIZED"); return 0
+    save(
+        value, expected_previous=reset_ledger_snapshot,
+        reset_dependencies=reset_dependencies,
+    ); print("AGENT LEDGER INITIALIZED"); return 0
 
 
 def completed_zero_pass(item: Dict[str, object]) -> bool:
@@ -2351,7 +2526,45 @@ def require_formal_review_predecessor(state: Dict[str, object], envelope: Dict[s
             raise SystemExit("integrator review chain is not linked adversarial to cross")
 
 
-def command_prepare(args: argparse.Namespace) -> int:
+def budget_authority_snapshot() -> Dict[str, Tuple[bytes, Tuple[int, int, int, int]]]:
+    """Snapshot every authority consumed by agentctl budget-gate.
+
+    The child must run before the ledger lock because current agentctl recovery
+    takes project-init -> agents -> TASK -> context.  Exact byte and identity
+    revalidation under the ledger lock turns that outside observation into a
+    commit-safe gate without weakening either lock.
+    """
+    authorities = (
+        CONFIG, TASK, STATE, AGENT / "state/CONTEXT.json",
+        AGENT / "state/REQUIREMENT_CONTRACT.md", AGENT / "state/STAGE_INDEX.md",
+    )
+    snapshot: Dict[str, Tuple[bytes, Tuple[int, int, int, int]]] = {}
+    for path in authorities:
+        if not path.exists() and path not in {CONFIG, TASK, STATE}:
+            continue
+        if not path.is_file() or path.is_symlink():
+            raise SystemExit(f"budget authority is missing or unsafe: {path.relative_to(ROOT)}")
+        data, identity = humandecision.receipt_snapshot(path)
+        snapshot[str(path.relative_to(ROOT))] = (data, identity)
+    return snapshot
+
+
+def gather_budget_gate(action: str) -> Dict[str, object]:
+    before = budget_authority_snapshot()
+    try:
+        result = boundedprocess.run(
+            [sys.executable, str(AGENT / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
+            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"budget gate timed out for {action}") from error
+    after = budget_authority_snapshot()
+    if after != before:
+        raise SystemExit("budget authority changed while the child gate was observed; retry prepare")
+    return {"action": action, "returncode": result.returncode, "stdout": result.stdout, "authority": after}
+
+
+def command_prepare(args: argparse.Namespace, budget_evidence: Optional[Dict[str, object]] = None) -> object:
     """Publish payload/envelope before spawn and reserve one bounded child slot."""
     state = load(STATE)
     if state.get("task_payload_limits") != task_payload_limits():
@@ -2369,9 +2582,9 @@ def command_prepare(args: argparse.Namespace) -> int:
     root_id = args.root_task_id or args.id
     if args.role_type not in state.get("allowed_role_types", []):
         raise SystemExit(f"unknown canonical role type: {args.role_type}")
-    configured_model = str(policy().get("default_model", ""))
-    if args.model != configured_model:
-        raise SystemExit(f"agent model must equal configured default: {configured_model}")
+    selected_model = configured_model()
+    if args.model != selected_model:
+        raise SystemExit(f"agent model must equal configured default: {selected_model}")
     configured_fork = int(policy().get("max_fork_turns", 0))
     if args.fork_turns < 0 or args.fork_turns > configured_fork:
         raise SystemExit(f"agent fork window must stay within 0..{configured_fork}")
@@ -2454,6 +2667,8 @@ def command_prepare(args: argparse.Namespace) -> int:
                     f"prepared dispatch is past the register TTL: {args.id}; "
                     f"release it before re-registering: agentledger.py cancel-prepare --id {args.id}"
                 )
+            if budget_evidence is None:
+                return {"idempotent": True}
             return 0
         raise SystemExit("canonical dispatch ID is already closed")
     require_dispatch_context(args.fork_turns, estimated_tokens)
@@ -2485,12 +2700,21 @@ def command_prepare(args: argparse.Namespace) -> int:
     action = "spawn-review-agent" if (
         args.role_type in state.get("review_role_types", []) or attestation_only_implementer
     ) else "spawn-agent"
-    budget = subprocess.run(
-        [sys.executable, str(AGENT / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    if budget.returncode:
-        raise SystemExit(budget.stdout.strip() or f"budget gate blocked {action}")
+    if budget_evidence is None:
+        # Gather child authority before taking .agents.lock.  agentctl recovery
+        # canonically takes project-init before .agents.lock, so spawning it
+        # from the ledger critical section would invert the global order.
+        return gather_budget_gate(action)
+    if budget_evidence.get("action") != action:
+        raise SystemExit("prepared dispatch classification changed after the budget observation; retry prepare")
+    if budget_evidence.get("authority") != budget_authority_snapshot():
+        raise SystemExit("budget authority changed before ledger commit; retry prepare")
+    budget_returncode = budget_evidence.get("returncode")
+    budget_stdout = budget_evidence.get("stdout")
+    if type(budget_returncode) is not int or not isinstance(budget_stdout, str):
+        raise SystemExit("budget gate evidence is malformed")
+    if budget_returncode:
+        raise SystemExit(budget_stdout.strip() or f"budget gate blocked {action}")
     require_payload_token_budget(state, estimated_tokens, args.fork_turns)
     capacity_failures = [
         item for item in state.get("capacity_failures", [])
@@ -2638,7 +2862,7 @@ def register(state: Dict[str, object], args: argparse.Namespace, redispatch_coun
     platform_item = platform.get(args.id)
     if observed != expected or not platform_item or str(platform_item.get("status", "")).lower() not in PLATFORM_ACTIVE:
         raise SystemExit(f"registration platform mismatch: expected={sorted(expected)} observed={sorted(observed)}")
-    expected_model = str(policy().get("default_model", ""))
+    expected_model = configured_model()
     if not expected_model or args.model != expected_model or platform_item.get("model") != expected_model:
         raise SystemExit(f"agent model must be platform-bound to configured default: {expected_model}")
     if platform_item.get("fork_turns") != args.fork_turns:
@@ -2871,26 +3095,20 @@ def replay_observation(run: Dict[str, object], expected: Dict[str, object], sequ
 
 
 def write_replay_receipt(run: Dict[str, object], cases: List[Dict[str, object]]) -> None:
-    receipt_path = ROOT / str(run["receipt_path"]); receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path=ROOT/str(run["receipt_path"])
     value = {
         "schema": "agent-test-receipt/v3", "run_id": run["run_id"],
         "candidate_sha256": run["candidate_sha256"],
         "runner": run["runner_evidence"], "cases": [case["case"] for case in cases if case.get("case") is not None],
     }
     data = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode()
-    descriptor, raw = tempfile.mkstemp(prefix=f".{receipt_path.name}.", dir=str(receipt_path.parent))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary, receipt_path)
-    finally:
-        if temporary.exists(): temporary.unlink()
+    try: boundedio.atomic_write(receipt_path,data,mode=0o600,label="managed replay receipt")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def replay_execute_claim(integrator_id: str, run_id: str) -> Optional[Dict[str, object]]:
     """Short locked phase: authorize exactly the next Node 6 case and persist its start."""
-    with LOCK.open("r+") as handle:
+    with ledger_lock() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         state = load(STATE); item = member(state, integrator_id); run = replay_run(state, integrator_id, run_id)
         plan = replay_plan(run.get("plan_evidence")); cases = run.get("cases")
@@ -2956,7 +3174,7 @@ def replay_execute_claim(integrator_id: str, run_id: str) -> Optional[Dict[str, 
 
 def replay_execute_commit(integrator_id: str, run_id: str, claim: Dict[str, object]) -> Tuple[bool, bool]:
     """Short locked phase: consume only the exact ledger-launched testrun result."""
-    with LOCK.open("r+") as handle:
+    with ledger_lock() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         state = load(STATE); item = member(state, integrator_id); run = replay_run(state, integrator_id, run_id)
         plan = replay_plan(run.get("plan_evidence")); cases = run.get("cases")
@@ -3005,14 +3223,15 @@ def replay_execute_commit(integrator_id: str, run_id: str, claim: Dict[str, obje
         observed_case = provisional_cases[index]
         required_case = {
             "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at", "exit_code",
-            "outcome", "cleanup", "output", "case_sha256",
+            "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
         }
         if (
             not isinstance(observed_case, dict) or set(observed_case) != required_case
             or observed_case.get("id") != expected.get("id") or observed_case.get("run_id") != run_id
             or observed_case.get("candidate_sha256") != run.get("candidate_sha256")
             or observed_case.get("command") != expected.get("command")
-            or not valid_receipt(observed_case.get("output"))
+            or not valid_test_execution_boundary(observed_case.get("execution_boundary"))
+            or not valid_managed_test_output(observed_case.get("output"))
             or (observed_case.get("output") or {}).get("path") != expected.get("expected_output_path")
         ):
             raise SystemExit("managed testrun result does not match the exact planned invocation")
@@ -3038,7 +3257,8 @@ def replay_execute_commit(integrator_id: str, run_id: str, claim: Dict[str, obje
             "candidate_sha256": run["candidate_sha256"], "command": expected["command"],
             "started_at": start_value["observed_at"], "finished_at": finished_at,
             "exit_code": observed_case.get("exit_code"), "outcome": observed_case.get("outcome"),
-            "cleanup": observed_case.get("cleanup"), "output": output,
+            "cleanup": observed_case.get("cleanup"),
+            "execution_boundary": dict(TEST_EXECUTION_BOUNDARY), "output": output,
         }
         case["case_sha256"] = hashlib.sha256(
             json.dumps(case, sort_keys=True, separators=(",", ":")).encode()
@@ -3078,12 +3298,12 @@ def command_replay_execute(args: argparse.Namespace) -> int:
             "--timeout", str(claim["timeout_seconds"]), "--", *claim["command"],
         ]
         try:
-            result = subprocess.run(
+            result = boundedprocess.run(
                 invocation, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 timeout=int(claim["timeout_seconds"]) + 15,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            with LOCK.open("r+") as handle:
+            with ledger_lock() as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 state = load(STATE); run = replay_run(state, args.integrator_id, args.run_id)
                 if run.get("status") == "prepared":
@@ -3096,7 +3316,7 @@ def command_replay_execute(args: argparse.Namespace) -> int:
         try:
             passed, completed = replay_execute_commit(args.integrator_id, args.run_id, claim)
         except SystemExit as error:
-            with LOCK.open("r+") as handle:
+            with ledger_lock() as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 state = load(STATE); run = replay_run(state, args.integrator_id, args.run_id)
                 if run.get("status") == "prepared":
@@ -3117,7 +3337,7 @@ def command_replay_execute(args: argparse.Namespace) -> int:
 
 def command_capacity_failure(args: argparse.Namespace) -> int:
     """Record pre-registration spawn capacity failures and bound retries."""
-    state = load(STATE); configured = str(policy().get("default_model", ""))
+    state = load(STATE); configured = configured_model()
     if args.model != configured:
         raise SystemExit(f"capacity retry cannot change model; required: {configured}")
     if not args.root_task_id or not args.attempt_id:
@@ -3291,7 +3511,7 @@ def command_check(args: argparse.Namespace) -> int:
 
 def command_finish(args: argparse.Namespace) -> int:
     if not args.lost and (args.source or args.receipt):
-        raise SystemExit("--source/--receipt require finish --lost")
+        raise SystemExit("--source/--human-decision-receipt require finish --lost")
     state = load(STATE); item = member(state, args.id)
     if item.get("status") in TERMINAL:
         requested = sorted(
@@ -3330,7 +3550,7 @@ def command_finish(args: argparse.Namespace) -> int:
             if not args.source:
                 raise SystemExit(
                     f"finish --lost requires {LOST_OBSERVATION_THRESHOLD} consecutive missing platform observations "
-                    "or --source user:<message> to bind a human decision (gate agent-lost)"
+                    "or --source <provider-bound-source> --human-decision-receipt <path> (gate agent-lost)"
                 )
             approval = humandecision.record_decision_approval(
                 ROOT, load(CONFIG), load(TASK), gate="agent-lost",
@@ -3688,7 +3908,7 @@ def replay_run_registry_errors(state: Dict[str, object]) -> List[str]:
             finish_value = load(ROOT / str(finish["path"]))
             required_case = {
                 "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at",
-                "exit_code", "outcome", "cleanup", "output", "case_sha256",
+                "exit_code", "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
             }
             if (
                 finish_value.get("schema") != REPLAY_OBSERVATION_SCHEMA or finish_value.get("event") != "finish"
@@ -3709,6 +3929,7 @@ def replay_run_registry_errors(state: Dict[str, object]) -> List[str]:
                 or case.get("id") != expected.get("id") or case.get("run_id") != run.get("run_id")
                 or case.get("candidate_sha256") != run.get("candidate_sha256")
                 or case.get("command") != expected.get("command")
+                or not valid_test_execution_boundary(case.get("execution_boundary"))
                 or not content_addressed_receipt(case.get("output"), "agent-replay-outputs", ".log")
             ):
                 errors.append(f"replay output chain drifted: {run.get('run_id')}/{index}")
@@ -3790,6 +4011,16 @@ def replay_run_registry_errors(state: Dict[str, object]) -> List[str]:
 
 def command_validate(args: argparse.Namespace) -> int:
     state = load(STATE); config = policy(); errors: List[str] = []; warnings: List[str] = []
+    task_state=load(TASK); completion_binding=task_state.get("completion_binding",{})
+    expected_member_model=config.get("default_model")
+    if (
+        task_state.get("status")=="accepted" and state.get("default_model") is None
+        and isinstance(completion_binding,dict)
+        and completion_binding.get("schema")=="agent-completion-binding/v2"
+        and completion_binding.get("completed_model")==task_state.get("completed_model")
+        and valid_model_id(task_state.get("completed_model"))
+    ):
+        expected_member_model=task_state.get("completed_model")
     try:
         dispatch_context_policy()
     except SystemExit as error:
@@ -3884,7 +4115,7 @@ def command_validate(args: argparse.Namespace) -> int:
         }
         if (
             preparation.get("role_type") not in state.get("allowed_role_types", [])
-            or preparation.get("model") != config.get("default_model")
+            or preparation.get("model") != expected_member_model
             or integer(preparation.get("fork_turns"), -1) < 0
             or integer(preparation.get("fork_turns"), -1) > integer(config.get("max_fork_turns"), -1)
             or payload is None
@@ -4066,7 +4297,7 @@ def command_validate(args: argparse.Namespace) -> int:
                         or charge.get("terminal_observed_at") != item.get("terminal_observed_at")
                     ):
                         errors.append(f"terminal Agent token charge is not settled: {item.get('id')}")
-        if item.get("model") != config.get("default_model"): errors.append(f"member model differs from configured default: {item.get('id')}")
+        if item.get("model") != expected_member_model: errors.append(f"member model differs from task-generation authority: {item.get('id')}")
         if integer(item.get("fork_turns"), -1) < 0 or integer(item.get("fork_turns"), -1) > integer(config.get("max_fork_turns"), -1): errors.append(f"member fork window is outside configured bounds: {item.get('id')}")
         if item.get("context_strategy") != config.get("context_strategy"): errors.append(f"member context strategy differs from config: {item.get('id')}")
         if not SHA.fullmatch(str(item.get("task_payload_sha256", ""))): errors.append(f"invalid task payload hash: {item.get('id')}")
@@ -4567,10 +4798,30 @@ def command_watchdog_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_migrate_idle_model_v4(_args: argparse.Namespace) -> int:
+    previous=bounded_regular_snapshot(STATE,"Agent ledger")
+    state=strict_snapshot_object(previous,"Agent ledger")
+    errors=ledger_chain_errors(state)
+    if errors: raise SystemExit("idle model migration refuses an invalid ledger chain: "+"; ".join(errors))
+    task=load(TASK); config=policy()
+    if task.get("status") not in {"idle","accepted"} or active(state) or state.get("prepared_dispatches"):
+        raise SystemExit("idle model migration requires an inactive task and no active or prepared child")
+    if config.get("default_model") is not None or task.get("selected_model") is not None:
+        raise SystemExit("idle model migration requires null task/config model authority")
+    if state.get("default_model") is None:
+        print("IDLE MODEL POLICY CURRENT"); return 0
+    if not valid_model_id(state.get("default_model")):
+        raise SystemExit("legacy idle ledger model is malformed")
+    state["default_model"]=None; state["updated_at"]=iso(now())
+    save(state,expected_previous=previous)
+    print("IDLE MODEL POLICY MIGRATED")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(); sub = value.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--platform-snapshot"); init.add_argument("--archive-existing", action="store_true")
-    init.add_argument("--force", action="store_true"); init.add_argument("--force-reason"); init.add_argument("--source"); init.add_argument("--receipt")
+    init.add_argument("--force", action="store_true"); init.add_argument("--force-reason"); init.add_argument("--source"); init.add_argument("--receipt", "--human-decision-receipt", dest="receipt")
     seal = sub.add_parser("seal-payload"); seal.add_argument("--draft", required=True); seal.add_argument("--output", required=True)
     prepare = sub.add_parser("prepare"); prepare.add_argument("--id", required=True); prepare.add_argument("--root-task-id"); prepare.add_argument("--role-type", choices=CANONICAL_ROLE_TYPES, required=True); prepare.add_argument("--model", required=True); prepare.add_argument("--fork-turns", type=int, required=True); prepare.add_argument("--redispatch-count", type=int, default=0); prepare.add_argument("--task-payload", required=True); prepare.add_argument("--handoff-envelope", required=True)
     cancel = sub.add_parser("cancel-prepare"); cancel.add_argument("--id", required=True)
@@ -4582,25 +4833,37 @@ def parser() -> argparse.ArgumentParser:
     replay_reconcile = sub.add_parser("replay-reconcile-terminal"); replay_reconcile.add_argument("--integrator-id", required=True)
     check = sub.add_parser("check"); check.add_argument("--platform-snapshot")
     finish = sub.add_parser("finish"); finish.add_argument("--id", required=True); finish.add_argument("--status", choices=tuple(sorted(TERMINAL)), required=True); finish.add_argument("--conclusion", required=True); finish.add_argument("--evidence", action="append"); finish.add_argument("--platform-snapshot")
-    finish.add_argument("--lost", action="store_true"); finish.add_argument("--source"); finish.add_argument("--receipt")
+    finish.add_argument("--lost", action="store_true"); finish.add_argument("--source"); finish.add_argument("--receipt", "--human-decision-receipt", dest="receipt")
     redispatch = sub.add_parser("redispatch"); redispatch.add_argument("--from-id", required=True); redispatch.add_argument("--to-id", required=True); redispatch.add_argument("--handoff-envelope", required=True); redispatch.add_argument("--deadline-minutes", type=int, required=True); redispatch.add_argument("--platform-snapshot")
     validate = sub.add_parser("validate"); validate.add_argument("--require-empty", action="store_true"); validate.add_argument("--platform-snapshot")
     sub.add_parser("watchdog-plan")
+    sub.add_parser("migrate-idle-model-v4")
     return value
 
 
 def main() -> int:
-    args = parser().parse_args(); LOCK.touch(exist_ok=True)
+    args=parser().parse_args()
     if args.command == "replay-execute":
         return command_replay_execute(args)
-    with LOCK.open("r+") as handle:
+    if args.command == "prepare":
+        # Two-phase prepare: collect child budget evidence without .agents.lock,
+        # then acquire the ledger lock and re-run all validation before commit.
+        budget_evidence = command_prepare(args)
+        if not isinstance(budget_evidence, dict):
+            raise SystemExit("prepare did not produce budget gate evidence")
+        with ledger_lock() as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return int(command_prepare(args, budget_evidence))
+    with ledger_lock() as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        return {"init": command_init, "seal-payload": command_seal_payload, "prepare": command_prepare, "cancel-prepare": command_cancel_prepare,
+        return {"init": command_init, "seal-payload": command_seal_payload, "cancel-prepare": command_cancel_prepare,
                 "register": command_register, "capacity-failure": command_capacity_failure, "heartbeat": command_heartbeat,
                 "replay-prepare": command_replay_prepare, "replay-reconcile-terminal": command_replay_reconcile_terminal,
                 "check": command_check, "finish": command_finish, "redispatch": command_redispatch,
-                "validate": command_validate, "watchdog-plan": command_watchdog_plan}[args.command](args)
+                "validate": command_validate, "watchdog-plan": command_watchdog_plan, "migrate-idle-model-v4":command_migrate_idle_model_v4}[args.command](args)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

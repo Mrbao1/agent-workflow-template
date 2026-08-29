@@ -1,17 +1,17 @@
 {
   "schema": "agent-task/v2",
-  "title": "用户确认设计后动态发现评分并锁定 GitHub Skill 的通用开发工作流",
-  "mode": "release",
-  "task_type": "governance",
-  "complexity": "complex",
-  "files": 24,
+  "title": "No active task",
+  "mode": "standard",
+  "task_type": "maintenance",
+  "complexity": "tiny",
+  "files": 0,
   "environment": "local",
   "deployment_requested": false,
-  "branch": "feature/dynamic-skill-workflow",
-  "status": "in_progress",
-  "phase": "implementation",
-  "requirements_clarified": true,
-  "token_budget": 96000,
+  "branch": "unversioned",
+  "status": "idle",
+  "phase": "idle",
+  "requirements_clarified": false,
+  "token_budget": 48000,
   "tokens_used": 0,
   "token_usage_source": "estimated",
   "usage_receipts": [],
@@ -21,234 +21,62 @@
   "risk_flags": {
     "deploy": false,
     "data_risk": false,
-    "cross_system": true,
+    "cross_system": false,
     "uncertain": false,
-    "security": true,
+    "security": false,
     "compliance": false,
     "migration": false,
     "irreversible": false,
     "external_impact": false
   },
-  "requirement_source": "user:不固定技术栈；由用户输入并确认设计后再选择最合适 Skill，完善独立通用模板并推送",
-  "primary_skill": "run-ai-coding-pipeline",
+  "requirement_source": "pending",
+  "primary_skill": "clarify-task",
   "loaded_references": [],
   "selected_templates": [
-    "requirement-contract",
-    "structured-requirement",
-    "deliverables",
-    "solution",
-    "task-plan",
-    "acceptance-matrix",
-    "review-policy",
-    "node-implementation",
-    "node-acceptance",
-    "retrospective",
-    "acceptance-workflow"
+    "requirement-contract"
   ],
   "selected_capabilities": [
-    "acceptance-workflow",
-    "core",
-    "multi-agent"
+    "core"
   ],
-  "template_route": {
-    "schema": "agent-template-route/v3",
-    "mode": "release",
-    "task_type": "governance",
-    "projection": "lightweight-release",
-    "capabilities": [
-      "acceptance-workflow",
-      "core",
-      "multi-agent"
-    ],
-    "templates": [
-      "requirement-contract",
-      "structured-requirement",
-      "deliverables",
-      "solution",
-      "task-plan",
-      "acceptance-matrix",
-      "review-policy",
-      "node-implementation",
-      "node-acceptance",
-      "retrospective",
-      "acceptance-workflow"
-    ],
-    "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-    "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-    "sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-    "adaptive_project": {
-      "blueprint_sha256": null,
-      "skills_lock_sha256": null,
-      "project_capabilities": []
-    }
-  },
-  "rendered_artifacts": [
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "structured-requirement",
-      "path": ".agent/state/artifacts/02-structured-requirement.md",
-      "sha256": "ffcccf113e62d0cc572045c29f0c37e6a1004ba8696129bbd69bbf83038b3770",
-      "bytes": 1348,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/structured-requirement.md.tmpl",
-      "source_sha256": "ebeca483fa969a6e05d4a8a945c3a2d37d1f69c93dd814729f1f15a80110e074",
-      "source_bytes": 334
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "deliverables",
-      "path": ".agent/state/artifacts/03-deliverables.md",
-      "sha256": "a785ce1c4b4ec83aaf12fe383e1eadbffd80ed07ce83d9b526eca51e6bf82946",
-      "bytes": 694,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/deliverables.md.tmpl",
-      "source_sha256": "e31bbd96f333e055860daa9bf2975ee78096e992a0a8eb0f564134056aed5049",
-      "source_bytes": 215
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "solution",
-      "path": ".agent/state/artifacts/04-solution.md",
-      "sha256": "057c8303e6f99d8fbdef3090fc2b33a3302f035af648fd835d036aeaf989f722",
-      "bytes": 1910,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/solution.md.tmpl",
-      "source_sha256": "0df252909a67a0c31edab1dbab80e4519c93e19d25c82d713074aec302594f71",
-      "source_bytes": 523
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "task-plan",
-      "path": ".agent/state/artifacts/04-task-plan.md",
-      "sha256": "52aa67b69b2e2f9cf4d381e6bffcce5e5eb63d520e997cc23f88f74c68f7435b",
-      "bytes": 1534,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/task-plan.md.tmpl",
-      "source_sha256": "e87c2b6d518542bdcd8bd8da3e08758b46198f27bb0fc3eb446865ee35e6e34b",
-      "source_bytes": 481
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "acceptance-matrix",
-      "path": ".agent/state/artifacts/05-acceptance-matrix.md",
-      "sha256": "b3c10ba65f6cc7ff6495831f7427c8918edf0e8e26d6123b18dabba77c84688c",
-      "bytes": 1201,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/acceptance-matrix.md.tmpl",
-      "source_sha256": "0ada5be61d5651c14869d3d25678d0874204e419ab1afdf52ac24218d3a05284",
-      "source_bytes": 311
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "review-policy",
-      "path": ".agent/state/artifacts/05-review-policy.json",
-      "sha256": "2ea70c5870d06f861ba8cfe874c6b18de7a2f2cdb30e06c5834157822751fd19",
-      "bytes": 792,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/review-policy.json.tmpl",
-      "source_sha256": "f42e8f9d8e2a61459430fce5f84f69ae168b96a024d9a395cebb5c6e679c98b6",
-      "source_bytes": 701
-    },
-    {
-      "schema": "agent-template-render/v1",
-      "template_id": "acceptance-workflow",
-      "path": ".agent/state/artifacts/04-acceptance-runner.json",
-      "sha256": "36dd2a01d85ca952df66317c6ef18c7198507037965aee4d8bba0c294b5df867",
-      "bytes": 464,
-      "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "manifest_sha256": "735320ebefbf4a4b285191859af4898292e0d1a2bdcf49bcee5727442dd0fc82",
-      "route_sha256": "eebb14d7bfe870f75754b156dbae32cdaa62e0d7c534b81b0e011f3270affa63",
-      "source_path": ".agent/templates/workflow-acceptance-runner.json.tmpl",
-      "source_sha256": "9f49d01e788935e7647966bacb0a0b6e265d0524a206318ae0230bec4363c2d7",
-      "source_bytes": 216
-    }
-  ],
+  "template_route": null,
+  "rendered_artifacts": [],
   "decisions": [],
   "open_questions": [],
-  "current_node": 6,
-  "accepted_nodes": [
-    0,
-    1,
-    2,
-    3,
-    4,
-    5
-  ],
-  "node_artifacts": {
-    "1": {
-      "path": ".agent/state/REQUIREMENT_CONTRACT.md",
-      "sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "bytes": 3454
-    },
-    "2": {
-      "path": ".agent/state/artifacts/02-structured-requirement.md",
-      "sha256": "ffcccf113e62d0cc572045c29f0c37e6a1004ba8696129bbd69bbf83038b3770",
-      "bytes": 1348
-    },
-    "3": {
-      "path": ".agent/state/artifacts/03-deliverables.md",
-      "sha256": "a785ce1c4b4ec83aaf12fe383e1eadbffd80ed07ce83d9b526eca51e6bf82946",
-      "bytes": 694
-    },
-    "4": {
-      "path": ".agent/state/artifacts/04-solution.md",
-      "sha256": "057c8303e6f99d8fbdef3090fc2b33a3302f035af648fd835d036aeaf989f722",
-      "bytes": 1910
-    },
-    "5": {
-      "path": ".agent/state/artifacts/05-acceptance-matrix.md",
-      "sha256": "b3c10ba65f6cc7ff6495831f7427c8918edf0e8e26d6123b18dabba77c84688c",
-      "bytes": 1201
-    }
-  },
-  "gate_approvals": {
-    "requirement": {
-      "source": "user:不固定技术栈；由用户输入并确认设计后再选择最合适 Skill，完善独立通用模板并推送",
-      "artifact_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855",
-      "assurance": "explicit-user-message;local-only;not-provider-verified",
-      "routing_profile_sha256": "0fbdafeb1da8aef1fff55cf33852c7d6a4c1643ac015067342bef25d4d52bbf3"
-    },
-    "solution": {
-      "source": "user:技术栈与架构必须由用户输入确认后再按蓝图动态选择 Skill",
-      "artifact_sha256": "057c8303e6f99d8fbdef3090fc2b33a3302f035af648fd835d036aeaf989f722",
-      "assurance": "explicit-user-message;local-only;not-provider-verified",
-      "routing_profile_sha256": "0fbdafeb1da8aef1fff55cf33852c7d6a4c1643ac015067342bef25d4d52bbf3"
-    }
-  },
-  "pending_gate_artifacts": {
-    "solution": {
-      "path": ".agent/state/artifacts/04-solution.md",
-      "sha256": "057c8303e6f99d8fbdef3090fc2b33a3302f035af648fd835d036aeaf989f722",
-      "bytes": 1910
-    }
-  },
+  "current_node": "idle",
+  "accepted_nodes": [],
+  "node_artifacts": {},
+  "gate_approvals": {},
+  "pending_gate_artifacts": {},
   "production_provider": null,
-  "projection": "lightweight-release",
   "rollback_ledger": [],
   "rollback_archive": null,
   "failure_ledger": {},
   "failure_archive": null,
-  "mode_status": "confirmed",
-  "decision_policy_version": 2,
-  "task_archive": {
-    "schema": "agent-task-archive-head/v1",
-    "path": ".agent/state/evidence/task-archives/369c6dc2414ff967818d199055c9ba6d1f1b70b42061d6410e8a9a9ee45d1389.json",
-    "sha256": "369c6dc2414ff967818d199055c9ba6d1f1b70b42061d6410e8a9a9ee45d1389",
-    "bytes": 14090,
-    "total_archives": 4
+  "mode_status": "provisional",
+  "decision_policy_version": 1,
+  "selected_model": null,
+  "completed_model": null,
+  "task_generation_id": "idle-template-v4",
+  "skill_activation": {
+    "schema": "agent-task-skill-activation/v2",
+    "path": ".agent/state/SKILL_ACTIVATION.json",
+    "sha256": "23a28aae79b47d51776d16da1759518bda287af57aff0b57a92cdc9d8ddf40d4",
+    "bytes": 1379626,
+    "activation_sha256": "054f32cb896f7a73495b676d45b1645fecdc4c26cc22f3315588ef3f02ad4b2c",
+    "lock_sha256": null,
+    "skill_ids": [],
+    "builtin_skill_ids": [
+      "clarify-task",
+      "deliver-environments",
+      "manage-adaptive-workflow",
+      "manage-agent-team",
+      "manage-local-runtime",
+      "manage-task-context",
+      "run-ai-coding-pipeline",
+      "run-full-chain-acceptance"
+    ]
   },
+  "task_archive": null,
   "metrics": {
     "tokens": 0,
     "token_source": "estimated",
@@ -262,8 +90,6 @@
     "context_compactions": 0,
     "references_loaded": 0
   },
-  "next_action": "complete node 6: implementation",
-  "updated": "2026-08-24",
-  "requirement_contract": ".agent/state/REQUIREMENT_CONTRACT.md",
-  "requirement_contract_sha256": "ce2c962717e725ab00e4599b23b0cef9f6debe260a4efbe5ab9a4411bf526855"
+  "next_action": "start clarification",
+  "updated": "2026-07-22"
 }

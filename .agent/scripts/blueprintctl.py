@@ -5,10 +5,13 @@ import argparse
 import os
 import signal
 import subprocess
+import time
+import uuid
 
+import testrun
 from adaptive_common import (
     AdaptiveError, blueprint_path, canonical_sha256, fail, load_blueprint, load_json,
-    print_json, record_human_decision, resolve_root, utc_now, validate_blueprint, validate_design, write_json,
+    mutation_lock, print_json, record_provider_human_decision, resolve_root, utc_now, validate_blueprint, validate_design, write_json,
 )
 
 
@@ -85,7 +88,7 @@ def command_confirm(root, args):
         raise AdaptiveError("BLUEPRINT_ALREADY_CONFIRMED", "reopen before replacing a confirmed design")
     design = validate_design(value["design"], require_material=True)
     design_sha256 = canonical_sha256(design)
-    decision_receipt = record_human_decision(
+    decision_receipt = record_provider_human_decision(
         root, gate="adaptive-blueprint-confirm", artifact_sha256=design_sha256,
         source=source, receipt=args.human_decision_receipt,
     )
@@ -112,7 +115,7 @@ def command_reopen(root, args):
     value = load_blueprint(root, require_confirmed=True)
     action = {"action": "reopen-blueprint", "design_sha256": value["confirmation"]["design_sha256"], "source": source}
     action_sha256 = canonical_sha256(action)
-    decision_receipt = record_human_decision(
+    decision_receipt = record_provider_human_decision(
         root, gate="adaptive-blueprint-reopen", artifact_sha256=action_sha256,
         source=source, receipt=args.human_decision_receipt,
     )
@@ -139,27 +142,10 @@ def command_show(root, _args):
     return 0
 
 
-def stop_process_group(process):
-    if process.poll() is not None:
-        return
-    if hasattr(os, "killpg"):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-    else:
-        process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
-        else:
-            process.kill()
-        process.wait()
+def stop_process_group(process,known,launch_token):
+    cleaned,uncertain=testrun.terminate_process_tree(
+        process,known,grace=2.0,launch_token=launch_token)
+    if not cleaned or uncertain: raise AdaptiveError("COMMAND_CLEANUP_UNCERTAIN","could not prove exact Blueprint command process cleanup",3)
 
 
 def command_run(root, args):
@@ -171,6 +157,11 @@ def command_run(root, args):
         raise AdaptiveError("UNKNOWN_COMMAND", f"confirmed blueprint has no command {args.id!r}")
     if args.stage and command["stage"] != args.stage:
         raise AdaptiveError("COMMAND_STAGE_MISMATCH", f"command {args.id!r} is not in stage {args.stage!r}")
+    # Re-read under the shared mutation lock immediately before launch.
+    current = load_blueprint(root, require_confirmed=True)
+    if (current["confirmation"]["design_sha256"] != blueprint["confirmation"]["design_sha256"]
+            or next((item for item in current["design"]["commands"] if item["id"] == args.id), None) != command):
+        raise AdaptiveError("BLUEPRINT_DRIFT", "confirmed blueprint changed before command launch", 3)
     environment = {"PATH": os.defpath}
     if os.name == "nt" and "SYSTEMROOT" in os.environ:
         environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
@@ -178,22 +169,38 @@ def command_run(root, args):
         if name not in os.environ:
             raise AdaptiveError("COMMAND_ENVIRONMENT_MISSING", f"command {args.id!r} requires unavailable environment variable {name}")
         environment[name] = os.environ[name]
+    launch_token=uuid.uuid4().hex; environment[testrun.LAUNCH_TOKEN_NAME]=launch_token
+    if signal.getsignal(signal.SIGCHLD) is not signal.SIG_DFL:
+        raise AdaptiveError("COMMAND_PROCESS_OBSERVER_UNAVAILABLE","default SIGCHLD ownership is required",3)
     try:
         process = subprocess.Popen(command["argv"], cwd=root, shell=False, start_new_session=True,
                                    stdin=subprocess.DEVNULL, env=environment)
     except OSError as error:
         raise AdaptiveError("COMMAND_START_FAILED", f"could not start {args.id!r}: {error}") from error
+    known={}; deadline=time.monotonic()+command["timeout_seconds"]; cleanup_attempted=False
+    timed_out=False; leader_identity=None
     try:
-        return_code = process.wait(timeout=command["timeout_seconds"])
-    except subprocess.TimeoutExpired:
-        stop_process_group(process)
+        while True:
+            snapshot=testrun.process_snapshot()
+            if snapshot is None: raise AdaptiveError("COMMAND_PROCESS_OBSERVER_UNAVAILABLE","process identity snapshot failed",3)
+            leader=snapshot.get(process.pid)
+            if leader is not None:
+                if leader_identity is None: leader_identity=leader[2]; known[process.pid]=leader_identity
+                elif leader[2]!=leader_identity: raise AdaptiveError("COMMAND_PROCESS_OBSERVER_UNAVAILABLE","leader identity changed",3)
+            testrun.discover_descendants(process.pid,known,snapshot)
+            if leader is None or leader[3].startswith("Z"): break
+            if time.monotonic()>=deadline: timed_out=True; break
+            time.sleep(0.05)
+        cleanup_attempted=True; stop_process_group(process,known,launch_token)
+        return_code=int(process.returncode if process.returncode is not None else 125)
+    except BaseException:
+        if not cleanup_attempted: stop_process_group(process,known,launch_token)
+        raise
+    if timed_out:
         print(f"BLUEPRINT_COMMAND_TIMEOUT: id={args.id} timeout={command['timeout_seconds']}")
         return 124
-    except BaseException:
-        stop_process_group(process)
-        raise
     print(f"BLUEPRINT_COMMAND_FINISHED: id={args.id} exit={return_code}")
-    return int(return_code)
+    return return_code
 
 
 def parser():
@@ -214,14 +221,19 @@ def main():
     args = parser().parse_args()
     try:
         root = resolve_root(args.root, __file__)
-        return {
+        handlers = {
             "init": command_init, "import": command_import, "check": command_check,
             "confirm": command_confirm, "reopen": command_reopen, "show": command_show,
             "run-command": command_run,
-        }[args.command](root, args)
+        }
+        if args.command in {"init", "import", "confirm", "reopen", "run-command"}:
+            with mutation_lock(root):
+                return handlers[args.command](root, args)
+        return handlers[args.command](root, args)
     except Exception as error:
         return fail(error)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

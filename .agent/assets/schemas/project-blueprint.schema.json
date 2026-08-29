@@ -41,6 +41,16 @@
         "architecture": {
           "$ref": "#/$defs/stringList"
         },
+        "application_services": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_.-]{0,62}$"
+          }
+        },
         "technology_choices": {
           "type": "array",
           "maxItems": 32,
@@ -186,7 +196,7 @@
         },
         "providers": {
           "type": "array",
-          "maxItems": 2,
+          "maxItems": 16,
           "items": {
             "oneOf": [
               {
@@ -195,7 +205,12 @@
                 "required": [
                   "id",
                   "runner",
-                  "container_image"
+                  "protected_runner",
+                  "candidate_ephemeral",
+                  "protected_ephemeral",
+                  "protected_isolated",
+                  "container_image",
+                  "default_branch"
                 ],
                 "properties": {
                   "id": {
@@ -219,6 +234,27 @@
                       }
                     ]
                   },
+                  "protected_runner": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$"
+                      },
+                      {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "uniqueItems": true,
+                        "items": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$"
+                        }
+                      }
+                    ]
+                  },
+                  "candidate_ephemeral": {"const": true},
+                  "protected_ephemeral": {"const": true},
+                  "protected_isolated": {"const": true},
                   "container_image": {
                     "oneOf": [
                       {
@@ -226,9 +262,17 @@
                       },
                       {
                         "type": "string",
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}@sha256:[0-9a-f]{64}$"
+                        "pattern": "^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?/)?(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*@sha256:[0-9a-f]{64}$"
                       }
                     ]
+                  },
+                  "default_branch": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$"
+                  },
+                  "host": {
+                    "type": "string",
+                    "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*?(?::[0-9]{1,5})?$"
                   }
                 }
               },
@@ -237,12 +281,23 @@
                 "additionalProperties": false,
                 "required": [
                   "id",
+                  "platform",
                   "image",
-                  "tags"
+                  "tags",
+                  "protected_tags",
+                  "candidate_ephemeral",
+                  "protected_ephemeral",
+                  "protected_isolated"
                 ],
                 "properties": {
                   "id": {
                     "const": "gitlab"
+                  },
+                  "platform": {
+                    "enum": [
+                      "linux",
+                      "macos"
+                    ]
                   },
                   "image": {
                     "oneOf": [
@@ -251,17 +306,82 @@
                       },
                       {
                         "type": "string",
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}@sha256:[0-9a-f]{64}$"
+                        "pattern": "^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?/)?(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*@sha256:[0-9a-f]{64}$"
                       }
                     ]
                   },
                   "tags": {
                     "type": "array",
+                    "minItems": 1,
                     "uniqueItems": true,
                     "maxItems": 16,
                     "items": {
                       "type": "string",
                       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                    }
+                  },
+                  "protected_tags": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "maxItems": 16,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+                    }
+                  },
+                  "candidate_ephemeral": {"const": true},
+                  "protected_ephemeral": {"const": true},
+                  "protected_isolated": {"const": true}
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "kind",
+                  "configuration"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^(?!github$|gitlab$)[a-z0-9][a-z0-9._-]{0,63}$"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+                  },
+                  "configuration": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "key",
+                        "value"
+                      ],
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+                        },
+                        "value": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 512
+                        }
+                      }
+                    }
+                  },
+                  "discovery_aliases": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "maxItems": 8,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9][a-z0-9 +._-]{0,63}$"
                     }
                   }
                 }

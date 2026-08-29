@@ -2,10 +2,11 @@
 
 - Provider: {{provider}}
 - CI triggers: pull request and pushes to test/production branches.
-- CI responsibilities: clean install, static checks, tests, build once, publish immutable artifact.
-- Test CD: deploy the CI artifact first, run independent integration acceptance, then publish a digest-bound test receipt.
-- Production CD: promote the identical approved artifact from protected production branch.
-- Provider files: keep CI verification/publication and CD promotion as separate workflows. CD accepts an immutable artifact digest and never rebuilds source.
+- CI responsibilities: clean install, static checks, tests, build exactly once without OIDC, seal an exact file inventory plus authenticity receipt, and pass only those verified bytes to a no-checkout OIDC attestation publisher.
+- Test CD: deploy the exact CI artifact first, run independent integration acceptance, clean the test runtime, then publish an authenticated digest/run/source-bound test receipt.
+- Production CD: promote only the identical artifact bound by the exact bounded successful test receipt and provider preflight.
+- Provider trust boundary: candidate-owned workflow files and verifier scripts produce evidence only and cannot establish their own required-check success. GitHub candidate evidence fails when the repository variables naming the external verifier mode, repository ID, immutable workflow@commit, required-check name, effective-ruleset receipt digest, or verifier-config digest are absent/malformed; those declarations still do not prove that GitHub actually enforces the check. A provider preflight must independently verify the live ruleset and check run emitted by that immutable external or protected-default-branch verifier while treating candidate bytes only as data. GitLab must configure a protected pipeline execution policy/compliance pipeline outside candidate control and verify effective merged configuration plus collision evidence; included job names alone are never authority.
+- Credential boundary: candidate code never receives publication credentials. An unprivileged no-OIDC job downloads and verifies the seal, reconstructs one exact publication-ready archive, and re-uploads it under a same-run immutable artifact ID. The OIDC job has no checkout, run, shell, or project-authored code; it contains only immutable pinned download and attestation actions consuming that exact artifact ID.
 - Provider preflight receipt SHA-256: {{provider_preflight_receipt_sha256}}
 - Provider preflight observed at: {{provider_preflight_observed_at}}
 - Repository identity: {{repository_identity}}

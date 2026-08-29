@@ -10,12 +10,12 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import subprocess
 import sys
 from typing import Dict, List, Optional
 
 import humandecision
+from workflowlib import boundedio,boundedprocess
 
 
 def find_agent_dir() -> Path:
@@ -56,26 +56,16 @@ PROVIDER_TARGET_FIELDS = {
 
 
 def load(path: Path) -> Dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(boundedio.read_text(path,label="delivery JSON"))
     if not isinstance(value, dict):
         raise SystemExit(f"JSON object required: {path}")
     return value
 
 
 def save(value: Dict[str, object], target: Path = STATE) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
-    temporary = Path(raw)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    data=(json.dumps(value,ensure_ascii=False,indent=2)+"\n").encode("utf-8")
+    try: boundedio.atomic_write(target,data,mode=0o600,label="delivery state")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
 
 
 def timestamp() -> str:
@@ -97,7 +87,7 @@ def file_receipt(raw: str, label: str = "receipt file") -> Dict[str, object]:
         raise SystemExit(f"{label} escapes project")
     if not path.is_file() or path.is_symlink():
         raise SystemExit(f"{label} missing: {relative}")
-    data = path.read_bytes()
+    data = boundedio.read_bytes(path,label="delivery file")
     return {"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 
 
@@ -111,7 +101,7 @@ def valid_file_receipt(value: object) -> bool:
         return False
     if not path.is_file() or path.is_symlink():
         return False
-    data = path.read_bytes()
+    data = boundedio.read_bytes(path,label="delivery file")
     return hashlib.sha256(data).hexdigest() == value.get("sha256") and len(data) == value.get("bytes")
 
 
@@ -146,28 +136,33 @@ def require_status(state: Dict[str, object], expected: str) -> None:
         raise SystemExit(f"delivery transition requires status={expected}, observed={state.get('status')}")
 
 
+def require_provider_policy(task: Dict[str, object]) -> Dict[str, object]:
+    if task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION:
+        raise SystemExit("delivery refuses an unknown or legacy human-decision policy")
+    return task
+
+
 def execution_gate(action: str) -> Dict[str, object]:
-    task = load(TASK)
+    task = require_provider_policy(load(TASK))
     source = task.get("requirement_source")
     requirement = task.get("gate_approvals", {}).get("requirement") if isinstance(task.get("gate_approvals"), dict) else None
     accepted = task.get("accepted_nodes", [])
     if task.get("requirements_clarified") is not True or not str(source or "").startswith("user:"):
         raise SystemExit("delivery is blocked until requirements are clarified and human-approved")
-    if task.get("decision_policy_version") == 1:
-        contract = AGENT / "state/REQUIREMENT_CONTRACT.md"
-        contract_sha = hashlib.sha256(contract.read_bytes()).hexdigest() if contract.is_file() else ""
-        if (
-            not isinstance(requirement, dict)
-            or requirement.get("artifact_sha256") != contract_sha
-            or not humandecision.reverify(
-                ROOT, load(CONFIG), task, gate="requirement", artifact_sha256=contract_sha,
-                source=str(source), record=requirement.get("decision_receipt"),
-            )
-        ):
-            raise SystemExit("delivery lacks a provider-signed human requirement decision")
+    contract = AGENT / "state/REQUIREMENT_CONTRACT.md"
+    contract_sha = hashlib.sha256(boundedio.read_bytes(contract,label="requirement contract")).hexdigest() if contract.is_file() else ""
+    if (
+        not isinstance(requirement, dict)
+        or requirement.get("artifact_sha256") != contract_sha
+        or not humandecision.reverify(
+            ROOT, load(CONFIG), task, gate="requirement", artifact_sha256=contract_sha,
+            source=str(source), record=requirement.get("decision_receipt"),
+        )
+    ):
+        raise SystemExit("delivery lacks a provider-signed human requirement decision")
     if not isinstance(accepted, list) or 7 not in accepted:
         raise SystemExit("delivery is blocked until full-chain acceptance has passed")
-    result = subprocess.run(
+    result = boundedprocess.run(
         [sys.executable, str(AGENT / "scripts" / "agentctl.py"), "budget-gate", "--action", action],
         cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
@@ -197,7 +192,7 @@ def production_provider_target(task: Dict[str, object]) -> Dict[str, object]:
         raise SystemExit("production_provider target is malformed or weaker than the production contract")
     if not CONTRACT.is_file() or CONTRACT.is_symlink():
         raise SystemExit("production provider target requires the approved requirement contract")
-    contract_bytes = CONTRACT.read_bytes()
+    contract_bytes = boundedio.read_bytes(CONTRACT,label="requirement contract")
     if hashlib.sha256(contract_bytes).hexdigest() != task.get("requirement_contract_sha256"):
         raise SystemExit("production provider target is not bound to the approved requirement contract")
     prefix = "- Production provider target: "
@@ -254,7 +249,10 @@ def provider_observer_policy() -> Dict[str, object]:
 def provider_adapter_path() -> Path:
     observer = provider_observer_policy()
     try:
-        adapter = humandecision.adapter_path(ROOT, observer.get("signed_adapter"))
+        adapter = humandecision.adapter_path(
+            ROOT, observer.get("signed_adapter"),
+            required_operations=("health-provider-preflight", "verify-provider-preflight"),
+        )
     except SystemExit as error:
         raise SystemExit("production preflight requires an OS-protected host provider adapter") from error
     if adapter.name.lower() in {
@@ -264,7 +262,7 @@ def provider_adapter_path() -> Path:
     return adapter
 
 
-def provider_receipt_file(raw: str) -> tuple[Path, Dict[str, object]]:
+def provider_receipt_file(raw: str):
     path = (ROOT / raw).resolve()
     boundary = (AGENT / "state" / "evidence" / "provider-preflight").resolve()
     try:
@@ -274,8 +272,40 @@ def provider_receipt_file(raw: str) -> tuple[Path, Dict[str, object]]:
         raise SystemExit("provider preflight receipt escapes its evidence boundary")
     if not path.is_file() or path.is_symlink():
         raise SystemExit("provider preflight receipt is missing or is a symlink")
-    data = path.read_bytes()
-    return path, {"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    data,identity=humandecision.receipt_snapshot(path)
+    return path,{"path":relative,"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)},data,identity
+
+
+def valid_required_check_authority(item: object, provider: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    producer = item.get("producer_identity")
+    authority = item.get("external_authority")
+    if (not isinstance(producer, dict)
+            or set(producer) != {"identity_type", "subject", "issuer", "provider_actor_id"}
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{2,255}", str(producer.get("subject", "")))
+            or not re.fullmatch(r"https://[^\s]+", str(producer.get("issuer", "")))
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", str(producer.get("provider_actor_id", "")))
+            or not isinstance(authority, dict)
+            or set(authority) != {"kind", "authority_id", "immutable_ref", "evidence_sha256"}
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{2,127}", str(authority.get("authority_id", "")))
+            or not HEX64.fullmatch(str(authority.get("evidence_sha256", "")))):
+        return False
+    if provider == "github":
+        immutable = (
+            re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}", str(authority.get("immutable_ref", "")))
+            if authority.get("kind") == "github-external-workflow" else
+            re.fullmatch(r"ruleset/[1-9][0-9]{0,19}@[0-9a-f]{64}", str(authority.get("immutable_ref", "")))
+            if authority.get("kind") == "github-ruleset" else None
+        )
+        return producer.get("identity_type") in {"github-app", "github-actions"} and immutable is not None
+    if provider == "gitlab":
+        immutable = re.fullmatch(
+            r"(?:policy|compliance)/[A-Za-z0-9_.:/+-]+@[0-9a-f]{40}",
+            str(authority.get("immutable_ref", "")),
+        ) if authority.get("kind") in {"gitlab-pipeline-execution-policy", "gitlab-compliance-pipeline"} else None
+        return producer.get("identity_type") in {"gitlab-user", "gitlab-service-account"} and immutable is not None
+    return False
 
 
 def parse_provider_preflight(
@@ -320,13 +350,14 @@ def parse_provider_preflight(
         })
         or any(
             not isinstance(item, dict)
-            or set(item) != {"name", "commit_sha", "status", "conclusion", "run_id", "url", "evidence_sha256"}
+            or set(item) != {"name", "commit_sha", "status", "conclusion", "run_id", "url", "evidence_sha256", "producer_identity", "external_authority"}
             or not isinstance(item.get("name"), str) or not item.get("name", "").strip()
             or item.get("commit_sha") != artifact.get("source_revision")
             or item.get("status") != "completed" or item.get("conclusion") != "success"
             or not RUN_ID.fullmatch(str(item.get("run_id", "")))
             or not re.fullmatch(r"https://[^\s]+", str(item.get("url", "")))
             or not HEX64.fullmatch(str(item.get("evidence_sha256", "")))
+            or not valid_required_check_authority(item, value.get("provider"))
             for item in check_runs
         )
         or not isinstance(protection, dict)
@@ -388,15 +419,17 @@ def verify_provider_preflight(
         or not valid_file_receipt(test.get("evidence"))
     ):
         raise SystemExit("provider preflight requires the current byte-valid artifact and test evidence")
-    path, receipt = provider_receipt_file(raw)
-    value = parse_provider_preflight(load(path), task, artifact, test, require_fresh=require_fresh)
-    adapter = provider_adapter_path()
-    result = subprocess.run(
-        [str(adapter), "verify-provider-preflight", "--receipt", str(path)],
-        cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
-    )
+    path,receipt,data,identity=provider_receipt_file(raw)
+    try: parsed=json.loads(data.decode("utf-8"))
+    except (UnicodeError,json.JSONDecodeError) as error: raise SystemExit("provider preflight receipt is not valid UTF-8 JSON") from error
+    value=parse_provider_preflight(parsed,task,artifact,test,require_fresh=require_fresh)
+    adapter=provider_adapter_path()
+    result=humandecision.run_adapter(adapter,["verify-provider-preflight"],required_operations=("health-provider-preflight","verify-provider-preflight"),timeout=30,receipt_raw=data)
     if result.returncode or result.stdout.strip() != f"VERIFIED PROVIDER PREFLIGHT sha256={receipt['sha256']}":
         raise SystemExit("host provider adapter rejected the production preflight receipt")
+    after_data,after_identity=humandecision.receipt_snapshot(path)
+    if after_identity!=identity or after_data!=data:
+        raise SystemExit("provider preflight receipt changed during verification")
     return {
         "schema": PROVIDER_RECORD_SCHEMA,
         **receipt,
@@ -409,7 +442,7 @@ def verify_provider_preflight(
         "candidate_sha256": canonical_sha256(value["candidate"]),
         "test_summary_sha256": canonical_sha256(value["test_summary"]),
         "adapter_path": str(adapter),
-        "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
+        "adapter_sha256": hashlib.sha256(boundedio.read_bytes(adapter,label="delivery adapter")).hexdigest(),
     }
 
 
@@ -459,7 +492,7 @@ def current_delivery_bytes() -> Optional[bytes]:
     """
     if not STATE.is_file() or STATE.is_symlink():
         return None
-    return STATE.read_bytes()
+    return boundedio.read_bytes(STATE,label="delivery state")
 
 
 def delivery_state_empty(value: object) -> bool:
@@ -487,21 +520,9 @@ def delivery_head_wellformed(head: object) -> bool:
 def archive_delivery_state(raw: bytes) -> Dict[str, object]:
     """Content-address the exact prior delivery.json bytes into evidence."""
     value_sha = hashlib.sha256(raw).hexdigest()
-    DELIVERY_ARCHIVES.mkdir(parents=True, exist_ok=True)
     target = DELIVERY_ARCHIVES / f"{value_sha}.json"
-    if target.exists():
-        if target.is_symlink() or target.read_bytes() != raw:
-            raise SystemExit("delivery state archive digest collision")
-    else:
-        descriptor, temp_raw = tempfile.mkstemp(prefix=".delivery-archive.", dir=str(DELIVERY_ARCHIVES))
-        temporary = Path(temp_raw)
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(raw); output.flush(); os.fsync(output.fileno())
-            os.replace(temporary, target); target.chmod(0o444)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+    try: boundedio.publish_immutable(target,raw,maximum=16*1024*1024,label="delivery state archive")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
     return {"path": str(target.relative_to(ROOT)), "sha256": value_sha, "bytes": len(raw)}
 
 
@@ -545,7 +566,7 @@ def delivery_chain_errors(state: Dict[str, object]) -> List[str]:
             errors.append("delivery archive head is invalid or missing")
             break
         seen.add(value_sha)
-        data = path.read_bytes()
+        data = boundedio.read_bytes(path,label="delivery file")
         if len(data) != head["bytes"] or hashlib.sha256(data).hexdigest() != value_sha:
             errors.append("delivery archive bytes drifted")
             break
@@ -570,11 +591,11 @@ def delivery_chain_errors(state: Dict[str, object]) -> List[str]:
 
 
 def command_init(_: argparse.Namespace) -> int:
-    task = load(TASK)
+    task = require_provider_policy(load(TASK))
     status = "awaiting_artifact" if task.get("deployment_requested") else "not_requested"
     epoch, previous_head = 1, None
     if STATE.is_file() and not STATE.is_symlink():
-        raw = STATE.read_bytes()
+        raw = boundedio.read_bytes(STATE,label="delivery state")
         try:
             current = json.loads(raw)
         except (ValueError, json.JSONDecodeError):
@@ -749,14 +770,13 @@ def command_approve(args: argparse.Namespace) -> int:
     decision_receipt = None
     decision_packet = deployment_decision_packet(task, artifact, test, provider)
     decision_packet_sha256 = canonical_sha256(decision_packet)
-    if task.get("decision_policy_version") == 1:
-        if not args.human_decision_receipt:
-            raise SystemExit("production approval requires a provider-signed human decision receipt")
-        decision_receipt = humandecision.verify(
-            ROOT, load(CONFIG), task, gate="production-delivery",
-            artifact_sha256=decision_packet_sha256, source=args.source,
-            receipt=args.human_decision_receipt,
-        )
+    if not args.human_decision_receipt:
+        raise SystemExit("production approval requires a provider-signed human decision receipt")
+    decision_receipt = humandecision.verify(
+        ROOT, load(CONFIG), task, gate="production-delivery",
+        artifact_sha256=decision_packet_sha256, source=args.source,
+        receipt=args.human_decision_receipt,
+    )
     state.update({
         "production_approval": {
             "source": args.source,
@@ -789,10 +809,10 @@ def command_promote(args: argparse.Namespace) -> int:
     if state.get("environment") == "production":
         approval = state.get("production_approval")
         provider = state.get("provider_preflight")
-        task = load(TASK)
+        task = require_provider_policy(load(TASK))
         expected_packet = deployment_decision_packet(task, artifact, test, provider) if isinstance(provider, dict) else None
-        signed_decision_valid = task.get("decision_policy_version") != 1
-        if task.get("decision_policy_version") == 1 and isinstance(approval, dict) and expected_packet is not None:
+        signed_decision_valid = False
+        if isinstance(approval, dict) and expected_packet is not None:
             signed_decision_valid = humandecision.reverify(
                 ROOT, load(CONFIG), task, gate="production-delivery",
                 artifact_sha256=str(canonical_sha256(expected_packet)),
@@ -904,14 +924,12 @@ def command_legacy_rollback_closure(args: argparse.Namespace) -> int:
         "health_evidence_sha256": health_evidence.get("sha256"),
     }
     packet_sha256 = canonical_sha256(packet)
-    decision_receipt = None
-    if task.get("decision_policy_version") == 1:
-        if not args.human_decision_receipt:
-            raise SystemExit("legacy rollback closure requires a provider-signed human decision receipt")
-        decision_receipt = humandecision.verify(
-            ROOT, load(CONFIG), task, gate="legacy-rollback-closure",
-            artifact_sha256=str(packet_sha256), source=args.source, receipt=args.human_decision_receipt,
-        )
+    if not args.human_decision_receipt:
+        raise SystemExit("legacy rollback closure requires a provider-signed human decision receipt")
+    decision_receipt = humandecision.verify(
+        ROOT, load(CONFIG), task, gate="legacy-rollback-closure",
+        artifact_sha256=str(packet_sha256), source=args.source, receipt=args.human_decision_receipt,
+    )
     legacy["rollback_closure"] = {
         "schema": "agent-legacy-rollback-closure/v1",
         "source": args.source,
@@ -935,6 +953,8 @@ def command_legacy_rollback_closure(args: argparse.Namespace) -> int:
 def command_validate(_: argparse.Namespace) -> int:
     task, state = load(TASK), load(STATE)
     errors: List[str] = []
+    if task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION:
+        errors.append("task uses an unknown or legacy human-decision policy")
     if state.get("schema") != "agent-delivery/v3":
         errors.append("invalid schema")
     base_fields = {
@@ -1104,24 +1124,22 @@ def command_validate(_: argparse.Namespace) -> int:
                 if (
                     closure.get("decision_packet") != expected_packet
                     or closure.get("decision_packet_sha256") != canonical_sha256(expected_packet)
-                    or (
-                        task.get("decision_policy_version") == 1
-                        and not humandecision.reverify(
-                            ROOT, load(CONFIG), task, gate="legacy-rollback-closure",
-                            artifact_sha256=str(canonical_sha256(expected_packet)),
-                            source=str(closure.get("source", "")), record=closure.get("decision_receipt"),
-                        )
+                    or task.get("decision_policy_version") != humandecision.PROVIDER_POLICY_VERSION
+                    or not humandecision.reverify(
+                        ROOT, load(CONFIG), task, gate="legacy-rollback-closure",
+                        artifact_sha256=str(canonical_sha256(expected_packet)),
+                        source=str(closure.get("source", "")), record=closure.get("decision_receipt"),
                     )
                 ):
                     errors.append("legacy rollback closure lacks its exact human-approved recovery packet")
     if isinstance(approval, dict):
-        signed_decision_valid = True
+        signed_decision_valid = False
         expected_packet = (
             deployment_decision_packet(task, artifact, test, provider)
             if isinstance(artifact, dict) and isinstance(test, dict) and isinstance(provider, dict)
             else None
         )
-        if task.get("decision_policy_version") == 1 and expected_packet is not None:
+        if task.get("decision_policy_version") == humandecision.PROVIDER_POLICY_VERSION and expected_packet is not None:
             signed_decision_valid = humandecision.reverify(
                 ROOT, load(CONFIG), task, gate="production-delivery",
                 artifact_sha256=str(canonical_sha256(expected_packet)),
@@ -1290,9 +1308,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    LOCK.touch(exist_ok=True)
-    with LOCK.open("r+") as handle:
+    try: lock_handle=boundedio.open_private_lock(LOCK,label="delivery state lock")
+    except RuntimeError as error: raise SystemExit(str(error)) from error
+    with lock_handle as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         return {
             "init": command_init,
@@ -1309,4 +1327,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

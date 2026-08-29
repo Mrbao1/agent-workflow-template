@@ -15,10 +15,12 @@ from typing import Optional
 AGENT_SOURCE = Path(__file__).resolve().parents[3]
 DELIVERY_SOURCE = AGENT_SOURCE / "scripts/deliveryctl.py"
 HUMAN_DECISION_SOURCE = AGENT_SOURCE / "scripts/humandecision.py"
+SCHEMA_VALIDATION_SOURCE = AGENT_SOURCE / "scripts/schema_validation.py"
 
 
-def invoke(root: Path, *args: str, expected: int = 0, provider_harness: bool = False) -> subprocess.CompletedProcess:
-    command = root / ("provider-harness.py" if provider_harness else ".agent/scripts/deliveryctl.py")
+def invoke(root: Path, *args: str, expected: int = 0, provider_harness: bool = False, requirement_harness: bool = False) -> subprocess.CompletedProcess:
+    if provider_harness and requirement_harness: raise AssertionError("choose one fixture harness")
+    command = root / ("provider-harness.py" if provider_harness else "requirement-harness.py" if requirement_harness else ".agent/scripts/deliveryctl.py")
     result = subprocess.run(
         [sys.executable, str(command), *args], cwd=root, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
@@ -105,6 +107,15 @@ def provider_receipt(root: Path, target: dict, *, observed_at: Optional[str] = N
                 "conclusion": "success", "run_id": f"run-{index + 1}",
                 "url": f"https://provider.example/checks/{index + 1}",
                 "evidence_sha256": hashlib.sha256(name.encode()).hexdigest(),
+                "producer_identity": {
+                    "identity_type": "github-app", "subject": "app/protected-checks",
+                    "issuer": "https://token.actions.githubusercontent.com", "provider_actor_id": "71",
+                },
+                "external_authority": {
+                    "kind": "github-external-workflow", "authority_id": f"required-check-{index + 1}",
+                    "immutable_ref": "security/authority/.github/workflows/verify.yml@" + "d" * 40,
+                    "evidence_sha256": hashlib.sha256(("authority:" + name).encode()).hexdigest(),
+                },
             }
             for index, name in enumerate(target["required_status_checks"])
         ],
@@ -120,6 +131,10 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
     (root / ".agent/state").mkdir()
     shutil.copy2(DELIVERY_SOURCE, scripts / "deliveryctl.py")
     shutil.copy2(HUMAN_DECISION_SOURCE, scripts / "humandecision.py")
+    shutil.copy2(HUMAN_DECISION_SOURCE.with_name("process_observation.py"), scripts / "process_observation.py")
+    shutil.copy2(SCHEMA_VALIDATION_SOURCE, scripts / "schema_validation.py")
+    shutil.copy2(AGENT_SOURCE/"scripts/testrun.py",scripts/"testrun.py")
+    shutil.copytree(AGENT_SOURCE/"scripts/workflowlib",scripts/"workflowlib")
     (scripts / "agentctl.py").write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
     (root / "artifact.bin").write_bytes(b"immutable candidate")
     (root / "test-evidence.txt").write_text("passed", encoding="utf-8")
@@ -135,13 +150,22 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
         encoding="utf-8",
     )
     verifier.chmod(0o755)
+    write_json(Path(str(verifier)+".agent-workflow-adapter.json"),{
+        "schema":"agent-provider-adapter/v1","purpose":"provider-verifiable-agent-control",
+        "executable_sha256":hashlib.sha256(verifier.read_bytes()).hexdigest(),
+        "operations":["health-provider-preflight","verify-provider-preflight"],
+    })
     (root / "provider-harness.py").write_text(
         "#!/usr/bin/env python3\n"
         "from pathlib import Path\n"
         "import sys\n"
         "sys.path.insert(0, str(Path('.agent/scripts').resolve()))\n"
         "import deliveryctl\n"
-        "deliveryctl.provider_adapter_path=lambda: Path('.agent/provider-preflight-verifier').resolve()\n"
+        "adapter=Path('.agent/provider-preflight-verifier').resolve()\n"
+        "metadata=Path(str(adapter)+'.agent-workflow-adapter.json').resolve()\n"
+        "original_chain=deliveryctl.humandecision.protected_path_chain\n"
+        "deliveryctl.humandecision.protected_path_chain=lambda path: True if Path(path).resolve() in {adapter,metadata} else original_chain(path)\n"
+        "deliveryctl.provider_adapter_path=lambda: adapter\n"
         "def verify(root, config, task, *, gate, artifact_sha256, source, receipt):\n"
         "    value=deliveryctl.load((Path(root)/receipt).resolve())\n"
         "    if value != {'gate':gate,'artifact_sha256':artifact_sha256,'source':source}:\n"
@@ -155,6 +179,11 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
         "raise SystemExit(deliveryctl.main())\n",
         encoding="utf-8",
     )
+    (root / "requirement-harness.py").write_text(
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\nsys.path.insert(0,str(Path('.agent/scripts').resolve()))\nimport deliveryctl\n"
+        "original=deliveryctl.humandecision.reverify\n"
+        "deliveryctl.humandecision.reverify=lambda *a,**k: True if k.get('gate')=='requirement' else original(*a,**k)\n"
+        "raise SystemExit(deliveryctl.main())\n",encoding="utf-8")
     write_json(root / ".agent/config.json", {
         "branches": {
             "local": ["feature/*", "fix/*", "chore/*"],
@@ -185,20 +214,24 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
         "--run-id", "test-123", "--reviewer", "independent:reviewer", "--runner", "runner.py",
     )
 
-    # Test delivery remains lightweight: no provider receipt, adapter or human production decision.
+    # Test delivery remains lightweight after its signed requirement: no production provider receipt or production decision.
+    test_contract=root / ".agent/state/REQUIREMENT_CONTRACT.md"; test_contract.write_text("approved test requirement\n",encoding="utf-8")
+    test_contract_sha=hashlib.sha256(test_contract.read_bytes()).hexdigest()
     test_task = {
         "environment": "test", "deployment_requested": True,
         "requirements_clarified": True, "requirement_source": "user:fixture",
+        "requirement_contract_sha256":test_contract_sha, "decision_policy_version":1,
+        "gate_approvals":{"requirement":{"artifact_sha256":test_contract_sha,"decision_receipt":{"fixture":"provider-signed-requirement"}}},
         "accepted_nodes": list(range(8)),
     }
     write_json(root / ".agent/state/TASK.json", test_task)
-    invoke(root, "init")
-    invoke(root, "record-artifact", *artifact_args)
-    invoke(root, "accept-test", *test_args)
+    invoke(root, "init",provider_harness=True)
+    invoke(root, "record-artifact", *artifact_args,provider_harness=True)
+    invoke(root, "accept-test", *test_args,provider_harness=True)
     if current_state(root)["status"] != "ready_to_promote":
         raise AssertionError("test delivery was incorrectly burdened by the production provider gate")
-    invoke(root, "promote", "--digest", digest, "--evidence", "deploy-evidence.txt")
-    invoke(root, "validate")
+    invoke(root, "promote", "--digest", digest, "--evidence", "deploy-evidence.txt",provider_harness=True)
+    invoke(root, "validate",provider_harness=True)
 
     target = {
         "schema": "agent-production-provider-target/v1",
@@ -209,16 +242,18 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
     canonical_target = json.dumps(target, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     contract = root / ".agent/state/REQUIREMENT_CONTRACT.md"
     contract.write_text("# Approved requirements\n\n- Production provider target: " + canonical_target + "\n", encoding="utf-8")
+    production_contract_sha=hashlib.sha256(contract.read_bytes()).hexdigest()
     production_task = {
         "environment": "production", "deployment_requested": True,
         "requirements_clarified": True, "requirement_source": "user:fixture",
         "accepted_nodes": list(range(8)), "production_provider": target,
-        "requirement_contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+        "requirement_contract_sha256":production_contract_sha, "decision_policy_version":1,
+        "gate_approvals":{"requirement":{"artifact_sha256":production_contract_sha,"decision_receipt":{"fixture":"provider-signed-requirement"}}},
     }
     write_json(root / ".agent/state/TASK.json", production_task)
-    invoke(root, "init")
-    invoke(root, "record-artifact", *artifact_args)
-    invoke(root, "accept-test", *test_args)
+    invoke(root, "init",provider_harness=True)
+    invoke(root, "record-artifact", *artifact_args,provider_harness=True)
+    invoke(root, "accept-test", *test_args,provider_harness=True)
     state_path = root / ".agent/state/delivery.json"
 
     missing_before = state_path.read_bytes()
@@ -232,7 +267,7 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
     # A caller-authored project-local verifier is rejected by the real trust boundary.
     untrusted_before = state_path.read_bytes()
     rejected = invoke(
-        root, "record-provider-preflight", "--receipt", str(receipt_path.relative_to(root)), expected=1,
+        root, "record-provider-preflight", "--receipt", str(receipt_path.relative_to(root)), expected=1,requirement_harness=True,
     )
     if "OS-protected host provider adapter" not in rejected.stdout:
         raise AssertionError(f"caller verifier failed for the wrong reason:\n{rejected.stdout}")
@@ -257,6 +292,13 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
         expected=1, provider_harness=True,
     )
     assert_state_unchanged(root, check_before, "check run from another revision")
+
+    forged_producer = json.loads(json.dumps(valid_receipt))
+    forged_producer["required_check_runs"][0]["producer_identity"]["provider_actor_id"] = "caller"
+    write_json(receipt_path, forged_producer)
+    producer_before = state_path.read_bytes()
+    invoke(root, "record-provider-preflight", "--receipt", str(receipt_path.relative_to(root)), expected=1, provider_harness=True)
+    assert_state_unchanged(root, producer_before, "caller-authored required-check producer")
 
     expired_time = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=301)).replace(microsecond=0).isoformat()
     expired = provider_receipt(root, target, observed_at=expired_time)
@@ -284,8 +326,14 @@ with tempfile.TemporaryDirectory(prefix="delivery-v3-test-") as raw:
     assert_state_unchanged(root, drift_before, "drifted provider receipt")
     receipt_path.write_bytes(valid_bytes)
 
-    # Policy v1 must sign the complete deployment packet SHA, not only artifact bytes/digest.
-    production_task = json.loads((root / ".agent/state/TASK.json").read_text(encoding="utf-8"))
+    # Unknown/future policy values never disable requirement or production decisions.
+    task_path=root / ".agent/state/TASK.json"
+    production_task = json.loads(task_path.read_text(encoding="utf-8"))
+    unknown_task=dict(production_task); unknown_task["decision_policy_version"]=2
+    write_json(task_path,unknown_task); unknown_before=state_path.read_bytes()
+    invoke(root,"approve-production","--source","user:release-owner",expected=1,provider_harness=True)
+    assert_state_unchanged(root,unknown_before,"unknown decision policy")
+    invoke(root,"validate",expected=1,provider_harness=True)
     production_task["decision_policy_version"] = 1
     production_task["gate_approvals"] = {
         "requirement": {
@@ -363,7 +411,7 @@ with tempfile.TemporaryDirectory(prefix="production-target-config-") as raw:
     root = Path(raw)
     scripts = root / ".agent/scripts"
     scripts.mkdir(parents=True)
-    for name in ("agentctl.py", "contexttx.py", "contextctl.py", "humandecision.py"):
+    for name in ("agentctl.py", "contexttx.py", "contextctl.py", "humandecision.py", "process_observation.py", "schema_validation.py", "testrun.py"):
         shutil.copy2(AGENT_SOURCE / "scripts" / name, scripts / name)
     shutil.copytree(AGENT_SOURCE / "scripts/workflowlib", scripts / "workflowlib")
     target = {
@@ -408,6 +456,12 @@ with tempfile.TemporaryDirectory(prefix="production-target-config-") as raw:
 with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
     root = Path(raw)
     shutil.copytree(AGENT_SOURCE, root / ".agent")
+    seed = root / ".agent/assets/fresh-state/v1"
+    shutil.rmtree(root / ".agent/state")
+    shutil.rmtree(root / ".agent/policies")
+    shutil.copytree(seed / "state", root / ".agent/state")
+    shutil.copytree(seed / "policies", root / ".agent/policies")
+    shutil.copy2(seed / "config.json", root / ".agent/config.json")
     subprocess.run(["git", "init", "-b", "main"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     config_path = root / ".agent/config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -422,6 +476,7 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
 """.encode()
     (root / ".agent/policies/PROJECT_GUARDRAILS.md").write_bytes(fixture_guardrails)
     config["guardrails_ready"] = True
+    config["agent_control"]["default_model"] = "vendor-x/reasoning.model+2026"
     # The generic fresh template intentionally leaves CI/release branch choices
     # empty; this production fixture supplies its own confirmed branch design.
     config["branches"] = {"local": ["feature/*"], "test": ["release/*"], "production": ["main"]}
@@ -449,14 +504,47 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
         "open_questions": ["requirement contract approval"], "current_node": 1, "accepted_nodes": [0],
         "node_artifacts": {}, "gate_approvals": {}, "pending_gate_artifacts": {},
         "mode_status": "provisional", "next_action": "clarify and approve the requirement contract",
+        "selected_model": "vendor-x/reasoning.model+2026", "completed_model": None,
     })
     task["risk_flags"]["deploy"] = True
     task["decision_policy_version"] = 1
     write_json(task_path, task)
     agents_path = root / ".agent/state/agents.json"
     agents = json.loads(agents_path.read_text(encoding="utf-8"))
+    agents["default_model"] = "vendor-x/reasoning.model+2026"
     agents["token_accounting"]["token_budget"] = task["token_budget"]
     write_json(agents_path, agents)
+    blueprint_design = {
+        "goals": ["exercise the provider-approved production delivery path"],
+        "architecture": ["isolated provider and acceptance workflow fixture"],
+        "technology_choices": [],
+        "capabilities": [
+            {"id": "delivery", "description": "explicit built-in delivery authorization"},
+            {"id": "ci-provider-github", "description": "explicit GitHub CI provider authorization"},
+        ],
+        "constraints": ["no real provider or deployment effects"],
+        "acceptance": [{"id": "delivery-gate", "criterion": "provider approval remains fail closed", "method": "manual"}],
+        "commands": [],
+        "providers": [{"id": "github", "runner": ["self-hosted", "linux", "candidate"], "protected_runner": ["self-hosted", "linux", "protected"], "candidate_ephemeral": True, "protected_ephemeral": True, "protected_isolated": True, "container_image": None, "default_branch": "main"}],
+    }
+    blueprint_digest = canonical(blueprint_design)
+    write_json(root / ".agent/project/BLUEPRINT.json", {
+        "schema": "agent-project-blueprint/v1", "status": "confirmed", "design": blueprint_design,
+        "suggestions": [], "confirmation": {
+            "source": "user:delivery-fixture", "design_sha256": blueprint_digest,
+            "confirmed_at": "2026-08-24T00:00:00+00:00", "decision_receipt": {
+                "authority": "provider-signed-user-message", "decision_id": "delivery-fixture",
+                "sha256": "f" * 64,
+            },
+        },
+    })
+    route_harness = root / "route-harness.py"
+    route_harness.write_text(
+        "import sys\nsys.path.insert(0,'.agent/scripts')\nimport adaptive_common,templatectl\n"
+        "adaptive_common.humandecision.reverify=lambda *a,**k: True\n"
+        "sys.argv=['templatectl.py',*sys.argv[1:]]\nraise SystemExit(templatectl.main())\n",
+        encoding="utf-8",
+    )
     contract_path = root / ".agent/state/REQUIREMENT_CONTRACT.md"
     contract_path.write_text(
         "# Requirement Contract\n\n- Goal: release safely\n- Users: production users\n"
@@ -509,7 +597,7 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
         " if value!={'gate':gate,'artifact_sha256':artifact_sha256,'source':source}: raise SystemExit('signed approval mismatch')\n"
         " return value\n"
         "agentctl.humandecision.verify=verify\n"
-        "args=argparse.Namespace(source='user:release-owner',human_decision_receipt=sys.argv[1])\n"
+        "args=argparse.Namespace(source='user:release-owner',human_decision_receipt=sys.argv[1],print_decision_request=False)\n"
         "raise SystemExit(agentctl.command_approve(args))\n",
         encoding="utf-8",
     )
@@ -524,14 +612,18 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
     write_json(correct, {"gate": "requirement", "artifact_sha256": approval_sha, "source": "user:release-owner"})
     approved = subprocess.run([sys.executable, str(harness), correct.name], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
     routed = subprocess.run(
-        [sys.executable, ".agent/scripts/templatectl.py", "route", "--capability", "delivery", "--capability", "ci-provider-github", "--capability", "acceptance-workflow"],
+        [sys.executable, str(route_harness), "route", "--capability", "delivery", "--capability", "ci-provider-github"],
         cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
+    )
+    template_check = subprocess.run(
+        [sys.executable, str(route_harness), "validate"], cwd=root,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
     )
     delivery_init = subprocess.run(
         [sys.executable, ".agent/scripts/deliveryctl.py", "init"], cwd=root,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
     )
-    # agentctl validate re-runs `workflowctl.py validate` as a subprocess, and
+    # agentctl validate re-runs template/workflow validation as subprocesses, and
     # the requirement-gate revalidation performs a genuine provider reverify.
     # A sandbox cannot provision an OS-owned decision adapter, so the harness
     # executes that one subprocess in-process with the provider boundary
@@ -539,15 +631,18 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
     validated = root / "validate-harness.py"
     validated.write_text(
         "import sys,types;sys.path.insert(0,'.agent/scripts')\n"
-        "import agentctl,humandecision,workflowctl\n"
+        "import agentctl,humandecision,templatectl,workflowctl\n"
         "humandecision.reverify=lambda *a,**k: True\n"
-        "real_run=agentctl.subprocess.run\n"
+        "real_run=agentctl.run_bounded_command\n"
         "def patched(command,**kwargs):\n"
+        "    if any(str(item).endswith('templatectl.py') for item in command):\n"
+        "        rc=templatectl.command_validate(types.SimpleNamespace())\n"
+        "        return types.SimpleNamespace(returncode=rc,stdout='')\n"
         "    if any(str(item).endswith('workflowctl.py') for item in command):\n"
         "        rc=workflowctl.command_validate()\n"
         "        return types.SimpleNamespace(returncode=rc,stdout='')\n"
         "    return real_run(command,**kwargs)\n"
-        "agentctl.subprocess.run=patched\n"
+        "agentctl.run_bounded_command=patched\n"
         "raise SystemExit(agentctl.command_validate())\n",
         encoding="utf-8",
     )
@@ -555,10 +650,10 @@ with tempfile.TemporaryDirectory(prefix="production-target-approval-") as raw:
     structure = subprocess.run([sys.executable, str(validated)], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
     approved_task = json.loads(task_path.read_text(encoding="utf-8"))
     if (
-        approved.returncode or routed.returncode or delivery_init.returncode or context_check.returncode or structure.returncode
+        approved.returncode or routed.returncode or template_check.returncode or delivery_init.returncode or context_check.returncode or structure.returncode
         or approved_task.get("production_provider") != target
         or approved_task.get("requirement_contract_sha256") != hashlib.sha256(contract_path.read_bytes()).hexdigest()
     ):
-        raise AssertionError(f"sanctioned signed approval path failed:\n{approved.stdout}\n{routed.stdout}\n{delivery_init.stdout}\n{context_check.stdout}\n{structure.stdout}")
+        raise AssertionError(f"sanctioned signed approval path failed:\n{approved.stdout}\n{routed.stdout}\n{template_check.stdout}\n{delivery_init.stdout}\n{context_check.stdout}\n{structure.stdout}")
 
 print("DELIVERY V3 SELF-TEST PASSED: lightweight test flow and fail-closed provider production gate")

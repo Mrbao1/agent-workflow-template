@@ -13,6 +13,15 @@ import tempfile
 import time
 
 
+
+if __name__=="__main__" and not globals().get("_PUBLICATION_SELF_TEST_REENTRY"):
+    import runpy
+    from workflowlib.publication import discover_project_root,run_cli
+    def _publication_self_test():
+        runpy.run_path(__file__,run_name="__main__",init_globals={"_PUBLICATION_SELF_TEST_REENTRY":True})
+        return 0
+    raise SystemExit(run_cli(discover_project_root(),_publication_self_test))
+
 SOURCE = Path(__file__).resolve().with_name("evidencectl.py")
 DELIVERY_SOURCE = Path(__file__).resolve().with_name("deliveryctl.py")
 DECISION_SOURCE = Path(__file__).resolve().with_name("humandecision.py")
@@ -26,6 +35,36 @@ def run(root: Path, *args: str, expected: int = 0) -> str:
     )
     if result.returncode != expected:
         raise AssertionError(f"{args}: expected {expected}, got {result.returncode}\n{result.stdout}")
+    return result.stdout
+
+
+PROVIDER_WRAPPER = r"""
+import runpy, sys
+from pathlib import Path
+target = sys.argv[1]
+sys.path.insert(0, str(Path(target).resolve().parent))
+import humandecision
+
+def provider_verify(*_args, receipt=None, **_kwargs):
+    return {"schema": "agent-human-decision/v1", "path": str(receipt),
+            "sha256": "f" * 64, "bytes": 1, "decision_id": "self-test-provider",
+            "authority": "provider-signed-user-message", "adapter_path": "/self-test/provider",
+            "adapter_sha256": "e" * 64}
+
+humandecision.verify = provider_verify
+sys.argv = sys.argv[1:]
+runpy.run_path(target, run_name="__main__")
+"""
+
+
+def run_provider(root: Path, *args: str, expected: int = 0) -> str:
+    target = root / ".agent/scripts/evidencectl.py"
+    result = subprocess.run(
+        [sys.executable, "-c", PROVIDER_WRAPPER, str(target), *args], cwd=root,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if result.returncode != expected:
+        raise AssertionError(f"provider {args}: expected {expected}, got {result.returncode}\n{result.stdout}")
     return result.stdout
 
 
@@ -52,7 +91,10 @@ def fresh_project(root: Path, *, delivery: bool = False) -> Path:
     scripts = root / ".agent/scripts"; state = root / ".agent/state"
     evidence = state / "evidence"; scripts.mkdir(parents=True); evidence.mkdir(parents=True)
     shutil.copy2(SOURCE, scripts / "evidencectl.py")
+    shutil.copytree(SOURCE.parent/"workflowlib",scripts/"workflowlib")
     shutil.copy2(DECISION_SOURCE, scripts / "humandecision.py")
+    shutil.copy2(DECISION_SOURCE.with_name("process_observation.py"), scripts / "process_observation.py")
+    shutil.copy2(DECISION_SOURCE.with_name("testrun.py"),scripts/"testrun.py")
     if delivery:
         shutil.copy2(DELIVERY_SOURCE, scripts / "deliveryctl.py")
     shutil.copy2(CONFIG_SOURCE, root / ".agent/config.json")
@@ -164,7 +206,14 @@ with tempfile.TemporaryDirectory(prefix="evidence-retention-") as raw:
 
     run(root, "restore", "--archive", archive_sha)
     cold.chmod(0o644); cold.write_bytes(b"collision")
-    run(root, "restore", "--archive", archive_sha, expected=1)
+    run(root,"restore","--archive",archive_sha,expected=1)
+
+    # A parent-directory symlink swap must fail before materializing archived bytes.
+    held_evidence=root/"held-evidence"; external_evidence=root/"external-evidence"; external_evidence.mkdir()
+    evidence.rename(held_evidence); evidence.symlink_to(external_evidence,target_is_directory=True)
+    run(root,"restore","--archive",archive_sha,expected=1)
+    if list(external_evidence.iterdir()): raise AssertionError("restore followed a symlink-swapped evidence parent")
+    evidence.unlink(); held_evidence.rename(evidence)
 
     cold.unlink(); forbidden = evidence / "forbidden-link"
     forbidden.symlink_to(recent)
@@ -228,13 +277,15 @@ with tempfile.TemporaryDirectory(prefix="evidence-task-migration-") as raw:
     if not (root / head1["path"]).exists() or not (root / head2["path"]).exists():
         raise AssertionError("migration destroyed the legacy v1 archive bytes")
     newest = json.loads((root / new_head["path"]).read_text(encoding="utf-8"))
-    if newest["schema"] != "agent-task-archive/v2" or newest["referenced_evidence"] != []:
-        raise AssertionError("rewritten head payload is not digest-bound v2")
+    if (newest["schema"]!="agent-task-archive/v2" or newest["referenced_evidence"]!=[]
+            or newest.get("skill_activation","missing") is not None or newest.get("delivery","missing") is not None):
+        raise AssertionError("rewritten head payload is not digest-bound v2 with explicit legacy null markers")
     oldest_head = newest["previous"]
     oldest = json.loads((root / oldest_head["path"]).read_text(encoding="utf-8"))
     if (
         oldest["schema"] != "agent-task-archive/v2" or oldest["previous"] is not None
         or oldest["referenced_evidence"] != [sha256(m_ref.read_bytes())]
+        or oldest.get("skill_activation","missing") is not None or oldest.get("delivery","missing") is not None
         or oldest_head["total_archives"] != 1
     ):
         raise AssertionError("referenced evidence paths were not extracted into digests")
@@ -269,7 +320,11 @@ with tempfile.TemporaryDirectory(prefix="evidence-task-history-") as raw:
     run(root, "compact", "--include-task-history", expected=1)
     if not (root / head["path"]).exists():
         raise AssertionError("task history was compacted without a human decision source")
-    output = run(root, "compact", "--include-task-history", "--source", "user:self-test-history")
+    run(root, "compact", "--include-task-history", "--source", "user:self-test-history", expected=1)
+    if not (root / head["path"]).exists():
+        raise AssertionError("caller text authorized task-history compaction without a provider receipt")
+    output = run_provider(root, "compact", "--include-task-history", "--source", "user:self-test-history",
+                          "--human-decision-receipt", ".agent/state/provider-receipt.json")
     if "TASK HISTORY DECISION" not in output or "EVIDENCE COMPACTED" not in output:
         raise AssertionError(f"task-history compaction did not bind a decision: {output}")
     if (root / head["path"]).exists() or not e_ref.exists():
@@ -287,7 +342,7 @@ with tempfile.TemporaryDirectory(prefix="evidence-task-history-") as raw:
 with tempfile.TemporaryDirectory(prefix="delivery-chain-") as raw:
     root = Path(raw); state = root / ".agent/state"
     fresh_project(root, delivery=True)
-    write_json(state / "TASK.json", {"environment": "local", "deployment_requested": True})
+    write_json(state / "TASK.json", {"environment": "local", "deployment_requested": True, "decision_policy_version": 1})
 
     run_delivery(root, "init")
     current = json.loads((state / "delivery.json").read_text(encoding="utf-8"))
@@ -353,7 +408,7 @@ with tempfile.TemporaryDirectory(prefix="delivery-chain-") as raw:
 with tempfile.TemporaryDirectory(prefix="delivery-chain-break-") as raw:
     root = Path(raw); state = root / ".agent/state"
     fresh_project(root, delivery=True)
-    write_json(state / "TASK.json", {"environment": "local", "deployment_requested": True})
+    write_json(state / "TASK.json", {"environment": "local", "deployment_requested": True, "decision_policy_version": 1})
 
     (state / "delivery.json").write_bytes(b"{not json")
     output = run_delivery(root, "init")
@@ -471,6 +526,15 @@ with tempfile.TemporaryDirectory(prefix="evidence-roots-") as raw:
     index = json.loads((state / "EVIDENCE_INDEX.json").read_text(encoding="utf-8"))
     if len(index["archives"]) != 2:
         raise AssertionError("orphan GC destroyed indexed archives")
+    held=state/"evidence-archives-held"; external=root/"external-evidence-archives"; external.mkdir()
+    sentinel=external/("e"*64+".zip"); sentinel.write_bytes(b"external sentinel")
+    archives.rename(held); archives.symlink_to(external,target_is_directory=True)
+    try:
+        rejected=run(root,"compact","--gc-orphans",expected=1)
+        if sentinel.read_bytes()!=b"external sentinel":
+            raise AssertionError(f"symlink-swapped archive root touched external evidence: {rejected}")
+    finally:
+        archives.unlink(); held.rename(archives)
     restored_sha = index["archives"][-1]["sha256"]
     lock = state / ".evidence.lock"; lock.touch(exist_ok=True)
     handle = lock.open("r+")
@@ -487,5 +551,58 @@ with tempfile.TemporaryDirectory(prefix="evidence-roots-") as raw:
     if process.returncode != 0 or "EVIDENCE RESTORED" not in output:
         raise AssertionError(f"restore did not complete after the lock released: {output}")
     handle.close()
+
+# Every normal archive publisher rejects symlinked output roots before any external write.
+with tempfile.TemporaryDirectory(prefix="evidence-publication-nofollow-") as raw:
+    base=Path(raw); root=base/"project"; outside=base/"outside"; outside.mkdir(); evidence=fresh_project(root)
+    candidate=evidence/"candidate.log"; candidate.write_bytes(b"archive"); old=time.time()-48*3600; os.utime(candidate,(old,old))
+    def invoke(statement):
+        code=("import os,runpy,sys; os.chdir("+repr(str(root))+ "); "
+              "sys.path.insert(0,'.agent/scripts'); module=runpy.run_path('.agent/scripts/evidencectl.py'); "+statement)
+        return subprocess.run([sys.executable,"-c",code],cwd=root,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+    archive_root=root/".agent/state/evidence-archives"
+    if archive_root.exists(): shutil.rmtree(archive_root)
+    archive_root.symlink_to(outside,target_is_directory=True)
+    archive=invoke("relative='.agent/state/evidence/candidate.log'; module['publish_archive']([relative],{relative:module['EVIDENCE']/'candidate.log'})")
+    if archive.returncode==0 or "directory is unsafe" not in archive.stdout or list(outside.iterdir()):
+        raise AssertionError(f"ZIP publisher wrote through a symlinked root: {archive.stdout}")
+
+    archive_root.unlink(); page_root=root/".agent/state/evidence-archive-pages"
+    if page_root.exists(): shutil.rmtree(page_root)
+    page_root.symlink_to(outside,target_is_directory=True)
+    page=invoke("module['publish_page'](None,[{'receipt':'bounded'}])")
+    if page.returncode==0 or "directory is unsafe" not in page.stdout or list(outside.iterdir()):
+        raise AssertionError(f"page publisher wrote through a symlinked root: {page.stdout}")
+
+    page_root.unlink(); task_root=evidence/"task-archives"
+    if task_root.exists(): shutil.rmtree(task_root)
+    task_root.symlink_to(outside,target_is_directory=True)
+    task=invoke("module['write_task_archive'](module['TASK_ARCHIVES']/('a'*64+'.json'),b'{}')")
+    if task.returncode==0 or "directory is unsafe" not in task.stdout or list(outside.iterdir()):
+        raise AssertionError(f"task publisher wrote through a symlinked root: {task.stdout}")
+
+# Aggregate inputs fail closed before multi-file materialization, and compaction batches
+# candidates within one deterministic source-byte ceiling.
+with tempfile.TemporaryDirectory(prefix="evidence-aggregate-bounds-") as raw:
+    root=Path(raw); evidence=fresh_project(root); controller=root/".agent/scripts/evidencectl.py"
+    source=controller.read_text(encoding="utf-8")
+    source=source.replace("MAX_ACTIVE_EVIDENCE_INPUT_BYTES=512*1024*1024","MAX_ACTIVE_EVIDENCE_INPUT_BYTES=64")
+    source=source.replace("MAX_ARCHIVED_MEMBER_BYTES=MAX_REFERENCE_FILE_BYTES","MAX_ARCHIVED_MEMBER_BYTES=32")
+    source=source.replace("MAX_ARCHIVE_CONTAINER_BYTES=32*1024*1024","MAX_ARCHIVE_CONTAINER_BYTES=4096")
+    controller.write_text(source,encoding="utf-8")
+    first=evidence/"first.log"; second=evidence/"second.log"
+    first.write_bytes(bytes(range(32))); second.write_bytes(bytes(range(30)))
+    old=time.time()-48*3600; os.utime(first,(old,old)); os.utime(second,(old,old))
+    bounded=json.loads(run(root,"compact","--dry-run","--force"))
+    if bounded["selected_bytes"]!=32 or len(bounded["selected"])!=1:
+        raise AssertionError(f"compaction did not batch within archive source-byte ceiling: {bounded}")
+    if "EVIDENCE COMPACTED" not in run(root,"compact","--force"):
+        raise AssertionError("boundary-sized compaction was not published")
+    run(root,"verify","--deep")
+    (evidence/"third.log").write_bytes(b"c"*30); (evidence/"fourth.log").write_bytes(b"d"*10)
+    output=run(root,"compact","--dry-run","--force",expected=1)
+    if "active evidence aggregate byte limit exceeded" not in output:
+        raise AssertionError(f"active evidence aggregate limit was not enforced: {output}")
 
 print("EVIDENCE RETENTION SELF-TEST PASSED: reachability, deterministic archive, restore and collision gates")

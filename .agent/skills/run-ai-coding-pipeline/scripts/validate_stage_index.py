@@ -4,13 +4,23 @@
 from pathlib import Path
 import argparse
 import json
+import os
 import re
+import stat
+import sys
 from typing import Dict, List
 
+sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+from workflowlib import boundedio
 
 FIELDS = ("Pipeline version", "Task", "Task type", "Complexity", "Mode", "Current node", "Status",
           "Last accepted node", "Release gate", "Release gate reason", "Next action", "Updated")
 HEADINGS = ("Input provenance", "Assumptions requiring confirmation", "Gate status", "Rollback ledger", "Canonical outputs")
+
+
+def bounded_text(path: Path,label: str,maximum: int=2*1024*1024) -> str:
+    try: return boundedio.read_text(path,maximum=maximum,label=label)
+    except RuntimeError as error: raise ValueError(str(error)) from error
 
 
 def occurrences(text: str, field: str) -> List[str]:
@@ -39,7 +49,10 @@ def main() -> int:
     args = parser.parse_args(); stage = Path(args.stage); task_path = Path(args.task) if args.task else stage.with_name("TASK.json")
     if not stage.is_file() or not task_path.is_file():
         print("INVALID stage index\n- stage or canonical task is missing"); return 1
-    text = stage.read_text(encoding="utf-8"); task = json.loads(task_path.read_text(encoding="utf-8")); errors: List[str] = []
+    try: text=bounded_text(stage,"stage index"); task=json.loads(bounded_text(task_path,"canonical task"))
+    except (OSError,ValueError,UnicodeError,json.JSONDecodeError) as error:
+        print(f"INVALID stage index\n- bounded input failed: {error}"); return 1
+    errors: List[str]=[]
     values: Dict[str, str] = {}
     for field in FIELDS:
         found = occurrences(text, field); values[field] = found[0] if found else ""
@@ -57,4 +70,7 @@ def main() -> int:
     print(f"VALID TASK-derived stage index: {stage}"); return 0
 
 
-if __name__ == "__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

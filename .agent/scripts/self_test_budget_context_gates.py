@@ -5,7 +5,7 @@ from pathlib import Path
 import base64
 import hashlib
 import json
-import re
+import os
 import shutil
 import subprocess
 import sys
@@ -34,7 +34,7 @@ def fixture(root: Path) -> None:
     scripts.mkdir(parents=True)
     for name in (
         "testrun.py", "agentctl.py", "contextctl.py", "contexttx.py",
-        "humandecision.py",
+        "humandecision.py", "process_observation.py",
     ):
         shutil.copy2(SOURCE / name, scripts / name)
     shutil.copytree(SOURCE / "workflowlib", scripts / "workflowlib")
@@ -70,7 +70,7 @@ def fixture(root: Path) -> None:
             },
         },
         "agent_control": {
-            "default_model": "gpt-5.6-sol",
+            "default_model": "provider-neutral/primary-model-v1",
             "dispatch_payload_token_limits": {"fast": 0, "standard": 4000, "release": 8000},
             "inherited_turn_estimated_tokens": 800,
             "human_decision_observer": {
@@ -132,11 +132,69 @@ def candidate(root: Path) -> str:
     return result.stdout.strip()
 
 
+def install_test_provider_verifier(root: Path) -> str:
+    """Install a subprocess-only provider verifier; production code stays untouched."""
+    receipt = root / ".agent/state/evidence/test-provider-decision.json"
+    write(receipt, {"test_only": "provider-owned adapter input"})
+    patch_dir = root / ".agent/fixtures/provider-sitecustomize"
+    patch_dir.mkdir(parents=True)
+    (patch_dir / "sitecustomize.py").write_text(textwrap.dedent(r'''
+        import json
+        from pathlib import Path
+        import humandecision
+
+        def provider_verify(root, _config, _task, *, receipt=None, **_kwargs):
+            path = (Path(root) / str(receipt)).resolve()
+            expected = {"test_only": "provider-owned adapter input"}
+            if json.loads(path.read_text(encoding="utf-8")) != expected:
+                raise SystemExit("self-test provider verifier rejected receipt fixture")
+            return {
+                "schema": "agent-human-decision/v1",
+                "path": str(path.relative_to(Path(root).resolve())),
+                "sha256": "f" * 64,
+                "bytes": path.stat().st_size,
+                "decision_id": "self-test-provider",
+                "authority": "provider-signed-user-message",
+                "adapter_path": "/self-test/provider-verifier",
+                "adapter_sha256": "e" * 64,
+            }
+
+        def provider_reverify(root, config, task, *, record=None, **kwargs):
+            try:
+                if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+                    return False
+                return record == provider_verify(
+                    root, config, task, receipt=record["path"], **kwargs
+                )
+            except (OSError, ValueError, TypeError, SystemExit, json.JSONDecodeError):
+                return False
+
+        humandecision.verify = provider_verify
+        humandecision.reverify = provider_reverify
+    '''), encoding="utf-8")
+    scripts = root / ".agent/scripts"
+    inherited = os.environ.get("PYTHONPATH")
+    paths = [str(patch_dir), str(scripts)]
+    if inherited:
+        paths.append(inherited)
+    os.environ["PYTHONPATH"] = os.pathsep.join(paths)
+    return str(receipt.relative_to(root))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="budget-context-gates-") as raw:
         root = Path(raw)
         fixture(root)
         runner = ".agent/scripts/testrun.py"
+        # Ignored authoritative dependencies cannot trigger a writable-root fallback.
+        (root / "node_modules").mkdir()
+        refused=run(root,sys.executable,runner,"--receipt","dependency.json","--case","dependency",
+                    "--timeout","2","--","npm","test",expected=1)
+        if "absent from the private candidate" not in refused.stdout:
+            raise AssertionError(f"private dependency refusal failed for the wrong reason:\n{refused.stdout}")
+        if json.loads((root/".agent/state/test-budget.json").read_text())["candidates"]:
+            raise AssertionError("dependency compatibility refusal consumed a test reservation")
+        (root / "node_modules").rmdir()
         # A caller cannot replace the 15-minute standard cap with a larger timeout.
         run(root, sys.executable, runner, "--receipt", "oversized.json", "--case", "oversized",
             "--timeout", "901", "--", sys.executable, "-c", "pass", expected=1)
@@ -168,8 +226,8 @@ def main() -> int:
         if "failed candidate test attempt is sealed" not in sealed.stdout:
             raise AssertionError("failed attempt accepted another Case ID")
 
-        # Dead runner reservations charge their full amount and cannot remain a
-        # permanent lock or reopen elapsed budget after a crash.
+        # Dead or PID-reused runner reservations charge their full amount and cannot
+        # remain a permanent lock or reopen elapsed budget after a crash.
         (root / "source.txt").write_text("candidate crash\n", encoding="utf-8")
         crash_candidate = candidate(root)
         state = json.loads((root / ".agent/state/test-budget.json").read_text())
@@ -178,7 +236,7 @@ def main() -> int:
             "max_automatic_test_attempts": 1, "consumed_seconds": 0,
             "infrastructure_failures": 0, "attempts": {},
             "active_reservations": [{
-                "id": "dead", "pid": 99999999, "run_id": "c" * 32,
+                "id": "dead", "pid": os.getpid(), "start_identity": "reused-pid-start-object", "run_id": "c" * 32,
                 "case": "dead", "reserved_seconds": 899,
                 "started_at": "2026-01-01T00:00:00+00:00",
             }], "latest_receipt": None,
@@ -205,31 +263,19 @@ def main() -> int:
         fake_runner = root / ".agent/fixtures/fake-pipe-runner.py"
         fake_runner.parent.mkdir(parents=True, exist_ok=True)
         fake_runner.write_text(textwrap.dedent(f"""
-            import os, subprocess, sys
+            import io, os, subprocess, sys
             os.chdir({str(root)!r})
             sys.path.insert(0, '.agent/scripts')
             import testrun
 
-            class Pipe:
-                closed = False
-                def close(self):
-                    self.closed = True
-
             class Process:
                 pid = 777777
                 returncode = None
-                stdout = Pipe()
-                def communicate(self, timeout=None):
-                    if timeout is None:
-                        raise AssertionError('unbounded communicate/read attempted')
-                    raise subprocess.TimeoutExpired(['fixture'], timeout, output=b'partial-output\\n')
-                def poll(self):
-                    return self.returncode
-                def wait(self, timeout=None):
-                    raise subprocess.TimeoutExpired(['fixture'], timeout)
+                stdout = io.BytesIO(b'partial-output\\n')
 
-            testrun.subprocess.Popen = lambda *args, **kwargs: Process()
-            testrun.terminate_group = lambda process: True
+            testrun.launch_supervised_process = lambda *args, **kwargs: Process()
+            testrun.process_snapshot = lambda: {{777777: (1, 777777, 'fixture-start', 'R')}}
+            testrun.terminate_process_tree = lambda process, known, **_kwargs: (False, True)
             sys.argv = [
                 'testrun.py', '--receipt', 'infra.json', '--run-id', {'e' * 32!r},
                 '--case', 'pipe-cleanup', '--timeout', '1', '--', sys.executable, '-c', 'pass',
@@ -369,34 +415,49 @@ def main() -> int:
         if "usage_freshness" not in json.loads(context_path.read_text()):
             raise AssertionError("legacy usage capsule was not upgraded by sync")
 
-        # Repair approval routes through the task decision policy: provider
-        # routes still demand a signed receipt, while the default (no adapter)
-        # v2 local boundary accepts a bound local user-message approval.
+        # Repair approval is provider-authoritative under every decision policy.
+        # Missing receipts and current-chat labels must fail without mutation;
+        # the positive path uses an explicit subprocess-only provider fixture.
+        task = json.loads(task_path.read_text())
+        task["decision_policy_version"] = 1
+        write(task_path, task)
         context_path.write_text("corrupt", encoding="utf-8")
         run(root, sys.executable, contextctl, "repair", "--reset",
             "--reason", "corrupt", "--summary", "reconstructed", "--source-tokens", "1000", expected=1)
         run(root, sys.executable, contextctl, "check", "--quiet", expected=1)
-        task = json.loads(task_path.read_text())
-        task["decision_policy_version"] = 1
-        write(task_path, task)
+        before_missing_receipt = context_path.read_bytes()
         denied = run(root, sys.executable, contextctl, "approve-repair",
             "--source", "user:forged", expected=1)
-        if "provider-signed human decision receipt" not in denied.stdout:
-            raise AssertionError("provider-routed repair approval did not demand a receipt")
-        repaired = json.loads(context_path.read_text())
-        if repaired["integrity"]["status"] != "needs_review":
-            raise AssertionError("unverified repair approval mutated context")
+        if (
+            "provider-signed human decision receipt" not in denied.stdout
+            or context_path.read_bytes() != before_missing_receipt
+        ):
+            raise AssertionError("provider-routed repair approval did not fail immutably without a receipt")
         task["decision_policy_version"] = 2
         write(task_path, task)
-        run(root, sys.executable, contextctl, "approve-repair", "--source", "user:fixture-review")
+        before_local_advisory = context_path.read_bytes()
+        denied = run(root, sys.executable, contextctl, "approve-repair",
+            "--source", "user:fixture-review", expected=1)
+        if (
+            "local user-message evidence is advisory only" not in denied.stdout
+            or context_path.read_bytes() != before_local_advisory
+        ):
+            raise AssertionError("local repair advisory crossed the authoritative gate or mutated context")
+        task["decision_policy_version"] = 1
+        write(task_path, task)
+        provider_receipt = install_test_provider_verifier(root)
+        run(root, sys.executable, contextctl, "approve-repair",
+            "--source", "user:fixture-review",
+            "--human-decision-receipt", provider_receipt)
         repaired = json.loads(context_path.read_text())
         approval = repaired["integrity"].get("repair_approval", {})
         if (
             repaired["integrity"]["status"] != "verified"
-            or approval.get("assurance") != "explicit-user-message;local-only;not-provider-verified"
-            or not re.fullmatch(r"[0-9a-f]{64}", str(approval.get("routing_profile_sha256", "")))
+            or approval.get("authority") != "provider-signed-user-message"
+            or approval.get("adapter_path") != "/self-test/provider-verifier"
+            or approval.get("adapter_sha256") != "e" * 64
         ):
-            raise AssertionError("local repair approval was not recorded with its routing profile")
+            raise AssertionError("provider-verified repair approval was not recorded with adapter provenance")
         run(root, sys.executable, contextctl, "check", "--quiet")
         run(root, sys.executable, contextctl, "account-turn", "--turn-id", "reviewed-repair-turn")
         reviewed_turn = json.loads(context_path.read_text())
@@ -465,7 +526,7 @@ def main() -> int:
                 observed['timeout'] = kwargs.get('timeout')
                 return Failed()
 
-            subprocess.run = recording_run
+            contexttx.boundedprocess.run = recording_run
             after = copy.deepcopy(before)
             after['next_action'] = 'timeout kwarg probe'
             try:
@@ -482,7 +543,7 @@ def main() -> int:
             def hanging_run(command, **kwargs):
                 raise subprocess.TimeoutExpired(command, kwargs.get('timeout'))
 
-            subprocess.run = hanging_run
+            contexttx.boundedprocess.run = hanging_run
             after = copy.deepcopy(before)
             after['next_action'] = 'hang probe'
             try:
@@ -524,7 +585,9 @@ def main() -> int:
         rebuilt = json.loads(context_path.read_text())
         if "host_compaction" in rebuilt:
             raise AssertionError("repair --reset resurrected the awaiting host compaction state")
-        run(root, sys.executable, contextctl, "approve-repair", "--source", "user:unstick")
+        run(root, sys.executable, contextctl, "approve-repair",
+            "--source", "user:unstick",
+            "--human-decision-receipt", provider_receipt)
         run(root, sys.executable, contextctl, "check", "--quiet")
 
         # abort-host-compaction clears the wait under the same approval
@@ -533,8 +596,17 @@ def main() -> int:
         stuck = json.loads(context_path.read_text())
         denied = run(root, sys.executable, contextctl, "abort-host-compaction",
             "--source", "agent:not-a-user", expected=1)
+        before_local_abort = context_path.read_bytes()
+        denied = run(root, sys.executable, contextctl, "abort-host-compaction",
+            "--source", "user:abort-the-wait", expected=1)
+        if (
+            "provider-signed human decision receipt" not in denied.stdout
+            or context_path.read_bytes() != before_local_abort
+        ):
+            raise AssertionError("local abort advisory crossed the authoritative gate or mutated context")
         aborted = run(root, sys.executable, contextctl, "abort-host-compaction",
-            "--source", "user:abort-the-wait")
+            "--source", "user:abort-the-wait",
+            "--human-decision-receipt", provider_receipt)
         if "HOST COMPACTION ABORTED" not in aborted.stdout:
             raise AssertionError("abort-host-compaction did not clear the awaiting state")
         capsule = json.loads(context_path.read_text())
@@ -552,7 +624,7 @@ def main() -> int:
         original_abort = capsule["compaction"]["host_compaction_abort"]
         forged_abort = {
             **original_abort,
-            "approval": {**original_abort["approval"], "routing_profile_sha256": "0" * 64},
+            "approval": {**original_abort["approval"], "adapter_sha256": "0" * 64},
         }
         rewrite_context(root, f"v['compaction']['host_compaction_abort']={json.dumps(forged_abort)};")
         denied = run(root, sys.executable, contextctl, "check", expected=1)
@@ -696,49 +768,59 @@ def main() -> int:
             artifact = 'a' * 64
             approval = humandecision.local_approval('user:fixture', artifact, release_task)
             assert approval['routing_profile_sha256'] == humandecision.routing_profile_sha256(release_task)
-            assert humandecision.local_approval_valid(
+            # Local/current-chat evidence can still be validated as advisory
+            # metadata, but it is never authoritative gate approval.
+            assert humandecision.local_advisory_valid(
+                release_task, approval, source='user:fixture', artifact_sha256=artifact)
+            assert not humandecision.local_approval_valid(
                 release_task, approval, source='user:fixture', artifact_sha256=artifact)
             observer = dict(humandecision.POLICY)
             tightened = {'agent_control': {'human_decision_observer': observer}}
-            assert not humandecision.local_approval_valid(
+            assert not humandecision.local_advisory_valid(
                 release_task, approval, source='user:fixture', artifact_sha256=artifact, config=tightened)
             permissive = {'agent_control': {'human_decision_observer': {
                 **humandecision.POLICY, 'allow_current_chat_local_release': True}}}
-            assert humandecision.local_approval_valid(
+            assert not humandecision.local_advisory_valid(
+                release_task, approval, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert not humandecision.local_approval_valid(
                 release_task, approval, source='user:fixture', artifact_sha256=artifact, config=permissive)
             legacy = {key: approval[key] for key in ('source', 'artifact_sha256', 'assurance')}
-            assert humandecision.local_approval_valid(
-                release_task, legacy, source='user:fixture', artifact_sha256=artifact, config=permissive)
-            forged = dict(approval, routing_profile_sha256='b' * 64)
+            assert humandecision.local_advisory_valid(
+                release_task, legacy, source='user:fixture', artifact_sha256=artifact)
             assert not humandecision.local_approval_valid(
-                release_task, forged, source='user:fixture', artifact_sha256=artifact, config=permissive)
+                release_task, legacy, source='user:fixture', artifact_sha256=artifact)
+            forged = dict(approval, routing_profile_sha256='b' * 64)
+            assert not humandecision.local_advisory_valid(
+                release_task, forged, source='user:fixture', artifact_sha256=artifact)
 
-            # Release acceptance approvals under the local boundary carry the
-            # transcript/debt commitment pair: the current 6-key shape (bound
-            # routing profile) and the legacy 5-key shape both validate, the
-            # digests are shape-checked, and partial or unknown keys fail.
+            # Release advisory records retain transcript/debt shape coverage,
+            # while every shape remains non-authoritative.
             release_pair = {
                 'platform_transcript_verified_sha256': 'c' * 64,
                 'supervision_debt_waiver_sha256': 'd' * 64,
             }
             current_release = {**approval, **release_pair}
-            assert humandecision.local_approval_valid(
-                release_task, current_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert humandecision.local_advisory_valid(
+                release_task, current_release, source='user:fixture', artifact_sha256=artifact)
+            assert not humandecision.local_approval_valid(
+                release_task, current_release, source='user:fixture', artifact_sha256=artifact)
             legacy_release = {key: current_release[key] for key in (
                 'source', 'artifact_sha256', 'assurance',
                 'platform_transcript_verified_sha256', 'supervision_debt_waiver_sha256')}
-            assert humandecision.local_approval_valid(
-                release_task, legacy_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert humandecision.local_advisory_valid(
+                release_task, legacy_release, source='user:fixture', artifact_sha256=artifact)
+            assert not humandecision.local_approval_valid(
+                release_task, legacy_release, source='user:fixture', artifact_sha256=artifact)
             partial_release = {key: current_release[key] for key in (
                 'source', 'artifact_sha256', 'assurance', 'platform_transcript_verified_sha256')}
-            assert not humandecision.local_approval_valid(
-                release_task, partial_release, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert not humandecision.local_advisory_valid(
+                release_task, partial_release, source='user:fixture', artifact_sha256=artifact)
             bad_release_digest = dict(current_release, supervision_debt_waiver_sha256='not-a-digest')
-            assert not humandecision.local_approval_valid(
-                release_task, bad_release_digest, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert not humandecision.local_advisory_valid(
+                release_task, bad_release_digest, source='user:fixture', artifact_sha256=artifact)
             unknown_key = dict(current_release, unexpected='x')
-            assert not humandecision.local_approval_valid(
-                release_task, unknown_key, source='user:fixture', artifact_sha256=artifact, config=permissive)
+            assert not humandecision.local_advisory_valid(
+                release_task, unknown_key, source='user:fixture', artifact_sha256=artifact)
 
             assert humandecision.try_adapter_path(None, None) is None
             assert humandecision.try_adapter_path(None, '  ') is None
@@ -1022,9 +1104,36 @@ def main() -> int:
             raise AssertionError(f"capsule validation did not fail closed on the budget invariant:\n{denied.stdout}")
         write(config_path, fixture_config)
         run(root, sys.executable, contextctl, "check", "--quiet")
-    print("PASS: atomic and sealed test budget, bounded pipe cleanup, provider-gated infrastructure remediation, context freshness, bundle migration, host-compaction abort revalidation and journal restore guards, bounded transition timeout, token-ledger calibration")
+
+        # Private context locks and authorization roots reject symlinks before external mutation.
+        def invoke_context(statement):
+            code=("import copy,json,os,runpy,sys; os.chdir("+repr(str(root))+ "); "
+                  "sys.path.insert(0,'.agent/scripts'); module=runpy.run_path('.agent/scripts/contexttx.py'); "+statement)
+            return subprocess.run([sys.executable,"-c",code],cwd=root,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+
+        external_lock=root/"external-task-lock"; external_lock.write_text("unchanged\n",encoding="utf-8")
+        task_lock=root/".agent/state/.task.lock"
+        if task_lock.exists() or task_lock.is_symlink(): task_lock.unlink()
+        task_lock.symlink_to(external_lock)
+        locked=invoke_context("before=json.loads(module['TASK_PATH'].read_text()); after=copy.deepcopy(before); after['title']=str(before.get('title','task'))+'-changed'; module['transition_task'](before,after,mutator='fixture',operation='fixture',reason='fixture',summary='fixture')")
+        if locked.returncode==0 or "lock is missing or unsafe" not in locked.stdout or external_lock.read_text(encoding="utf-8")!="unchanged\n":
+            raise AssertionError(f"task transition lock followed an unsafe symlink:\n{locked.stdout}")
+        task_lock.unlink(); external_lock.unlink()
+
+        outside_auth=root/"outside-auth"; outside_auth.mkdir(); authorization=root/".agent/state/.context-authorizations"
+        if authorization.exists(): shutil.rmtree(authorization)
+        authorization.symlink_to(outside_auth,target_is_directory=True)
+        denied_auth=invoke_context("before=json.loads(module['TASK_PATH'].read_text()); after=copy.deepcopy(before); after['title']=str(before.get('title','task'))+'-changed'; module['_authorization'](before,after,'fixture','fixture','fixture')")
+        if denied_auth.returncode==0 or "directory is unsafe" not in denied_auth.stdout or list(outside_auth.iterdir()):
+            raise AssertionError(f"context authorization wrote through a symlinked root:\n{denied_auth.stdout}")
+        authorization.unlink(); outside_auth.rmdir()
+    trust=run(SOURCE.parents[1],sys.executable,str(SOURCE/"self_test_runner_trust.py"))
+    if "PASS: descriptor-bound snapshot" not in trust.stdout:
+        raise AssertionError(f"runner trust regression did not complete:\n{trust.stdout}")
+    print("PASS: atomic and sealed test budget, exact private candidate trust, bounded pipe cleanup, provider-gated infrastructure remediation, context freshness, bundle migration, host-compaction abort revalidation and journal restore guards, bounded transition timeout, token-ledger calibration")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

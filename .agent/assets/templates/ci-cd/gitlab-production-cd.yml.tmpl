@@ -1,0 +1,73 @@
+stages: [production-promotion]
+variables:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
+agent-production-promotion:
+  stage: production-promotion
+  image: {{gitlab_image}}
+{{gitlab_protected_tags}}  before_script:
+    - 'python3 -c "import sys; raise SystemExit(0 if sys.platform == \"{{gitlab_sys_platform}}\" else 1)"'
+    - 'python3 .agent/scripts/blueprintctl.py check --require-confirmed --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - |
+      python3 - <<'PY'
+      import os
+      import stat
+      path="agent-production-deployment-receipt.json"
+      try:
+          metadata=os.lstat(path)
+      except FileNotFoundError:
+          pass
+      else:
+          if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+              raise SystemExit("unsafe preexisting production receipt path")
+          os.unlink(path)
+      PY
+  environment:
+    name: production
+  resource_group: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+  script:
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_ci_artifact_provenance_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_provider_preflight_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_artifact_and_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{verify_production_decision_packet_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - |
+      deploy_status=1
+      verify_status=125
+      publish_status=125
+      receipt_status=125
+      rollback_status=125
+      if python3 .agent/scripts/blueprintctl.py run-command --id {{deploy_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then
+        deploy_status=0
+        if python3 .agent/scripts/blueprintctl.py run-command --id {{verify_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then verify_status=0; else verify_status=$?; fi
+      else
+        deploy_status=$?
+      fi
+      if [ "$deploy_status" -ne 0 ] || [ "$verify_status" -ne 0 ]; then
+        if python3 .agent/scripts/blueprintctl.py run-command --id {{rollback_production_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then rollback_status=0; else rollback_status=$?; fi
+      fi
+      if [ "$deploy_status" -eq 0 ] && [ "$verify_status" -eq 0 ]; then
+        receipt_disposition=promoted
+        receipt_conclusion=success
+      elif [ "$rollback_status" -eq 0 ]; then
+        receipt_disposition=rolled-back
+        receipt_conclusion=failure
+      else
+        receipt_disposition=failed
+        receipt_conclusion=failure
+      fi
+      export AGENT_PRODUCTION_DEPLOY_STATUS="$deploy_status" AGENT_PRODUCTION_VERIFY_STATUS="$verify_status" AGENT_PRODUCTION_ROLLBACK_STATUS="$rollback_status"
+      export RECEIPT_DISPOSITION="$receipt_disposition" RECEIPT_CONCLUSION="$receipt_conclusion" RECEIPT_PATH="$CI_PROJECT_DIR/agent-production-deployment-receipt.json"
+      if python3 .agent/scripts/blueprintctl.py run-command --id {{publish_promotion_receipt_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then publish_status=0; else publish_status=$?; fi
+      if [ "$publish_status" -eq 0 ]; then
+        if python3 .agent/scripts/blueprintctl.py run-command --id {{verify_promotion_receipt_authenticity_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"; then receipt_status=0; else receipt_status=$?; fi
+      fi
+      export AGENT_PRODUCTION_PUBLISH_STATUS="$publish_status" AGENT_PRODUCTION_RECEIPT_STATUS="$receipt_status"
+      if [ "$receipt_disposition" = promoted ] && [ "$publish_status" -eq 0 ] && [ "$receipt_status" -eq 0 ]; then exit 0; fi
+      printf '%s\n' "production promotion failed closed with authenticated outcome: deploy=$deploy_status verify=$verify_status publish=$publish_status receipt=$receipt_status rollback=$rollback_status disposition=$receipt_disposition" >&2
+      exit 1
+  artifacts:
+    when: always
+    paths: ["agent-production-deployment-receipt.json"]

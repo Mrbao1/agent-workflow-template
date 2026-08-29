@@ -91,6 +91,18 @@ def main() -> int:
             },
         }
         write_json(root / "plan.json", plan)
+        blueprint_design={
+            "goals":["Exercise the exact user-required application"],"architecture":[],"technology_choices":[],
+            "capabilities":[],"constraints":[],"acceptance":[{"id":"exact-runtime","criterion":"Run the exact application service"}],
+            "commands":[{"id":"run-acceptance","argv":["python3","tests/e2e.js"],"stage":"acceptance","timeout_seconds":30,"covers":["exact-runtime"],"environment":["PATH"]}],
+            "providers":[],"application_services":["app"],
+        }
+        blueprint_sha256=hashlib.sha256(json.dumps(blueprint_design,sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+        (root/".agent/project").mkdir()
+        write_json(root/".agent/project/BLUEPRINT.json",{
+            "schema":"agent-project-blueprint/v1","status":"confirmed","design":blueprint_design,"suggestions":[],
+            "confirmation":{"source":"user:fixture","design_sha256":blueprint_sha256,"confirmed_at":"2026-07-17T00:00:00Z","decision_receipt":{}},
+        })
 
         common = {
             "tested_fingerprint": tested, "environment": "fixture", "precondition": "clean",
@@ -109,12 +121,13 @@ def main() -> int:
         for suffix in ("A",):
             runtime_id = f"acceptance_fixture_{suffix.lower()}"
             write_json(root / f"runtime-{suffix.lower()}.json", {
-                "schema": "run_acceptance_runtime/v1", "tool": "run_acceptance_runtime",
+                "schema": "run_acceptance_runtime/v2", "tool": "run_acceptance_runtime",
                 "tool_sha256": digest(VALIDATOR.with_name("run_acceptance_runtime.py")),
-                "candidate_sha256": candidate_sha256,
+                "candidate_sha256": candidate_sha256, "blueprint_sha256": blueprint_sha256,
                 "project": runtime_id, "status": "passed", "source": {"sha256": "fixture", "files": runtime_source},
                 "source_after": {"sha256": "fixture"},
-                "containers": [{"status": "running", "health": "healthy", "image": image_digest}],
+                "loaded_image_id": image_digest, "application_services": ["app"], "candidate_services": ["app"],
+                "containers": [{"service": "app", "status": "running", "health": "healthy", "image": image_digest}],
                 "docker": "fixture", "compose": "fixture",
                 "resolved_compose": {"sha256": "d" * 64, "line_count": 1, "tail": ["fixture"]},
                 "build": {"sha256": "d" * 64, "line_count": 1, "tail": ["fixture"]},
@@ -123,11 +136,12 @@ def main() -> int:
                 "client": {
                     "command": ["fixture-client", "tests/e2e.js", suffix], "exit_code": 0,
                     "output": {"sha256": "b" * 64},
-                    "process_cleanup": {"remaining": 0},
+                    "process_cleanup": {"remaining": 0}, "output_limit_exceeded": False,
                     "receipt": {"schema": "acceptance-client/v1", "passed": True, "fresh_state_token": f"fresh-{suffix}", "state_reset": {"performed": True, "residual": 0}, "case_ids": ["CASE-A", "CASE-B"], "assertions": [{"case_id": "CASE-A", "name": "boundary persists", "passed": True}, {"case_id": "CASE-B", "name": "happy path persists", "passed": True}]},
                 },
                 "logs": {"sha256": "d" * 64, "line_count": 1, "tail": ["fixture"]},
-                "cleanup_command": {"sha256": "c" * 64, "line_count": 1, "tail": ["fixture"]}, "cleanup": {"containers": 0, "networks": 0},
+                "namespace_preflight":{"containers":0,"networks":0,"volumes":0,"images":0},
+                "cleanup_command": {"sha256": "c" * 64, "line_count": 1, "tail": ["fixture"]}, "cleanup": {"containers": 0, "networks": 0, "volumes": 0, "images": 0},
             })
             write_json(root / f"run-{suffix.lower()}.json", {
                 "run_id": f"RUN-{suffix}", "tested_fingerprint": tested, "candidate_sha256": candidate_sha256, "fresh_state": True, "fresh_state_token": f"fresh-{suffix}",
@@ -255,8 +269,14 @@ Fixture only.
         value = copy.deepcopy(runtime_original); value["client"]["receipt"]["assertions"][0]["name"] = "   "; runtime_attacks.append(("receipt-whitespace-assertion", value))
         value = copy.deepcopy(runtime_original); value["client"]["receipt"]["case_ids"].append(value["client"]["receipt"]["case_ids"][0]); runtime_attacks.append(("duplicate-client-case-id", value))
         value = copy.deepcopy(runtime_original); value["client"]["process_cleanup"] = {"remaining": 1}; runtime_attacks.append(("client-process-residual", value))
+        value = copy.deepcopy(runtime_original); value["client"]["output_limit_exceeded"] = True; runtime_attacks.append(("client-output-truncated", value))
         value = copy.deepcopy(runtime_original); value["client"]["command"] = ["fixture-client"]; runtime_attacks.append(("client-without-fingerprinted-test", value))
         value = copy.deepcopy(runtime_original); value["containers"] = [1]; runtime_attacks.append(("non-object-container", value))
+        value = copy.deepcopy(runtime_original); value["loaded_image_id"] = "sha256:"+"b"*64; runtime_attacks.append(("loaded-image-substitution", value))
+        value = copy.deepcopy(runtime_original); value["blueprint_sha256"] = "e"*64; runtime_attacks.append(("blueprint-authority-substitution", value))
+        value = copy.deepcopy(runtime_original); value["candidate_services"] = []; runtime_attacks.append(("missing-candidate-service", value))
+        value = copy.deepcopy(runtime_original); value["application_services"] = ["dummy"]; runtime_attacks.append(("governed-service-substitution", value))
+        value = copy.deepcopy(runtime_original); value["containers"][0]["image"] = "sha256:"+"b"*64; runtime_attacks.append(("prebuilt-service-substitution", value))
         value = copy.deepcopy(runtime_original); value["health"] = {}; runtime_attacks.append(("missing-runtime-health", value))
         value = copy.deepcopy(runtime_original); value["source_after"]["sha256"] = "different"; runtime_attacks.append(("runtime-source-changed", value))
         value = copy.deepcopy(runtime_original); value["candidate_sha256"] = "e" * 64; runtime_attacks.append(("stale-runtime-candidate", value))
@@ -279,4 +299,6 @@ Fixture only.
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

@@ -1,7 +1,7 @@
 {
   "schema": "agent-team/v9",
   "platform_limit": 4,
-  "default_model": "gpt-5.6-sol",
+  "default_model": null,
   "allow_model_fallback": false,
   "context_strategy": "long-window-capsule",
   "max_fork_turns": 10,
@@ -40,21 +40,19 @@
     "human_verification_required": true,
     "signed_adapter": null
   },
-  "epoch": "14d2bea3b4413dd1c707001c737ce66ea8123f83e9d228a83b39c40f6868179a",
+  "epoch": "1cb7067a5c59c3feece0ddad1d340ec2d9343ed5e7820816a1b97dcb7b9175c4",
   "members": [],
   "prepared_dispatches": [],
   "capacity_failures": [],
   "replay_runs": [],
   "token_accounting": {
     "schema": "agent-child-token-accounting/v1",
-    "token_budget": 96000,
+    "token_budget": 48000,
     "settled_tokens": 0
   },
   "task_payload_schema": "agent-task-payload/v2",
   "last_platform_snapshot": null,
   "platform_empty_verified": false,
   "migration_source": null,
-  "updated_at": "2026-08-24T08:27:10+00:00",
-  "revision": 3,
-  "prev_sha256": "74fd2a685dc0ee6f79bf25e17f6b457c6c60b86059b2236a49ee2ef33e08a721"
+  "updated_at": "2026-07-22T02:17:20+00:00"
 }

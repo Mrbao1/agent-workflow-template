@@ -1,10 +1,9 @@
 {
   "schema": "agent-runtime/v2",
   "baseline": {
-    "source": "agentctl:start",
-    "captured_at": "2026-08-24T08:27:10+00:00",
-    "project_processes": [],
-    "confirmed_existing_processes": 0
+    "source": "template-uninitialized",
+    "captured_at": null,
+    "project_processes": []
   },
   "processes": [],
   "docker_projects": [],

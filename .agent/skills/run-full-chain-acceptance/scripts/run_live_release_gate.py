@@ -6,8 +6,8 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import re
-import subprocess
 import sys
 from typing import Dict, List, Tuple
 
@@ -38,25 +38,19 @@ def digest(data: bytes) -> str:
 
 
 def load(path: Path, label: str) -> Dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    try: value=json.loads(common.bounded_file_bytes(path,label).decode("utf-8"))
+    except (OSError,UnicodeDecodeError,ValueError,json.JSONDecodeError) as error:
         raise SystemExit(f"invalid {label}: {error}")
-    if not isinstance(value, dict):
-        raise SystemExit(f"{label} must be an object")
+    if not isinstance(value,dict): raise SystemExit(f"{label} must be an object")
     return value
 
 
 def file_record(path: Path, label: str) -> Dict[str, object]:
-    resolved = path.resolve()
-    try:
-        relative = str(resolved.relative_to(ROOT))
-    except ValueError:
-        raise SystemExit(f"{label} escapes project")
-    if not resolved.is_file() or resolved.is_symlink():
-        raise SystemExit(f"{label} is missing or unsafe")
-    data = resolved.read_bytes()
-    return {"path": relative, "sha256": digest(data), "bytes": len(data)}
+    lexical=Path(os.path.abspath(str(path)))
+    try: relative=lexical.relative_to(ROOT)
+    except ValueError: raise SystemExit(f"{label} escapes project")
+    _path,record=common.project_file(relative.as_posix(),label)
+    return record
 
 
 def runner_contract(path: Path) -> Tuple[Dict[str, object], List[Tuple[str, List[str], int]], str]:
@@ -89,13 +83,12 @@ def runner_contract(path: Path) -> Tuple[Dict[str, object], List[Tuple[str, List
 def report_integrator(report: Path, candidate_sha256: str) -> Tuple[Dict[str, object], str]:
     report_record = file_record(report, "acceptance report")
     validator = Path(__file__).with_name("validate_acceptance_report.py").resolve()
-    result = subprocess.run(
-        [sys.executable, str(validator), str(report), "--draft"], cwd=ROOT,
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
-    )
-    if result.returncode or file_record(report, "acceptance report") != report_record:
-        raise SystemExit("acceptance report is invalid or changed during read-only validation:\n" + result.stdout)
-    text = report.read_text(encoding="utf-8")
+    result=common.execute([sys.executable,str(validator),str(report),"--draft"],120,"report-validator",{
+        "environment":"local","authority":"default","capabilities":["report-validation"],
+    })
+    if result["exit_code"] or file_record(report,"acceptance report")!=report_record:
+        raise SystemExit("acceptance report is invalid or changed during read-only validation:\n"+str(result["captured_output"]))
+    text=common.bounded_file_bytes(report,"acceptance report").decode("utf-8")
     reruns = list(RERUN_RE.finditer(text))
     if len(reruns) != 1:
         raise SystemExit("acceptance report must bind exactly one integrator rerun")
@@ -281,4 +274,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

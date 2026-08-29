@@ -100,6 +100,8 @@ def fixture(root: Path) -> None:
     shutil.copy2(SOURCE_AGENT / "scripts/contextctl.py", root / ".agent/scripts/contextctl.py")
     shutil.copy2(SOURCE_AGENT / "scripts/contexttx.py", root / ".agent/scripts/contexttx.py")
     shutil.copy2(SOURCE_AGENT / "scripts/humandecision.py", root / ".agent/scripts/humandecision.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/process_observation.py", root / ".agent/scripts/process_observation.py")
+    shutil.copy2(SOURCE_AGENT / "scripts/testrun.py",root/".agent/scripts/testrun.py")
     shutil.copytree(SOURCE_AGENT / "scripts/workflowlib", root / ".agent/scripts/workflowlib")
     shutil.copy2(SOURCE_AGENT / "INDEX.md", root / ".agent/INDEX.md")
     shutil.copytree(SOURCE_AGENT / "workflows", root / ".agent/workflows")
@@ -113,15 +115,26 @@ def fixture(root: Path) -> None:
         encoding="utf-8",
     )
     host_adapter.chmod(0o755)
+    Path(str(host_adapter)+".agent-workflow-adapter.json").write_text(json.dumps({
+        "schema":"agent-provider-adapter/v1","purpose":"provider-verifiable-agent-control",
+        "executable_sha256":hashlib.sha256(host_adapter.read_bytes()).hexdigest(),"operations":["verify-host-compaction"],
+    },sort_keys=True)+"\n",encoding="utf-8")
     site_dir = root / "test-site"
     site_dir.mkdir()
     (site_dir / "sitecustomize.py").write_text(
         "import os,sys\nfrom pathlib import Path\n"
         "sys.path.insert(0,str(Path.cwd()/'.agent/scripts'))\n"
-        "import humandecision\n_original=humandecision.adapter_path\n"
-        "def _fixture(root,raw):\n"
-        " return Path(raw).resolve() if raw==os.environ.get('AGENT_TEST_HOST_ADAPTER') else _original(root,raw)\n"
-        "humandecision.adapter_path=_fixture\n",
+        "import humandecision\n_original=humandecision.adapter_path\n_original_chain=humandecision.protected_path_chain\n"
+        "def _fixture(root,raw,required_operations=('health','verify')):\n"
+        " if raw==os.environ.get('AGENT_TEST_HOST_ADAPTER'):\n"
+        "  assert tuple(required_operations)==('verify-host-compaction',)\n"
+        "  return Path(raw).resolve()\n"
+        " return _original(root,raw,required_operations=required_operations)\n"
+        "def _chain(path):\n"
+        " adapter=Path(os.environ['AGENT_TEST_HOST_ADAPTER']).resolve(); metadata=Path(str(adapter)+'.agent-workflow-adapter.json').resolve()\n"
+        " return True if Path(path).resolve() in {adapter,metadata} else _original_chain(path)\n"
+        "humandecision.adapter_path=_fixture\n"
+        "humandecision.protected_path_chain=_chain\n",
         encoding="utf-8",
     )
     os.environ["AGENT_TEST_HOST_ADAPTER"] = str(host_adapter.resolve())
@@ -633,7 +646,8 @@ def main() -> int:
             "--host-compaction-receipt", receipt.name,
         )
         adapter_path.write_bytes(adapter_bytes); adapter_path.chmod(0o755)
-        if rejected_compaction.returncode == 0 or "adapter rejected" not in rejected_compaction.stdout:
+        if (rejected_compaction.returncode == 0
+                or not any(marker in rejected_compaction.stdout for marker in ("adapter rejected","metadata does not bind"))):
             print("FAIL: forged host compaction adapter output was accepted")
             print(rejected_compaction.stdout)
             return 1
@@ -725,4 +739,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

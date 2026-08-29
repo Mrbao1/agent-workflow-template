@@ -10,9 +10,11 @@ import os
 import platform
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 
@@ -27,9 +29,11 @@ ROOT = find_root()
 AGENT = ROOT / ".agent"
 sys.path.insert(0, str(AGENT / "scripts"))
 import testrun as supervised_test
+from workflowlib import boundedio
 import ios_simulator_gate
 
 RUN_ID = re.compile(r"[0-9a-f]{32}")
+TEST_EXECUTION_BOUNDARY = supervised_test.TEST_EXECUTION_BOUNDARY
 PROFILE_KEYS = {"environment", "authority", "capabilities"}
 ADAPTER_IDS = {
     "workflow": "acceptance-workflow",
@@ -78,15 +82,28 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+MAX_PROJECT_FILE_BYTES = 16 * 1024 * 1024
+
+
+def bounded_file_bytes(path: Path,label: str,limit: int=MAX_PROJECT_FILE_BYTES) -> bytes:
+    try: return boundedio.read_bytes(path,maximum=limit,label=label)
+    except RuntimeError as error: raise ValueError(str(error)) from error
+
+
 def project_file(raw: str, label: str) -> Tuple[Path, Dict[str, object]]:
-    path = (ROOT / raw).resolve()
+    path=Path(os.path.abspath(str(ROOT/raw)))
+    try: relative_path=path.relative_to(ROOT)
+    except ValueError: raise SystemExit(f"{label} escapes project")
+    current=ROOT
     try:
-        relative = str(path.relative_to(ROOT))
-    except ValueError:
-        raise SystemExit(f"{label} escapes project")
-    if not path.is_file() or path.is_symlink():
-        raise SystemExit(f"{label} is missing")
-    data = path.read_bytes()
+        for part in relative_path.parts:
+            current=current/part
+            if stat.S_ISLNK(os.lstat(current).st_mode): raise SystemExit(f"{label} has a symlink component")
+    except FileNotFoundError: raise SystemExit(f"{label} is missing")
+    relative=str(relative_path)
+    if not path.is_file(): raise SystemExit(f"{label} is missing")
+    try: data=bounded_file_bytes(path,label)
+    except (OSError,ValueError) as error: raise SystemExit(str(error))
     return path, {"path": relative, "sha256": digest(data), "bytes": len(data)}
 
 
@@ -100,9 +117,8 @@ def receipt_path(record: object, label: str) -> Path:
 
 
 def load_json(path: Path, label: str) -> Dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+    try: value=json.loads(bounded_file_bytes(path,label).decode("utf-8"))
+    except (OSError,UnicodeDecodeError,ValueError) as error:
         raise SystemExit(f"invalid {label}: {error}")
     if not isinstance(value, dict):
         raise SystemExit(f"{label} must be an object")
@@ -169,156 +185,58 @@ def runner_contract(path: Path) -> Tuple[
             raise SystemExit(str(error))
     return value, profile, parsed_preflight, parsed
 
-
-def process_group_members(pgid: int) -> Optional[List[int]]:
-    try:
-        result = subprocess.run(["ps", "-axo", "pid=,pgid="], text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        result = None
-    if result is None or result.returncode:
-        try:
-            os.killpg(pgid, 0)
-            return [pgid]
-        except ProcessLookupError:
-            return []
-        except OSError:
-            return None
-    members = []
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and all(item.isdigit() for item in parts) and int(parts[1]) == pgid:
-            members.append(int(parts[0]))
-    return members
-
-
-def stop_group(pgid: int) -> bool:
-    members = process_group_members(pgid)
-    if members is None:
-        return False
-    if not members:
-        return True
-    for sent in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sent)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            return False
-        for _ in range(30):
-            time.sleep(0.05)
-            members = process_group_members(pgid)
-            if members == []:
-                return True
-            if members is None:
-                return False
-    return process_group_members(pgid) == []
-
-
-def output_text(raw: object) -> str:
-    if raw is None:
-        return ""
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return str(raw)
-
-
-def merge_output(previous: str, observed: object) -> str:
-    current = output_text(observed)
-    if current.startswith(previous):
-        return current
-    if previous.endswith(current):
-        return previous
-    return previous + current
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+SAFE_COMMAND_ENVIRONMENT = ("PATH","LANG","LC_ALL","LC_CTYPE","TZ","TMPDIR","TMP","TEMP","TERM","DEVELOPER_DIR","SDKROOT")
 
 
 def execute(argv: List[str], timeout: int, token: str, profile: Dict[str, object]) -> Dict[str, object]:
     started = now()
-    environment = dict(os.environ)
+    environment={key:os.environ[key] for key in SAFE_COMMAND_ENVIRONMENT if key in os.environ}
+    environment.setdefault("PATH",os.defpath); environment.setdefault("LANG","C"); environment.setdefault("LC_ALL","C")
     environment["AGENT_FRESH_STATE_TOKEN"] = token
     environment["AGENT_EXECUTION_ENVIRONMENT"] = str(profile["environment"])
     environment["AGENT_EXECUTION_AUTHORITY"] = str(profile["authority"])
-    process = subprocess.Popen(argv, cwd=ROOT, env=environment, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, start_new_session=True)
-    output = ""
-    pipe_drained = True
-    try:
-        output, _ = process.communicate(timeout=timeout)
-        code = int(process.returncode)
-    except subprocess.TimeoutExpired as error:
-        output = merge_output(output, error.output)
-        code = 124
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-        try:
-            observed, _ = process.communicate(timeout=5)
-            output = merge_output(output, observed)
-        except subprocess.TimeoutExpired as error:
-            output = merge_output(output, error.output)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            try:
-                observed, _ = process.communicate(timeout=2)
-                output = merge_output(output, observed)
-            except subprocess.TimeoutExpired as final_error:
-                output = merge_output(output, final_error.output)
-                pipe_drained = False
-                if process.stdout is not None and not process.stdout.closed:
-                    try:
-                        process.stdout.close()
-                    except OSError:
-                        pass
-    cleaned = stop_group(process.pid) and pipe_drained
-    if process.poll() is None:
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            cleaned = False
-    encoded = output.encode()
+    launch_token=uuid.uuid4().hex; environment[supervised_test.LAUNCH_TOKEN_NAME]=launch_token
+    if signal.getsignal(signal.SIGCHLD) is not signal.SIG_DFL:
+        raise RuntimeError("workflow release gate requires default SIGCHLD ownership")
+    with supervised_test.child_subreaper() as boundary_supported:
+        if not boundary_supported:
+            raise RuntimeError("workflow release gate cannot establish its process supervision boundary")
+        process = subprocess.Popen(
+            argv,cwd=ROOT,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,start_new_session=True,close_fds=True,bufsize=0,
+        )
+        result=supervised_test.supervise_bounded_process(
+            process,timeout,launch_token,output_limit=MAX_COMMAND_OUTPUT_BYTES,grace=5.0)
+    output=bytes(result["output"]); text=output.decode("utf-8",errors="replace")
     return {
-        "argv": argv, "started_at": started, "finished_at": now(), "exit_code": code if cleaned else 125,
-        "output_sha256": digest(encoded), "output_bytes": len(encoded), "output_tail": output.splitlines()[-20:],
-        "process_cleanup": {"remaining": 0 if cleaned else -1},
-        "captured_output": output,
+        "argv": argv, "started_at": started, "finished_at": now(), "exit_code": int(result["exit_code"]),
+        "output_sha256": digest(output), "output_bytes": len(output), "output_tail": text.splitlines()[-20:],
+        "process_cleanup": {"remaining": 0 if result["cleanup_ok"] else -1}, "captured_output": text,
+        "output_limit_exceeded": bool(result["output_limit_exceeded"]),
     }
 
 
 def runtime_assert_clean() -> Tuple[bool, Dict[str, object]]:
     """Reuse agentctl's read-only registry + baseline-delta clean assertion."""
-    tool_path = AGENT / "scripts/agentctl.py"
-    tool_data = tool_path.read_bytes()
-    environment = dict(os.environ)
+    tool_path=AGENT/"scripts/agentctl.py"; tool_data=bounded_file_bytes(tool_path,"agentctl")
     try:
-        result = subprocess.run(
-            [sys.executable, str(tool_path), "assert-clean"], cwd=ROOT,
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=30, env=environment,
-        )
-        output = result.stdout.encode()
-        if result.returncode and result.stdout.strip():
-            print("agentctl assert-clean rejected runtime:\n" + result.stdout.strip(), file=sys.stderr)
-        return result.returncode == 0, {
-            "mode": "baseline-delta-assert-clean",
-            "tool": {
-                "path": str(tool_path.relative_to(ROOT)), "sha256": digest(tool_data),
-                "bytes": len(tool_data),
-            },
-            "exit_code": result.returncode,
-            "output_sha256": digest(output), "output_bytes": len(output),
+        result=execute([sys.executable,str(tool_path),"assert-clean"],30,"runtime-assert-clean",{
+            "environment":"local","authority":"default","capabilities":["runtime-clean"],
+        })
+        output=str(result["captured_output"]).encode()
+        if result["exit_code"] and str(result["captured_output"]).strip():
+            print("agentctl assert-clean rejected runtime:\n"+str(result["captured_output"]).strip(),file=sys.stderr)
+        return result["exit_code"]==0 and result["process_cleanup"]=={"remaining":0},{
+            "mode":"baseline-delta-assert-clean",
+            "tool":{"path":str(tool_path.relative_to(ROOT)),"sha256":digest(tool_data),"bytes":len(tool_data)},
+            "exit_code":int(result["exit_code"]),"output_sha256":digest(output),"output_bytes":len(output),
         }
-    except (OSError, subprocess.TimeoutExpired):
-        return False, {
-            "mode": "baseline-delta-assert-clean",
-            "tool": {
-                "path": str(tool_path.relative_to(ROOT)), "sha256": digest(tool_data),
-                "bytes": len(tool_data),
-            },
-            "exit_code": 124, "output_sha256": digest(b""), "output_bytes": 0,
-        }
+    except (OSError,RuntimeError,ValueError):
+        return False,{"mode":"baseline-delta-assert-clean","tool":{
+            "path":str(tool_path.relative_to(ROOT)),"sha256":digest(tool_data),"bytes":len(tool_data),
+        },"exit_code":125,"output_sha256":digest(b""),"output_bytes":0}
+
 
 
 def plan_sha(profile: Dict[str, object], preflight: List[Tuple[str, List[str], int]],
@@ -392,7 +310,7 @@ def validate_test_receipt(value: Dict[str, object], commands: List[Tuple[str, Li
             raise ValueError(f"integrator case {index} is invalid")
         expected_keys = {
             "id", "run_id", "candidate_sha256", "command", "started_at", "finished_at", "exit_code",
-            "outcome", "cleanup", "output", "case_sha256",
+            "outcome", "cleanup", "execution_boundary", "output", "case_sha256",
         }
         unsigned = {key: item for key, item in case.items() if key != "case_sha256"}
         expected_sha = digest(json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode())
@@ -403,7 +321,9 @@ def validate_test_receipt(value: Dict[str, object], commands: List[Tuple[str, Li
             or case.get("run_id") != run_id or case.get("command") != expected[1]
             or case.get("candidate_sha256") != candidate_sha256
             or case.get("exit_code") != 0 or case.get("outcome") != "completed"
-            or case.get("cleanup") != "passed" or case.get("case_sha256") != expected_sha
+            or case.get("cleanup") != "passed"
+            or case.get("execution_boundary") != TEST_EXECUTION_BOUNDARY
+            or case.get("case_sha256") != expected_sha
             or finished < started
         ):
             raise ValueError(f"integrator case {index} is not the exact clean workflow command")
@@ -557,7 +477,7 @@ def run_gate(runner_raw: str, receipt_raw: str, integrator_raw: str, preflight_r
         )
     passed = clean and (adapter != "ios-simulator" or ios_cleanup.get("status") == "passed")
     tool_path = Path(__file__).resolve()
-    tool_data = tool_path.read_bytes()
+    tool_data=bounded_file_bytes(tool_path,"release gate tool")
     value = {
         "schema": GATE_SCHEMAS[adapter], "adapter_id": ADAPTER_IDS[adapter],
         "status": "passed" if passed else "blocked", "failure_class": None if passed else "infrastructure",
@@ -602,10 +522,24 @@ def verify_gate(runner_raw: str, receipt_raw: str, announce: bool = True) -> int
     if value.get("candidate_fingerprint") != fingerprint:
         errors.append("receipt candidate fingerprint is stale")
     tool_path = Path(__file__).resolve()
-    tool_data = tool_path.read_bytes()
+    tool_data=bounded_file_bytes(tool_path,"release gate tool")
     expected_tool = {"path": str(tool_path.relative_to(ROOT)), "sha256": digest(tool_data), "bytes": len(tool_data)}
     if value.get("gate_tool") != expected_tool:
         errors.append("receipt gate tool drifted")
+    gate_started = None
+    try:
+        gate_started = parse_time(value.get("started_at"), "release gate start")
+        gate_finished = parse_time(value.get("finished_at"), "release gate finish")
+        current = utc_now()
+        if (
+            gate_started > current + dt.timedelta(seconds=5)
+            or gate_finished > current + dt.timedelta(seconds=5)
+            or gate_finished < gate_started
+            or gate_finished - gate_started > dt.timedelta(minutes=15)
+        ):
+            raise ValueError("release gate chronology is future, reversed, or overlong")
+    except ValueError as error:
+        errors.append(str(error))
     try:
         preflight_path = receipt_path(value.get("preflight_receipt"), "execution preflight")
         validate_preflight(
@@ -623,11 +557,11 @@ def verify_gate(runner_raw: str, receipt_raw: str, announce: bool = True) -> int
     except (SystemExit, ValueError) as error:
         errors.append(str(error))
     assertion = value.get("runtime_assertion")
-    agentctl_path = AGENT / "scripts/agentctl.py"
+    agentctl_path=AGENT/"scripts/agentctl.py"; agentctl_data=bounded_file_bytes(agentctl_path,"agentctl")
     expected_assertion_tool = {
         "path": str(agentctl_path.relative_to(ROOT)),
-        "sha256": digest(agentctl_path.read_bytes()),
-        "bytes": len(agentctl_path.read_bytes()),
+        "sha256": digest(agentctl_data),
+        "bytes": len(agentctl_data),
     }
     if (
         not isinstance(assertion, dict)
@@ -707,4 +641,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

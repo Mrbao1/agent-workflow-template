@@ -1,7 +1,0 @@
-{
-  "schema": "acceptance-runner/v4",
-  "adapter": "workflow",
-  "execution_profile": {"environment":"local","authority":"default","capabilities":["python-runtime"]},
-  "preflight_commands": [{"id":"python-runtime","argv":["python3",".agent/skills/run-full-chain-acceptance/scripts/preflight_environment.py"],"timeout_seconds":30}],
-  "commands": [{"id":"workflow-full-suite","argv":["python3","tests/run_all.py","--test-timeout","600"],"timeout_seconds":2700}]
-}

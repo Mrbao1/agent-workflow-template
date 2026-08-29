@@ -4,6 +4,7 @@
 from pathlib import Path
 import datetime as dt
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
@@ -14,12 +15,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
 ROOT = Path(__file__).resolve().parents[4]
 TESTRUN = ROOT / ".agent/scripts/testrun.py"
 AGENT_LEDGER = ROOT / ".agent/skills/manage-agent-team/scripts/agentledger.py"
+FIXTURE_MODEL = "vendor-x/reasoning.model+2026"
 
 
 def copy_policy_runtime(project: Path) -> None:
@@ -127,6 +130,17 @@ def wait_dead(pid: int, timeout: float = 3.0) -> bool:
     return not alive(pid)
 
 
+def wait_pid_file(path: Path, timeout: float = 5.0) -> int:
+    deadline=time.monotonic()+timeout; last_error=None
+    while time.monotonic()<deadline:
+        try:
+            value=int(path.read_text(encoding="utf-8").strip())
+            if value>1: return value
+        except (FileNotFoundError,ValueError,OSError) as error: last_error=error
+        time.sleep(0.05)
+    raise AssertionError(f"PID fixture was not atomically readable: {path}: {last_error}")
+
+
 def kill_exact(pid: int) -> None:
     if alive(pid):
         try:
@@ -134,6 +148,47 @@ def kill_exact(pid: int) -> None:
         except ProcessLookupError:
             pass
 
+
+
+class HealthTarget(http.server.BaseHTTPRequestHandler):
+    hits=0
+    def do_GET(self):
+        type(self).hits+=1; self.send_response(204); self.end_headers()
+    def log_message(self,*_args): pass
+
+
+class HealthRedirect(http.server.BaseHTTPRequestHandler):
+    target=""
+    def do_GET(self):
+        self.send_response(302); self.send_header("Location",type(self).target); self.end_headers()
+    def log_message(self,*_args): pass
+
+
+def redirect_health_case():
+    target=http.server.ThreadingHTTPServer(("127.0.0.1",0),HealthTarget)
+    redirect=http.server.ThreadingHTTPServer(("127.0.0.1",0),HealthRedirect)
+    HealthTarget.hits=0; HealthRedirect.target=f"http://127.0.0.1:{target.server_port}/privileged"
+    threads=[threading.Thread(target=server.serve_forever,daemon=True) for server in (target,redirect)]
+    for thread in threads: thread.start()
+    try:
+        controller("managed-run","--name","redirect-refusal","--timeout","1","--health-url",f"http://127.0.0.1:{redirect.server_port}/health","--",sys.executable,"-c","import time; time.sleep(60)",expected=1)
+        if HealthTarget.hits: raise AssertionError("managed health probe followed a redirect to another origin")
+    finally:
+        for server in (redirect,target): server.shutdown(); server.server_close()
+        for thread in threads: thread.join(timeout=2)
+
+
+def docker_output_flood_case(temporary: Path):
+    binary=temporary/"bin"/"docker"; binary.parent.mkdir()
+    binary.write_text(f"#!{sys.executable}\nimport sys\nwhile True:\n sys.stdout.buffer.write(b'x'*65536); sys.stdout.buffer.flush()\n",encoding="utf-8")
+    binary.chmod(0o755); previous=os.environ.get("PATH")
+    os.environ["PATH"]=str(binary.parent)+(os.pathsep+previous if previous else "")
+    try:
+        if runtime_controller.docker_residual("agent_output_flood") is not None:
+            raise AssertionError("Docker residual inventory accepted output beyond its byte limit")
+    finally:
+        if previous is None: os.environ.pop("PATH",None)
+        else: os.environ["PATH"]=previous
 
 def controller(*args: str, expected: int = 0) -> subprocess.CompletedProcess:
     result = subprocess.run(
@@ -147,7 +202,7 @@ def controller(*args: str, expected: int = 0) -> subprocess.CompletedProcess:
 
 controller("cleanup")
 with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
-    temporary = Path(raw)
+    temporary=Path(raw); redirect_health_case(); docker_output_flood_case(temporary)
 
     # Stable identity must come from the host kernel, not lsof's missing start
     # time placeholder. An unreadable or changing identity fails closed.
@@ -156,25 +211,47 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     if own_snapshot is None or not str(own_snapshot.get("start_time", "")).startswith(expected_prefix):
         raise AssertionError(f"OS-native process identity unavailable: {own_snapshot}")
 
-    # Only an exact host-runner sibling may be excluded. A project child or an
-    # argv/name lookalike remains visible to the runtime delta gate.
+    # The default grants no provider-shaped process exemption. Only one
+    # explicitly configured provider-neutral host/runner kernel identity pair
+    # may be excluded; names, argv and directory resemblance carry no authority.
+    controller_config_path = CONTROL_ROOT / ".agent/config.json"
+    original_controller_config = controller_config_path.read_bytes()
+    original_controller_config_path = runtime_controller.CONFIG_PATH
+    runtime_controller.CONFIG_PATH = controller_config_path
+    host_start = "darwin:1:2" if sys.platform == "darwin" else "linux:1"
+    runner_start = "darwin:1:3" if sys.platform == "darwin" else "linux:2"
     host_runner = {
-        "pid": 10, "ppid": 1, "pgid": 10,
-        "executable": "/trusted/platform/codex",
+        "pid": 10, "start_time": host_start,
+        "executable": str(Path(sys.executable).resolve()),
     }
-    synthetic_ancestors = {10: host_runner}
-    if not runtime_controller.platform_runner_peer(
-        {"pid": 11, "ppid": 10, "pgid": 11, "executable": "/trusted/platform/cua_node/bin/node_repl"},
-        synthetic_ancestors,
-    ):
-        raise AssertionError("exact platform tool runner was not recognized")
-    for lookalike in (
-        {"pid": 12, "ppid": 11, "pgid": 12, "executable": "/trusted/platform/cua_node/bin/node_repl"},
-        {"pid": 13, "ppid": 10, "pgid": 13, "executable": "/project/node_repl"},
-        {"pid": 14, "ppid": 10, "pgid": 14, "executable": None},
-    ):
-        if runtime_controller.platform_runner_peer(lookalike, synthetic_ancestors):
-            raise AssertionError(f"project/lookalike process was treated as a platform peer: {lookalike}")
+    tool_runner = {
+        "pid": 11, "start_time": runner_start,
+        "executable": str(Path(shutil.which("sh") or "/bin/sh").resolve()),
+    }
+    exact_runner = {**tool_runner, "ppid": 10, "pgid": 11}
+    synthetic_ancestors = {10: {**host_runner, "ppid": 1, "pgid": 10}}
+    if runtime_controller.host_runner_peer(exact_runner, synthetic_ancestors):
+        raise AssertionError("default-null host runner policy granted an exemption")
+    configured = json.loads(original_controller_config)
+    configured["runtime"]["host_runner_identity"] = {
+        "schema": "agent-host-runner-identity/v1",
+        "authority": "self-test-host", "host": host_runner, "runner": tool_runner,
+    }
+    controller_config_path.write_text(json.dumps(configured), encoding="utf-8")
+    try:
+        if not runtime_controller.host_runner_peer(exact_runner, synthetic_ancestors):
+            raise AssertionError("exact configured provider-neutral host runner was not recognized")
+        for lookalike in (
+            {**exact_runner, "ppid": 12},
+            {**exact_runner, "pid": 12},
+            {**exact_runner, "start_time": runner_start + "0"},
+            {**exact_runner, "executable": host_runner["executable"]},
+        ):
+            if runtime_controller.host_runner_peer(lookalike, synthetic_ancestors):
+                raise AssertionError(f"unbound runner lookalike was treated as a host peer: {lookalike}")
+    finally:
+        controller_config_path.write_bytes(original_controller_config)
+        runtime_controller.CONFIG_PATH = original_controller_config_path
 
     # Registration and cleanup must never authorize the controller's own live
     # process group, even when its leader otherwise has a valid stable identity.
@@ -197,7 +274,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     finally:
         runtime_controller.signal_process_group = original_signal_group
 
-    # A forged/reused leader identity must never authorize killpg, even when
+    # A forged/reused leader identity must never authorize launch-member signaling, even when
     # PID and PGID still name a live isolated group.
     reused = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -215,10 +292,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
         if reused.poll() is not None:
             raise AssertionError("PID-reuse refusal still signaled the unrelated group")
     finally:
-        try:
-            os.killpg(reused.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if reused.poll() is None: reused.kill()
         reused.wait(timeout=3)
 
     # A leader may exit successfully while a child keeps its process group alive.
@@ -232,6 +306,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     result = controller(
         "managed-run", "--name", "leader-first-exit", "--timeout", "5", "--",
         sys.executable, "-c", leader_script, str(leader_child),
+        expected=1,
     )
     child_pid = int(leader_child.read_text())
     try:
@@ -239,6 +314,19 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
             raise AssertionError("managed-run left a child after its group leader exited")
     finally:
         kill_exact(child_pid)
+
+    detached_child=temporary/"detached-child.pid"
+    detached_script=("import os,pathlib,subprocess,sys,time; "
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,preexec_fn=os.setsid); "
+        "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(.3)")
+    controller("managed-run","--name","detached-child","--timeout","5","--",sys.executable,"-c",detached_script,str(detached_child),expected=1)
+    detached_pid=int(detached_child.read_text())
+    try:
+        if not wait_dead(detached_pid): raise AssertionError("managed-run left a setsid descendant after leader exit")
+    finally: kill_exact(detached_pid)
+    controller("managed-run","--name","oversized-timeout","--timeout","3601","--","/usr/bin/true",expected=1)
+    flooded=controller("managed-run","--name","output-flood","--timeout","5","--",sys.executable,"-c","import os;os.write(1,b'x'*(5*1024*1024))",expected=1)
+    if "output byte limit" not in flooded.stdout: raise AssertionError("managed-run output overflow did not fail explicitly")
 
     # SIGTERM delivered to the controller must still tear down the managed group.
     signal_child = temporary / "signal-child.pid"
@@ -253,15 +341,12 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
          sys.executable, "-c", signal_script, str(signal_child)],
         cwd=CONTROL_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=supervised_env(),
     )
-    deadline = time.monotonic() + 5
-    while not signal_child.is_file() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if not signal_child.is_file():
-        if managed.poll() is None:
-            managed.kill()
-        output = managed.communicate(timeout=5)[0]
-        raise AssertionError(f"signal fixture did not start; rc={managed.returncode}\n{output}")
-    signal_pid = int(signal_child.read_text())
+    try: signal_pid=wait_pid_file(signal_child)
+    except AssertionError as error:
+        try: managed.kill()
+        except ProcessLookupError: pass
+        output=managed.communicate(timeout=5)[0]
+        raise AssertionError(f"signal fixture did not start; rc={managed.returncode}\n{output}") from error
     try:
         managed.send_signal(signal.SIGTERM)
         managed.communicate(timeout=10)
@@ -290,15 +375,19 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
         local_dir = ROOT / ".agent/state/evidence/runtime-selftest"
         local_dir.mkdir(parents=True, exist_ok=True)
         receipt = local_dir / f"testrun-{os.getpid()}.json"
-        test_child = local_dir / f"testrun-child-{os.getpid()}.pid"
+        # The PID marker is output evidence, not candidate input; keep it outside ROOT
+        # so private-candidate compatibility never authorizes writable source fallback.
         try:
             timed = subprocess.run(
                 [sys.executable, str(TESTRUN), "--receipt", str(receipt.relative_to(ROOT)), "--case", "timeout-cleanup",
                  "--timeout", "1", "--", sys.executable, "-c", timeout_script, str(test_child)],
                 cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
             )
-            if timed.returncode != 124:
-                raise AssertionError(f"testrun timeout expected 124, got {timed.returncode}\n{timed.stdout}")
+            allowed_timeout_codes={124,125} if sys.platform.startswith("darwin") else {124}
+            if timed.returncode not in allowed_timeout_codes:
+                raise AssertionError(f"testrun timeout expected a clean timeout or Darwin fail-closed uncertainty, got {timed.returncode}\n{timed.stdout}")
+            if timed.returncode==125 and "exit=124 cleanup=failed" not in timed.stdout:
+                raise AssertionError(f"Darwin uncertainty did not remain an explicit failed cleanup signal\n{timed.stdout}")
             test_pid = int(test_child.read_text())
             try:
                 if not wait_dead(test_pid):
@@ -315,7 +404,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
             except OSError:
                 pass
     else:
-        raise AssertionError("off-project receipt path unexpectedly accepted")
+        raise AssertionError(f"off-project receipt path unexpectedly accepted or failed for the wrong reason: exit={timed.returncode}\n{timed.stdout}")
 
     # Same Docker project name may only be registered with the exact same identity.
     isolated = temporary / "project"
@@ -325,6 +414,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     shutil.copy2(ROOT / ".agent/scripts/contextctl.py", isolated / ".agent/scripts/contextctl.py")
     shutil.copy2(ROOT / ".agent/scripts/contexttx.py", isolated / ".agent/scripts/contexttx.py")
     shutil.copy2(ROOT / ".agent/scripts/humandecision.py", isolated / ".agent/scripts/humandecision.py")
+    shutil.copy2(ROOT / ".agent/scripts/process_observation.py", isolated / ".agent/scripts/process_observation.py")
     copy_policy_runtime(isolated)
     (isolated / ".agent/state/runtime.json").write_text(
         json.dumps({"schema": "agent-runtime/v2", "baseline": {"source": "user:fixture", "captured_at": "2026-07-17T00:00:00+00:00", "project_processes": []}, "processes": [], "docker_projects": [], "ports": []}),
@@ -338,9 +428,8 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     if first.returncode or conflict.returncode == 0:
         raise AssertionError("Docker project identity conflict did not fail closed")
 
-    # A sibling reviewer command is allowed only through a bounded,
-    # platform-evidenced, listener-free foreground-tool lease.  It must not
-    # mask an unrelated unregistered runtime or a registered product runtime.
+    # A local caller cannot impersonate a sibling platform reviewer. Even a
+    # canonical ledger ID must not execute argv or mutate the legacy lease registry.
     tool_project = temporary / "tool-project"
     (tool_project / ".agent/scripts").mkdir(parents=True)
     (tool_project / ".agent/skills/manage-agent-team/scripts").mkdir(parents=True)
@@ -350,11 +439,13 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     shutil.copy2(ROOT / ".agent/scripts/contexttx.py", tool_project / ".agent/scripts/contexttx.py")
     shutil.copy2(ROOT / ".agent/scripts/humandecision.py", tool_project / ".agent/scripts/humandecision.py")
     shutil.copy2(ROOT / ".agent/scripts/testrun.py", tool_project / ".agent/scripts/testrun.py")
+    shutil.copy2(ROOT / ".agent/scripts/process_observation.py", tool_project / ".agent/scripts/process_observation.py")
     shutil.copy2(AGENT_LEDGER, tool_project / ".agent/skills/manage-agent-team/scripts/agentledger.py")
     copy_policy_runtime(tool_project)
     tool_config = json.loads((ROOT / ".agent/config.json").read_text(encoding="utf-8"))
     tool_config["runtime"]["term_timeout_seconds"] = 1
     tool_config["routing"]["modes"]["standard"]["max_child_agents"] = 2
+    tool_config["agent_control"]["default_model"] = FIXTURE_MODEL
     (tool_project / ".agent/config.json").write_text(json.dumps(tool_config), encoding="utf-8")
     tool_task = json.loads((ROOT / ".agent/state/TASK.json").read_text(encoding="utf-8"))
     tool_contract = "# Requirement Contract\n\n- Human decisions: user:runtime-self-test\n- Clarified: true\n"
@@ -373,6 +464,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     })
     (tool_project / ".agent/state/TASK.json").write_text(json.dumps(tool_task), encoding="utf-8")
     tool_agents = json.loads((ROOT / ".agent/state/agents.json").read_text(encoding="utf-8"))
+    tool_agents["default_model"] = FIXTURE_MODEL
     tool_agents["token_accounting"]["token_budget"] = tool_task["token_budget"]
     (tool_project / ".agent/state/agents.json").write_text(json.dumps(tool_agents), encoding="utf-8")
     subprocess.run(
@@ -438,7 +530,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     reviewer_envelope_path.write_text(json.dumps({
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": initial_ledger["epoch"],
         "agent_id": "/root/reviewer", "root_task_id": "runtime-fixture", "role_type": "adversarial",
-        "model": "gpt-5.6-sol", "fork_turns": 0, "started_at": observed,
+        "model": FIXTURE_MODEL, "fork_turns": 0, "started_at": observed,
         "deadline_at": (observed_at + dt.timedelta(minutes=5)).isoformat(), "redispatch_count": 0,
         "task_payload_path": payload_internal, "task_payload_sha256": payload_hash,
         "allowed_evidence_paths": ["reviewer-report.txt"],
@@ -452,7 +544,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
         "id": "/root/reviewer", "status": "running", "ledger_epoch": initial_ledger["epoch"],
         "root_task_id": "runtime-fixture", "role_type": "adversarial",
         "started_at": observed, "deadline_at": (observed_at + dt.timedelta(minutes=5)).isoformat(),
-        "redispatch_count": 0, "model": "gpt-5.6-sol", "fork_turns": 0,
+        "redispatch_count": 0, "model": FIXTURE_MODEL, "fork_turns": 0,
         "task_payload_sha256": payload_hash, "handoff_envelope_sha256": reviewer_envelope_hash,
         "message_cursor": 0,
     }
@@ -462,14 +554,14 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     }), encoding="utf-8")
     prepared = subprocess.run(
         [*ledger_command, "prepare", "--id", "/root/reviewer", "--root-task-id", "runtime-fixture",
-         "--role-type", "adversarial", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+         "--role-type", "adversarial", "--model", FIXTURE_MODEL, "--fork-turns", "0",
          "--task-payload", payload_path.name, "--handoff-envelope", reviewer_envelope_path.name],
         cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     registered = subprocess.run(
         [*ledger_command, "register", "--id", "/root/reviewer", "--root-task-id", "runtime-fixture",
          "--role-type", "adversarial", "--role", "independent adversarial reviewer", "--task", "runtime integration",
-         "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", payload_path.name,
+         "--model", FIXTURE_MODEL, "--fork-turns", "0", "--task-payload", payload_path.name,
          "--handoff-envelope", reviewer_envelope_path.name, "--deadline-minutes", "5", "--progress-hash", payload_hash,
          "--platform-snapshot", registration_snapshot.name],
         cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -491,7 +583,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     implementer_envelope_path.write_text(json.dumps({
         "schema": "agent-handoff-envelope/v3", "ledger_epoch": initial_ledger["epoch"],
         "agent_id": "/root/implementer", "root_task_id": "runtime-implementer", "role_type": "implementer",
-        "model": "gpt-5.6-sol", "fork_turns": 0, "started_at": implementer_observed_at.isoformat(),
+        "model": FIXTURE_MODEL, "fork_turns": 0, "started_at": implementer_observed_at.isoformat(),
         "deadline_at": (implementer_observed_at + dt.timedelta(minutes=5)).isoformat(), "redispatch_count": 0,
         "task_payload_path": payload_internal, "task_payload_sha256": payload_hash,
         "allowed_evidence_paths": ["implementer-report.txt"], "forbidden_actions": ["approve-node7"],
@@ -505,7 +597,7 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
         "root_task_id": "runtime-implementer", "role_type": "implementer",
         "started_at": implementer_observed_at.isoformat(),
         "deadline_at": (implementer_observed_at + dt.timedelta(minutes=5)).isoformat(),
-        "redispatch_count": 0, "model": "gpt-5.6-sol", "fork_turns": 0,
+        "redispatch_count": 0, "model": FIXTURE_MODEL, "fork_turns": 0,
         "task_payload_sha256": payload_hash, "handoff_envelope_sha256": implementer_envelope_hash,
         "message_cursor": 0,
     }
@@ -516,14 +608,14 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     }), encoding="utf-8")
     implementer_prepared = subprocess.run(
         [*ledger_command, "prepare", "--id", "/root/implementer", "--root-task-id", "runtime-implementer",
-         "--role-type", "implementer", "--model", "gpt-5.6-sol", "--fork-turns", "0",
+         "--role-type", "implementer", "--model", FIXTURE_MODEL, "--fork-turns", "0",
          "--task-payload", payload_path.name, "--handoff-envelope", implementer_envelope_path.name],
         cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     implementer_registered = subprocess.run(
         [*ledger_command, "register", "--id", "/root/implementer", "--root-task-id", "runtime-implementer",
          "--role-type", "implementer", "--role", "primary implementer-review owner", "--task", "implementation",
-         "--model", "gpt-5.6-sol", "--fork-turns", "0", "--task-payload", payload_path.name,
+         "--model", FIXTURE_MODEL, "--fork-turns", "0", "--task-payload", payload_path.name,
          "--handoff-envelope", implementer_envelope_path.name, "--deadline-minutes", "5", "--progress-hash", payload_hash,
          "--platform-snapshot", implementer_snapshot.name],
         cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -540,137 +632,17 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
     if valid_ledger.returncode:
         raise AssertionError(f"registered reviewer ledger is invalid before tool authorization\n{valid_ledger.stdout}")
 
-    def rejected_owner(mutator, label: str) -> None:
-        value = json.loads(valid_agents_bytes)
-        mutator(value)
-        agents_path.write_text(json.dumps(value), encoding="utf-8")
-        try:
-            rejected = subprocess.run(
-                [*tool_command, "tool-run", "--agent-id", "/root/reviewer", "--name", label,
-                 "--timeout", "5", "--", sys.executable, "-c", "pass"],
-                cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
-            if rejected.returncode == 0 or "requires an active platform-evidenced" not in rejected.stdout:
-                raise AssertionError(f"{label} owner was accepted\n{rejected.stdout}")
-        finally:
-            agents_path.write_bytes(valid_agents_bytes)
-
-    rejected_owner(lambda value: value.clear() or value.update({"schema": "agent-team/v6", "members": []}), "partial-v6")
-    rejected_owner(lambda value: value.update({"schema": "agent-team/v5"}), "legacy-v5")
-    rejected_owner(lambda value: value.update({"schema": "agent-team/v4"}), "legacy-v4")
-    rejected_owner(lambda value: value.update({"schema": "agent-team/v3"}), "legacy-v3")
-    rejected_owner(lambda value: value.update({"schema": "agent-team/v2"}), "legacy-v2")
-    rejected_owner(lambda value: value["members"][0].update({
-        "registration_platform_evidence": {
-            "path": registration_snapshot.name,
-            "sha256": hashlib.sha256(registration_snapshot.read_bytes()).hexdigest(),
-            "bytes": len(registration_snapshot.read_bytes()),
-        },
-    }), "arbitrary-registration-path")
-    rejected_owner(lambda value: value["members"][0].update({
-        "terminal_platform_evidence": value["members"][0]["registration_platform_evidence"],
-    }), "terminal-active-tamper")
-    rejected_owner(lambda value: value["members"][0].update({"role_type": "implementer"}), "role-type-tamper")
-    rejected_owner(lambda value: value["members"][0].update({
-        "started_at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).replace(microsecond=0).isoformat(),
-        "deadline_at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).replace(microsecond=0).isoformat(),
-    }), "expired-owner")
-    unregistered = subprocess.run(
-        [*tool_command, "tool-run", "--agent-id", "/root/not-registered", "--name", "unregistered-owner",
-         "--timeout", "5", "--", sys.executable, "-c", "pass"],
-        cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    marker=tool_project/"must-not-run"
+    leases_before=(tool_project/".agent/state/tool-leases.json").read_bytes()
+    disabled=subprocess.run(
+        [*tool_command,"tool-run","--agent-id","/root/reviewer","--name","disabled-local-impersonation",
+         "--timeout","5","--",sys.executable,"-c","import pathlib,sys;pathlib.Path(sys.argv[1]).write_text('bad')",str(marker)],
+        cwd=tool_project,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
     )
-    if unregistered.returncode == 0:
-        raise AssertionError("unregistered owner was accepted")
-    hybrid = subprocess.run(
-        [*tool_command, "tool-run", "--agent-id", "/root/implementer", "--name", "implementer-review-hybrid",
-         "--timeout", "5", "--", sys.executable, "-c", "pass"],
-        cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    if hybrid.returncode == 0 or "requires an active platform-evidenced" not in hybrid.stdout:
-        raise AssertionError(f"implementer with review-like display text was authorized\n{hybrid.stdout}")
-
-    # Keep a real Bash parent alive while the leased child immediately checks
-    # runtime state.  This attacks both the lease-before-exec barrier and the
-    # direct-parent supervisor capture used by collaboration shells.
-    nested_command = [
-        *tool_command, "tool-run", "--agent-id", "/root/reviewer", "--name", "nested-live-validation",
-        "--timeout", "10", "--", *tool_command, "assert-clean",
-    ]
-    nested_shell = f"{shlex.join(nested_command)} & child=$!; wait \"$child\""
-    nested = subprocess.run(
-        ["/bin/bash", "-c", nested_shell], cwd=tool_project, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
-    )
-    nested_leases = json.loads((tool_project / ".agent/state/tool-leases.json").read_text(encoding="utf-8"))["leases"]
-    if nested.returncode or "RUNTIME CLEAN" not in nested.stdout or nested_leases:
-        raise AssertionError(f"live reviewer lease was not visible before nested validation\n{nested.stdout}")
-
-    ready = tool_project / "reviewer-ready"
-    foreground = subprocess.Popen(
-        [*tool_command, "tool-run", "--agent-id", "/root/reviewer", "--name", "read-only-review",
-         "--timeout", "10", "--", sys.executable, "-c",
-         "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(10)", str(ready)],
-        cwd=tool_project, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        leases = json.loads((tool_project / ".agent/state/tool-leases.json").read_text(encoding="utf-8"))
-        if ready.is_file() and leases.get("leases"):
-            break
-        time.sleep(0.05)
-    else:
-        foreground.kill()
-        raise AssertionError("foreground reviewer lease did not become observable")
-    clean_with_reviewer = subprocess.run([*tool_command, "assert-clean"], cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if clean_with_reviewer.returncode:
-        raise AssertionError(f"audited foreground reviewer was misclassified as runtime\n{clean_with_reviewer.stdout}")
-    forged = json.loads(valid_agents_bytes)
-    forged["members"][0]["terminal_platform_evidence"] = forged["members"][0]["registration_platform_evidence"]
-    agents_path.write_text(json.dumps(forged), encoding="utf-8")
-    try:
-        rejected_allowance = subprocess.run(
-            [*tool_command, "assert-clean"], cwd=tool_project, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        if rejected_allowance.returncode != 1 or "tool lease" not in rejected_allowance.stdout:
-            raise AssertionError(f"forged owner retained audited allowance\n{rejected_allowance.stdout}")
-    finally:
-        agents_path.write_bytes(valid_agents_bytes)
-    cleanup_with_reviewer = subprocess.run([*tool_command, "cleanup"], cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    leases_after_cleanup = json.loads((tool_project / ".agent/state/tool-leases.json").read_text(encoding="utf-8"))["leases"]
-    if cleanup_with_reviewer.returncode or not leases_after_cleanup:
-        raise AssertionError(f"product cleanup failed or erased a valid active reviewer lease\n{cleanup_with_reviewer.stdout}")
-    illegal = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"], cwd=tool_project,
-        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        time.sleep(0.2)
-        dirty_with_reviewer = subprocess.run([*tool_command, "assert-clean"], cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if dirty_with_reviewer.returncode != 1 or f"pid={illegal.pid}" not in dirty_with_reviewer.stdout:
-            raise AssertionError(f"foreground lease masked an unrelated unregistered runtime\n{dirty_with_reviewer.stdout}")
-    finally:
-        if illegal.poll() is None:
-            illegal.kill()
-            illegal.wait(timeout=5)
-    foreground.send_signal(signal.SIGTERM)
-    foreground_output = foreground.communicate(timeout=10)[0]
-    if foreground.returncode == 0 or json.loads((tool_project / ".agent/state/tool-leases.json").read_text(encoding="utf-8"))["leases"]:
-        raise AssertionError(f"interrupted foreground tool did not remove its exact lease\n{foreground_output}")
-
-    forged_ledger = json.loads((tool_project / ".agent/state/agents.json").read_text(encoding="utf-8"))
-    forged_ledger["members"][0]["fork_turns"] = 9
-    (tool_project / ".agent/state/agents.json").write_text(json.dumps(forged_ledger), encoding="utf-8")
-    forged = subprocess.run(
-        [*tool_command, "tool-run", "--agent-id", "/root/reviewer", "--name", "forged-review",
-         "--timeout", "2", "--", sys.executable, "-c", "print('must not run')"],
-        cwd=tool_project, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    if forged.returncode == 0:
-        raise AssertionError("forged reviewer ledger bypassed platform/model/context binding")
-    forged_ledger["members"][0]["fork_turns"] = 10
-    (tool_project / ".agent/state/agents.json").write_text(json.dumps(forged_ledger), encoding="utf-8")
+    if (disabled.returncode==0 or "local --agent-id cannot authenticate" not in disabled.stdout or marker.exists()
+            or (tool_project/".agent/state/tool-leases.json").read_bytes()!=leases_before
+            or agents_path.read_bytes()!=valid_agents_bytes):
+        raise AssertionError(f"disabled local tool impersonation executed or mutated authority\n{disabled.stdout}")
 
     controller_group_registration = subprocess.run(
         [*tool_command, "register-process", "--pid", str(os.getpgid(0)), "--name", "controller-group"],
@@ -726,12 +698,9 @@ with tempfile.TemporaryDirectory(prefix="runtime-adversary-") as raw:
         if spoofed.returncode != 1 or "unregistered project process since baseline" not in spoofed.stdout:
             raise AssertionError(f"caller-supplied supervisor PID hid an unregistered runtime\n{spoofed.stdout}")
     finally:
-        try:
-            os.killpg(unregistered.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if unregistered.poll() is None: unregistered.kill()
         unregistered.wait(timeout=5)
 
 controller("assert-clean")
 _CONTROL_TEMP.cleanup()
-print("MANAGED RUNTIME SELF-TEST PASSED: tool leases, leader exit, signals, timeout descendants, baseline delta and Docker identity")
+print("MANAGED RUNTIME SELF-TEST PASSED: disabled tool impersonation, leader exit, signals, launch-scoped timeout cleanup and Docker identity")

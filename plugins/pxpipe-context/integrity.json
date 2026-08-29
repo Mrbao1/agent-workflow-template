@@ -1,18 +1,27 @@
 {
-  "schema": "pxpipe-context-integrity/v3",
+  "schema": "pxpipe-context-integrity/v4",
+  "provenance_status": "quarantined",
+  "quarantine_reason": "historical bundles lacked exact upstream commit/tree, committed lock/toolchain identity, and a complete transitive-license inventory; opaque artifacts were removed",
   "plugin_version": "0.1.0+codex.20260721210500",
   "pxpipe_package": "pxpipe-proxy",
   "pxpipe_version": "0.9.0",
-  "source_package_sha256": "537c32e4b1ccf850fd0cb50a53acc81cbd2882780e81530092d26ad853b56268",
-  "runtime_bundle": "mcp/vendor/pxpipe-runtime.mjs",
-  "runtime_bundle_sha256": "3bd30405a35ad089088bb2e640c25daae6ac9a1393ecd14153e3d49e6e465718",
-  "proxy_bundle": "proxy/vendor/pxpipe-node.mjs",
-  "proxy_bundle_sha256": "ad100f1330356aee6a0b0ff2a678f11fd5c29c9f788183095c687c29f33729c7",
+  "source_repository": "https://github.com/teamchong/pxpipe.git",
+  "source_commit": null,
+  "source_tree": null,
+  "source_package_sha256": null,
+  "source_lockfile": null,
+  "source_lockfile_sha256": null,
+  "esbuild_main_sha256": null,
+  "plugin_tree_sha256": "de08c9d0c17a7a2075de7ae7534e5fb975ee050dba996508ad22dbe374541999",
+  "runtime_bundle": null,
+  "runtime_bundle_sha256": null,
+  "proxy_bundle": null,
+  "proxy_bundle_sha256": null,
   "provider_assets": {
-    "scripts/codex-pxpipe.sh": "385311ab133ccf44590fde379d7d49d7baf2450866af453031ecbb5908af9b6b",
-    "scripts/codex-default-config.mjs": "8f2914b972bcb796213ee747ec74855dea83455a13aab3276d8f16eef3bb8f0a",
-    "scripts/install-codex-default.sh": "c5ddc7495e637f3d94c90730b7dc28dce10e360c238db958b967c4ee3c6ba844",
-    "scripts/uninstall-codex-default.sh": "25762254d1bdb216d9fa502a5c45a96bed58d9226f4faf199a17a6cd56fcd9f9",
-    "scripts/status-codex-default.sh": "2469f2b9e78c5015938765f79d8d1f8155e17cad66c8f4a6b98803c9c092c1b4"
+    "scripts/codex-default-config.mjs": "593f2c7f074de7df6e7f04c351d9dd7add168a9912d23f7288f3ac1cdee62483",
+    "scripts/codex-pxpipe.sh": "b000ed911aac54ea79a882926561b1e6ac90187167271f6260cca767c1c9169b",
+    "scripts/install-codex-default.sh": "308dce40ece475f2d889cd080c19164e88659b8863f64b5deecadb13e5f2d9f0",
+    "scripts/status-codex-default.sh": "a9a67c25a64f5a88240e734648d4b748954fe39a6352687ae827cd7df9465ce1",
+    "scripts/uninstall-codex-default.sh": "3c8d8e9fae692adb5df3ef63663b9367f216ecbbfb7628d5104f543f741d9375"
   }
 }

@@ -1,26 +1,291 @@
-name: verify-and-publish
+name: verify-build-and-attest
 on:
   pull_request:
   push:
-    branches: [develop, main, "test/**", "release/**"]
+    branches: ["{{github_default_branch}}"]
 permissions:
   contents: read
+env:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  verify-build-once:
+    runs-on: {{github_candidate_runner}}
+{{github_container}}
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact_sha256: ${{ steps.seal.outputs.artifact_sha256 }}
+      inventory_sha256: ${{ steps.seal.outputs.inventory_sha256 }}
+      receipt_sha256: ${{ steps.seal.outputs.receipt_sha256 }}
+      workflow_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
-      - uses: actions/checkout@v4
-      - run: "{{install_command}}"
-      - run: "{{static_security_command}}"
-      - run: "{{test_command}}"
-      - run: "{{integration_command}}"
-      - run: "{{migration_dry_run_command}}"
-      - run: "{{build_command}}"
-      - name: Publish immutable artifact
-        run: "{{publish_artifact_and_digest_command}}"
-      - name: Publish artifact receipt
-        run: "{{publish_artifact_receipt_command}}"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{install_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{static_security_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{integration_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{migration_dry_run_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - run: 'python3 .agent/scripts/blueprintctl.py run-command --id {{build_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+      - name: Seal exact artifact inventory and authenticity receipt
+        id: seal
+        shell: bash
+        env:
+          ARTIFACT_ROOT: "{{artifact_path}}"
+          SOURCE_SHA: ${{ github.sha }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SEAL_ROOT: ${{ runner.temp }}/agent-artifact-seal
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, io, json, os, pathlib, stat, tarfile
+          MAX_ENTRIES=20000; MAX_FILES=10000; MAX_TOTAL=1073741824; MAX_ARCHIVE=MAX_TOTAL+MAX_FILES*2048+10240
+          root=pathlib.Path(os.environ["ARTIFACT_ROOT"]); seal=pathlib.Path(os.environ["SEAL_ROOT"])
+          if root.is_absolute() or ".." in root.parts or not root.parts:
+              raise SystemExit("artifact_path must be one project-relative path")
+          root=pathlib.Path.cwd()/root; before=root.lstat()
+          if not stat.S_ISDIR(before.st_mode): raise SystemExit("artifact_path is not a directory")
+          seal.mkdir(mode=0o700); paths=[]; stack=[root]; entries=0
+          while stack:
+              directory=stack.pop()
+              with os.scandir(directory) as scanner:
+                  batch=[]
+                  for entry in scanner:
+                      entries+=1
+                      if entries>MAX_ENTRIES: raise SystemExit("artifact entry inventory exceeds bound")
+                      batch.append(entry)
+              for entry in sorted(batch,key=lambda item:os.fsencode(item.name),reverse=True):
+                  observed=entry.stat(follow_symlinks=False); path=pathlib.Path(entry.path)
+                  if stat.S_ISDIR(observed.st_mode): stack.append(path); continue
+                  if not stat.S_ISREG(observed.st_mode) or observed.st_nlink!=1:
+                      raise SystemExit(f"unsafe artifact member: {path.relative_to(root)}")
+                  relative=path.relative_to(root).as_posix()
+                  if len(relative.encode())>512: raise SystemExit("artifact member path exceeds bound")
+                  if len(paths)>=MAX_FILES: raise SystemExit("artifact file inventory exceeds bound")
+                  paths.append((relative,path))
+          rows=[]; total=0; identities={}
+          for relative,path in sorted(paths,key=lambda item:item[0].encode()):
+              observed=os.lstat(path); remaining=MAX_TOTAL-total
+              if not stat.S_ISREG(observed.st_mode) or observed.st_nlink!=1 or observed.st_size>remaining:
+                  raise SystemExit("artifact inventory exceeds bound")
+              descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)); digest=hashlib.sha256(); size=0
+              try:
+                  opened=os.fstat(descriptor)
+                  identity=(opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns)
+                  if identity!=(observed.st_dev,observed.st_ino,observed.st_size,observed.st_mtime_ns): raise SystemExit("artifact member changed while opening")
+                  while True:
+                      chunk=os.read(descriptor,min(1024*1024,remaining-size+1))
+                      if not chunk: break
+                      size+=len(chunk)
+                      if size>remaining: raise SystemExit("artifact inventory exceeds bound")
+                      digest.update(chunk)
+                  after=os.fstat(descriptor)
+                  if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)!=identity or size!=opened.st_size:
+                      raise SystemExit("artifact member changed while sealing")
+              finally: os.close(descriptor)
+              total+=size; identities[relative]=identity
+              rows.append({"path":relative,"bytes":size,"sha256":digest.hexdigest(),"mode":0o755 if observed.st_mode&0o111 else 0o644})
+          if not rows: raise SystemExit("artifact inventory is empty")
+          inventory={"schema":"agent-artifact-inventory/v1","files":rows,"total_bytes":total}
+          inventory_raw=(json.dumps(inventory,sort_keys=True,separators=(",",":"))+"\n").encode(); (seal/"inventory.json").write_bytes(inventory_raw)
+          archive=seal/"artifact.tar"
+          with tarfile.open(archive,"w",format=tarfile.PAX_FORMAT) as bundle:
+              for row in rows:
+                  path=root/pathlib.PurePosixPath(row["path"]); descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+                  try:
+                      opened=os.fstat(descriptor)
+                      if (opened.st_dev,opened.st_ino,opened.st_size,opened.st_mtime_ns)!=identities[row["path"]]: raise SystemExit("artifact member changed before archive")
+                      info=tarfile.TarInfo(row["path"]); info.size=row["bytes"]; info.uid=info.gid=0; info.uname=info.gname=""; info.mtime=0; info.mode=row["mode"] or 0o644
+                      with io.FileIO(descriptor,"rb",closefd=False) as source: bundle.addfile(info,source)
+                      after=os.fstat(descriptor)
+                      if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)!=identities[row["path"]]: raise SystemExit("artifact member changed during archive")
+                  finally: os.close(descriptor)
+          archive_stat=archive.stat()
+          if archive_stat.st_size>MAX_ARCHIVE: raise SystemExit("artifact archive exceeds bound")
+          archive_digest=hashlib.sha256(); archive_bytes=0
+          with archive.open("rb") as source:
+              while True:
+                  chunk=source.read(min(1024*1024,MAX_ARCHIVE-archive_bytes+1))
+                  if not chunk: break
+                  archive_bytes+=len(chunk)
+                  if archive_bytes>MAX_ARCHIVE: raise SystemExit("artifact archive exceeds bound")
+                  archive_digest.update(chunk)
+          after_root=root.lstat()
+          if (after_root.st_dev,after_root.st_ino)!=(before.st_dev,before.st_ino): raise SystemExit("artifact root changed while sealing")
+          receipt={"schema":"agent-artifact-authenticity-receipt/v1","source_sha":os.environ["SOURCE_SHA"],
+                   "build_run_id":os.environ["BUILD_RUN_ID"],"build_run_attempt":os.environ["BUILD_RUN_ATTEMPT"],
+                   "artifact_sha256":archive_digest.hexdigest(),"artifact_bytes":archive_bytes,
+                   "inventory_sha256":hashlib.sha256(inventory_raw).hexdigest(),"inventory_bytes":len(inventory_raw)}
+          receipt_raw=(json.dumps(receipt,sort_keys=True,separators=(",",":"))+"\n").encode()
+          (seal/"authenticity-receipt.json").write_bytes(receipt_raw)
+          outputs={"artifact_sha256":receipt["artifact_sha256"],"inventory_sha256":receipt["inventory_sha256"],
+                   "receipt_sha256":hashlib.sha256(receipt_raw).hexdigest()}
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as target:
+              for key,value in outputs.items(): target.write(f"{key}={value}\n")
+          PY
+      - name: Upload sealed verified bytes
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/agent-artifact-seal/artifact.tar
+            ${{ runner.temp }}/agent-artifact-seal/inventory.json
+            ${{ runner.temp }}/agent-artifact-seal/authenticity-receipt.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  verify-publication-payload:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/{{github_default_branch}}' && github.sha == github.event.after
+    needs: verify-build-once
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      publication_artifact_id: ${{ steps.upload-publication-ready.outputs.artifact-id }}
+      publication_artifact_digest: ${{ steps.upload-publication-ready.outputs.artifact-digest }}
+    env:
+      EXPECTED_DEFAULT_REF: refs/heads/{{github_default_branch}}
+      PUSH_AFTER: ${{ github.event.after }}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_REF: ${{ github.ref }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      EXPECTED_ARTIFACT_SHA256: ${{ needs.verify-build-once.outputs.artifact_sha256 }}
+      EXPECTED_INVENTORY_SHA256: ${{ needs.verify-build-once.outputs.inventory_sha256 }}
+      EXPECTED_RECEIPT_SHA256: ${{ needs.verify-build-once.outputs.receipt_sha256 }}
+      EXPECTED_WORKFLOW_ARTIFACT_DIGEST: ${{ needs.verify-build-once.outputs.workflow_artifact_digest }}
+      BUILD_RUN_ID: ${{ github.run_id }}
+      BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
+      PUBLISH_ROOT: ${{ runner.temp }}/verified-publication
+      READY_ROOT: ${{ runner.temp }}/publication-ready
+    steps:
+      # Deliberately no checkout and no OIDC: candidate-authored verification handles bytes only here.
+      - name: Validate protected publication context
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_EVENT_NAME" == push && "$WORKFLOW_REF" == "$EXPECTED_DEFAULT_REF" ]] || exit 2
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ && "$PUSH_AFTER" == "$WORKFLOW_SHA" ]] || exit 2
+          [[ "$EXPECTED_ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ && "$EXPECTED_INVENTORY_SHA256" =~ ^[0-9a-f]{64}$ && "$EXPECTED_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          [[ "$EXPECTED_WORKFLOW_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 2
+      - name: Download only sealed verified bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-publication
+      - name: Verify exact inventory, bytes, and authenticity receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PUBLISH_ROOT"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,stat,tarfile
+          root=pathlib.Path.cwd(); expected={"artifact.tar","inventory.json","authenticity-receipt.json"}; observed=set()
+          with os.scandir(root) as scanner:
+              for entry in scanner:
+                  if len(observed)>=4: raise SystemExit("downloaded artifact inventory limit exceeded")
+                  observed.add(entry.name)
+          if observed!=expected: raise SystemExit("downloaded artifact file set was substituted")
+          def bounded(name,limit):
+              path=root/name; before=path.lstat()
+              if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>limit: raise SystemExit(f"unsafe {name}")
+              fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)); chunks=[]; total=0
+              try:
+                  opened=os.fstat(fd)
+                  while True:
+                      chunk=os.read(fd,min(1048576,limit-total+1))
+                      if not chunk: break
+                      chunks.append(chunk); total+=len(chunk)
+                      if total>limit: raise SystemExit(f"oversized {name}")
+                  after=os.fstat(fd)
+              finally: os.close(fd)
+              identity=lambda value:(value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns)
+              if identity(before)!=identity(opened) or identity(opened)!=identity(after) or total!=opened.st_size: raise SystemExit(f"raced {name}")
+              return b"".join(chunks)
+          inventory_raw=bounded("inventory.json",4194304); receipt_raw=bounded("authenticity-receipt.json",262144)
+          if hashlib.sha256(inventory_raw).hexdigest()!=os.environ["EXPECTED_INVENTORY_SHA256"]: raise SystemExit("inventory substitution")
+          if hashlib.sha256(receipt_raw).hexdigest()!=os.environ["EXPECTED_RECEIPT_SHA256"]: raise SystemExit("receipt substitution")
+          receipt=json.loads(receipt_raw); inventory=json.loads(inventory_raw); rows=inventory.get("files") if isinstance(inventory,dict) else None
+          if set(inventory or {})!={"schema","files","total_bytes"} or inventory["schema"]!="agent-artifact-inventory/v1" or not isinstance(rows,list) or len(rows)>16384 or not isinstance(inventory.get("total_bytes"),int) or isinstance(inventory.get("total_bytes"),bool) or not 0<=inventory["total_bytes"]<=1073741824: raise SystemExit("invalid inventory")
+          ready=pathlib.Path(os.environ["READY_ROOT"]); ready.mkdir(mode=0o700); archive_path=root/"artifact.tar"; before=archive_path.lstat()
+          if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>1073741824: raise SystemExit("unsafe artifact.tar")
+          source_fd=os.open(archive_path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)); ready_path=ready/"artifact.tar"; output_fd=os.open(ready_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); archive_hash=hashlib.sha256(); archive_size=0
+          try:
+              opened=os.fstat(source_fd)
+              while True:
+                  chunk=os.read(source_fd,1048576)
+                  if not chunk: break
+                  archive_size+=len(chunk)
+                  if archive_size>1073741824: raise SystemExit("oversized artifact.tar")
+                  archive_hash.update(chunk); view=memoryview(chunk)
+                  while view:
+                      written=os.write(output_fd,view)
+                      if written<=0: raise SystemExit("publication archive write failed")
+                      view=view[written:]
+              os.fsync(output_fd); after=os.fstat(source_fd)
+          finally: os.close(output_fd); os.close(source_fd)
+          identity=lambda value:(value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns)
+          if identity(before)!=identity(opened) or identity(opened)!=identity(after) or archive_size!=opened.st_size: raise SystemExit("raced artifact.tar")
+          if archive_hash.hexdigest()!=os.environ["EXPECTED_ARTIFACT_SHA256"]: raise SystemExit("artifact substitution")
+          expected_receipt={"schema":"agent-artifact-authenticity-receipt/v1","source_sha":os.environ["WORKFLOW_SHA"],
+             "build_run_id":os.environ["BUILD_RUN_ID"],"build_run_attempt":os.environ["BUILD_RUN_ATTEMPT"],
+             "artifact_sha256":os.environ["EXPECTED_ARTIFACT_SHA256"],"artifact_bytes":archive_size,
+             "inventory_sha256":os.environ["EXPECTED_INVENTORY_SHA256"],"inventory_bytes":len(inventory_raw)}
+          if receipt!=expected_receipt: raise SystemExit("authenticity receipt binding mismatch")
+          total=0; member_count=0
+          with tarfile.open(ready_path,mode="r:") as bundle:
+              for member in bundle:
+                  if member_count>=len(rows): raise SystemExit("archive has extra members")
+                  row=rows[member_count]; member_count+=1
+                  if (not isinstance(row,dict) or set(row)!={"path","bytes","sha256","mode"} or not isinstance(row.get("path"),str) or not row["path"] or member.name!=row["path"] or not member.isfile()
+                      or not isinstance(row.get("bytes"),int) or isinstance(row.get("bytes"),bool) or not 0<=row["bytes"]<=268435456 or row.get("mode") not in {0o644,0o755}
+                      or not isinstance(row.get("sha256"),str) or len(row["sha256"])!=64 or any(char not in "0123456789abcdef" for char in row["sha256"])): raise SystemExit("unsafe archive member")
+                  extracted=bundle.extractfile(member); digest=hashlib.sha256(); size=0
+                  if extracted is None: raise SystemExit("missing archive member bytes")
+                  while True:
+                      chunk=extracted.read(min(1048576,row["bytes"]-size+1))
+                      if not chunk: break
+                      size+=len(chunk)
+                      if size>row["bytes"]: raise SystemExit("oversized archive member")
+                      digest.update(chunk)
+                  total+=size
+                  if size!=row["bytes"] or digest.hexdigest()!=row["sha256"]: raise SystemExit("artifact member substitution")
+          if member_count!=len(rows) or total!=inventory["total_bytes"]: raise SystemExit("artifact inventory mismatch")
+          PY
+      - name: Upload exact publication-ready archive
+        id: upload-publication-ready
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: publication-ready-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication-ready/artifact.tar
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  publish-protected-artifact:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/{{github_default_branch}}' && github.sha == github.event.after
+    needs: verify-publication-payload
+    environment: artifact-publication
+    runs-on: {{github_protected_runner}}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download exact same-run publication payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.verify-publication-payload.outputs.publication_artifact_id }}
+          path: ${{ runner.temp }}/publication-ready
+      - name: Publish provenance for preverified bytes
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: ${{ runner.temp }}/publication-ready/artifact.tar

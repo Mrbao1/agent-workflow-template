@@ -1,115 +1,79 @@
-# pxpipe for Codex Plugin
+# pxpipe for Codex Plugin (quarantined compatibility asset)
 
-This plugin integrates the original `pxpipe-proxy` request transformer with Codex. Its primary capability installs pxpipe as the **default transport for all new Codex Local sessions** on macOS. Eligible bulky context is rendered as PNG blocks before the request leaves the machine.
+This optional Codex integration is **not published by the marketplace and must not
+be installed from the current snapshot**. The historical compiled runtime/proxy files
+did not retain an exact upstream commit/tree, lock/toolchain chain, or complete
+transitive-license inventory. Those opaque distributable files were removed rather
+than redistributed under unverifiable provenance. `integrity.json` therefore uses
+`provenance_status: quarantined`, and the installer and MCP fail closed.
 
-The plugin also keeps the original read-only file MCP as an optional auxiliary. That MCP can prevent newly selected cold files from entering a chat as bulk text, but it cannot rewrite existing chat history or replace the Codex provider.
+The adaptive Agent Workflow does not depend on pxpipe. New projects have pxpipe
+disabled. This directory retains only migration metadata, project-owned fail-closed
+integration/rebuild scaffolding, and the known upstream notice until a maintainer
+performs a verified source, dependency-license, and toolchain rebuild.
 
-## Default whole-session provider proxy (primary)
+## This snapshot cannot remove quarantine
 
-Build the plugin from a trusted `pxpipe-proxy` checkout:
+The distributed `scripts/build-runtime.mjs` intentionally refuses every build. It is
+a fail-closed marker, not a working unquarantine command. No command in this tree can
+create a verified runtime, change `provenance_status`, or restore the marketplace
+entry.
 
-```bash
-node plugins/pxpipe-context/scripts/build-runtime.mjs \
-  --pxpipe-source /absolute/path/to/pxpipe
-```
+Only an external, pinned and independently reviewed release process may produce
+candidate artifacts in a separate reviewed change. That process must start from a
+clean canonical `teamchong/pxpipe` checkout and bind the complete 40-hex commit,
+Git tree, committed dependency lock, exact reviewed build toolchain and entry hashes,
+reproducible outputs, authenticated-dashboard controls, and a complete dependency/
+SBOM license inventory. The candidate change must then pass integrity, dashboard,
+provider-integration, runtime, security, and license review before any marketplace
+entry can be considered. Auditing the current quarantined tree, including use of an
+explicit `verify-integrity.mjs --allow-quarantined` check, never authorizes activation.
+Every activation entrypoint recomputes the exact whole-tree digest twice before loading code, using stable `O_NOFOLLOW` descriptors with pre/open/post identity checks. A future MCP activation also accepts only an exact `agent-workflow-install/v5` manifest whose canonical source-tree digest binds version, migration, managed file hashes/modes, both bootstrap hashes, the verified plugin file map, and the unique marketplace entry. The loaded plugin must be the real `plugins/pxpipe-context` path beneath that project. v2/v3 compatibility attestations, disabled/malformed bindings, source-tree drift, and missing or duplicate marketplace entries are rejected.
+The direct `codex-pxpipe.sh` compatibility launcher is a refusal-only stub: it rejects
+`PXPIPE_DIR`, `PXPIPE_NODE`, and Node-path overrides and never searches `dist/` or
+`vendor/` while this distribution is quarantined. MCP initialization imports the same
+whole-tree verifier, so a stale digest, extra executable, symlink, or modified
+unselected file fails before tool publication.
 
-The build vendors source-bound proxy, default-service, rollback, status, launcher,
-and optional export assets.
+A future verified uninstall must authenticate the launchd PID, its exact process group,
+and every TCP listener on the managed loopback port before bootout. It must wait for both
+the captured process group and port listener to remain absent across consecutive probes, treat `ps`/`lsof` ambiguity
+as failure, reject a service that appears after an authenticated absence probe, and recheck before removing the dashboard credential, plist, ownership
+record, or recovery journal. The v2 transaction journal binds that process identity plus
+authenticated pre/post Codex config/state/backup snapshots; recovery globally preflights
+all three live images before its first artifact/config mutation. A crash immediately after
+config mutation remains recoverable, and failed compensation retains the private
+credential and journal for explicit recovery. Legacy v1 recovery journals lack process
+identity and are intentionally rejected without mutation for manual quarantine.
 
-- the full pxpipe Node Responses proxy;
-- the Codex launcher;
-- the bounded export runtime used by the optional file MCP.
+## Dashboard boundary
 
-Install the default once, then restart Codex Local:
+Sensitive dashboard routes are disabled when `PXPIPE_DASHBOARD_TOKEN` is absent.
+When enabled, the token must contain 32–128 visible ASCII characters and HTTP Basic
+authentication uses username `pxpipe` with that token as the password. Mutating
+browser requests additionally require an exact loopback Origin. Responses containing
+captured context are `no-store`. `/proxy-stats` remains a non-sensitive loopback
+health endpoint.
 
-```bash
-plugins/pxpipe-context/scripts/install-codex-default.sh
-plugins/pxpipe-context/scripts/status-codex-default.sh
-```
+A future verified macOS installer is required to generate a random 256-bit token,
+store it in `~/.pxpipe/dashboard-token` with mode 0600, and place it in a 0600
+LaunchAgent configuration. Its status command must verify authenticated access and
+its uninstall must remove the credential. The current quarantined snapshot is not
+installable. Loopback plus authentication reduces browser and unrelated-process
+exposure but does not create isolation from a fully compromised same-user account.
 
-The installer registers a loopback-only macOS LaunchAgent, verifies a
-pxpipe-shaped health response, backs up the user config, and manages a
-user-level `model_provider = "pxpipe"` plus `[model_providers.pxpipe]` in
-`~/.codex/config.toml`. The provider uses the Responses wire API and existing
-Codex authentication, with WebSockets disabled so every request traverses the
-HTTP proxy. Every new conversation then uses pxpipe without a special command.
-Roll back with:
+## Model policy
 
-```bash
-plugins/pxpipe-context/scripts/uninstall-codex-default.sh
-```
+No project model is forced by the generic template. `PXPIPE_MODELS` controls the
+proxy exact allowlist and defaults to `off`; a future verified MCP must receive an
+explicit nonblank `PXPIPE_MCP_MODELS` exact allowlist and has no model fallback. A verified compatibility release may document tested model
+profiles, but it must not change the project Blueprint or host model choice.
 
-The explicit launcher remains available for isolated diagnostics:
+## Third-party boundary
 
-```bash
-plugins/pxpipe-context/scripts/codex-pxpipe.sh /absolute/project -- --no-alt-screen
-```
-
-The launcher:
-
-1. resolves the Codex CLI without reading its credentials;
-2. starts pxpipe on `127.0.0.1`, or safely reuses a healthy existing pxpipe;
-3. enables the exact configured model, defaulting to `gpt-5.6-sol`;
-4. starts Codex with the supported one-run override `-c openai_base_url="http://127.0.0.1:47821/v1"`;
-5. forwards the Codex exit status and signals;
-6. cleans only the proxy process it created.
-
-It fails closed when the port belongs to another process, pxpipe never becomes healthy, model enablement fails, or the Codex binary is unavailable. A pre-existing healthy pxpipe is never stopped by the launcher.
-
-The default installer never writes provider settings to project
-`.codex/config.toml`: Codex ignores provider redirection there. It writes only
-the user-level managed provider blocks after the local service is healthy and
-never reads `auth.json`, API keys, authorization headers, or request bodies.
-The proxy forwards Codex's existing bearer authentication to the ChatGPT Codex
-Responses backend without persisting it. The explicit launcher still uses a
-one-run `openai_base_url` override and does not edit configuration.
-
-Important boundary: installation cannot hot-swap a chat that is already
-running. Restart Codex Local and open a new conversation. Existing context
-tokens in the current chat cannot be reclaimed.
-
-## Verify whole-session compression
-
-Use a non-sensitive synthetic project and start a fresh Codex session normally,
-without invoking `cpx` or the explicit launcher. Verification must establish all
-of the following from the response and local pxpipe event evidence:
-
-- the request reached the loopback Responses proxy;
-- pxpipe reported that transformation was applied;
-- at least one eligible historical block became an image;
-- measured or locally estimated input-token savings are positive (the Agent Workflow acceptance gate uses at least 10%);
-- recent messages and open or malformed tool state remained native text;
-- the managed LaunchAgent remains healthy for subsequent new conversations.
-
-An offline export or MCP render is not evidence that a Codex provider request used pxpipe.
-
-## Offline file MCP (optional)
-
-Each newly opened Codex chat can optionally call:
-
-- `pxpipe_analyze_files`: estimate a bounded image rendering without returning source text;
-- `pxpipe_render_files`: verify the analyzed source SHA-256 and return PNG image blocks plus a supplemental factsheet.
-
-The MCP is for explicitly selected cold, non-authoritative reference files only. It does not bind a port, start a proxy, access the network, persist rendered files, remove history, or change model transport. Codex owns its STDIO lifecycle.
-
-The MCP trusts standard MCP Roots returned by the host. If a host does not advertise roots, configure an explicit startup allowlist before the new chat. System roots and control directories such as `/etc`, `.git`, `.agent` and `.codex` remain forbidden.
-
-## Install and reload
-
-From the canonical `agent-workflow-template` checkout:
-
-```bash
-codex plugin marketplace add /absolute/path/to/agent-workflow-template
-codex plugin add pxpipe-context@agent-workflow-template
-```
-
-After a source update, use the plugin cachebuster helper, reinstall the same marketplace entry, and open a new Codex chat. Plugin discovery does not hot-load changed skills or MCP servers into an existing chat.
-
-Run both plugin checks after a build:
-
-```bash
-node plugins/pxpipe-context/scripts/provider-integration-self-test.mjs
-node plugins/pxpipe-context/scripts/self-test.mjs
-```
-
-The protocol self-test covers MCP roots, bounded rendering, drift rejection, tampering and clean EOF shutdown. The provider integration self-test verifies that the plugin presents the whole-session proxy as primary, keeps the file MCP optional, and binds the launcher and full proxy bundle in `integrity.json`.
+The known upstream project MIT notice remains in
+`THIRD_PARTY_LICENSES/pxpipe-MIT.txt`. That notice does not license unknown transitive
+bundle contents, which is why the historical bundles are absent. A future rebuild must
+produce and review a complete dependency/SBOM license inventory before quarantine can
+be removed. This compatibility asset is not an authority for project architecture,
+CI, acceptance, credentials, or user decisions.

@@ -1,0 +1,22 @@
+stages: [build]
+variables:
+  BLUEPRINT_SHA256: "{{blueprint_sha256}}"
+agent-build:
+  stage: build
+  image: {{gitlab_image}}
+{{gitlab_candidate_tags}}  before_script:
+    - 'python3 -c "import sys; raise SystemExit(0 if sys.platform == \"{{gitlab_sys_platform}}\" else 1)"'
+    - 'python3 .agent/scripts/blueprintctl.py check --require-confirmed --expect-design-sha256 "$BLUEPRINT_SHA256"'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{install_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{static_security_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{test_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{integration_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{migration_dry_run_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+    - 'python3 .agent/scripts/blueprintctl.py run-command --id {{build_command_id}} --expect-design-sha256 "$BLUEPRINT_SHA256"'
+  artifacts:
+    when: on_success
+    paths: ["{{artifact_path}}"]

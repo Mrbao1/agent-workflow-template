@@ -125,33 +125,16 @@
     "preserve_referenced": true
   },
   "context_transport": {
-    "default": "native",
-    "pxpipe": {
-      "enabled": false,
-      "activation": "explicit-opt-in",
-      "plugin_name": "pxpipe-context",
-      "plugin_version": "0.1.0+codex.20260721210500",
-      "models": [
-        "gpt-5.6-sol"
-      ],
-      "primary_mode": "provider-proxy",
-      "provider_activation": "default-new-local-sessions",
-      "provider_configuration": "user-model-provider-plus-launch-agent",
-      "provider_content_scope": "whole-request-eligible-content",
-      "mcp_role": "optional-cold-reference",
-      "selection": "analyze-then-render",
-      "content_scope": "new-cold-reference-only",
-      "session_boundary": "plugin-load-requires-new-chat",
-      "fallback": "native"
-    }
+    "default": "native"
   },
   "runtime": {
     "registry": ".agent/state/runtime.json",
     "tool_leases_registry": ".agent/state/tool-leases.json",
-    "term_timeout_seconds": 8
+    "term_timeout_seconds": 8,
+    "host_runner_identity": null
   },
   "agent_control": {
-    "default_model": "gpt-5.6-sol",
+    "default_model": null,
     "allow_model_fallback": false,
     "context_strategy": "long-window-capsule",
     "max_fork_turns": 10,
@@ -224,6 +207,8 @@
     "scheduler": {
       "source": "host-scheduler",
       "signed_adapter": null,
+      "provider_project_id": null,
+      "provider_repository_id": null,
       "automatic_resume": false,
       "max_receipt_age_seconds": 300
     }
@@ -249,13 +234,7 @@
       ".agent/workflows",
       ".agent/state/TASK.json",
       ".agent/state/REQUIREMENT_CONTRACT.md",
-      ".agent/policies/PROJECT_GUARDRAILS.md",
-      "README.md",
-      "AGENTS.md",
-      "install.py",
-      "tests",
-      "plugins/pxpipe-context",
-      ".agents/plugins/marketplace.json"
+      ".agent/policies/PROJECT_GUARDRAILS.md"
     ],
     "product_roots": [
       "."

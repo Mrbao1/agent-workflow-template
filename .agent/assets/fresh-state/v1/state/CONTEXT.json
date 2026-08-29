@@ -1,11 +1,11 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "f7601d4c09f64d4d19f9734aa9fb3c42d5102cb6dba217538ffff2f1a477c9f2",
+  "policy_bundle_sha256": "1c46419fdd948693bc723f7f6e9b0b83015130f4353de143e510ec4001517ffa",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
-  "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
+  "task_invariant_sha256": "d79960ef0a40e30d3541ca37804612f16c347607a009068b41a23cbd042bbeb8",
   "requirement_contract_sha256": "unapproved-draft",
   "phase_summary": "fresh isolated idle state",
   "confirmed_facts": [
@@ -27,27 +27,27 @@
     "budget_state": "ok",
     "terminal": false,
     "resume_action": "waiting_human",
-    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156"
+    "task_invariant_sha256": "d79960ef0a40e30d3541ca37804612f16c347607a009068b41a23cbd042bbeb8"
   },
   "checkpoint": {
-    "sequence": 33,
-    "reason": "fresh-project-seed",
-    "updated_at": "2026-08-24T13:49:10+00:00",
-    "previous_sha256": "792041050e4756cebc320cf6d899e7e7372ca509039dc738774b0670bfbd49c0",
-    "previous_task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
+    "sequence": 1,
+    "reason": "template-genesis",
+    "updated_at": "2026-08-24T21:50:23+00:00",
+    "previous_sha256": "none",
+    "previous_task_invariant_sha256": "none",
     "task_delta": [
-      "canonical_task_state"
+      "initial_canonical_task_state"
     ],
     "transition_authorization": null
   },
   "usage_freshness": {
     "schema": "agent-context-usage/v1",
-    "checkpoint_sequence": 33,
-    "task_invariant_sha256": "7f69ccdc959edabb9a663456395c476475f164014411b12f4590b144cb997156",
+    "checkpoint_sequence": 1,
+    "task_invariant_sha256": "d79960ef0a40e30d3541ca37804612f16c347607a009068b41a23cbd042bbeb8",
     "coverage": "through-current-checkpoint",
     "source": "explicit-estimate",
     "estimated_tokens": 800,
-    "observed_at": "2026-08-24T13:49:10+00:00"
+    "observed_at": "2026-08-24T21:50:23+00:00"
   },
   "turn_accounting": {
     "schema": "agent-context-turn-accounting/v1",
@@ -57,13 +57,13 @@
   },
   "compaction": {
     "source_estimated_tokens": 800,
-    "capsule_estimated_tokens": 644,
+    "capsule_estimated_tokens": 614,
     "tokens_removed": 0,
-    "capsule_reduction_tokens": 156,
-    "compression_ratio": 1.24,
+    "capsule_reduction_tokens": 186,
+    "compression_ratio": 1.3,
     "method": "explicit-estimate/v1",
-    "reason": "fresh-project-seed",
-    "source": "project-init:bootstrap",
+    "reason": "template-genesis",
+    "source": "template-uninitialized",
     "budget_snapshot": {
       "task_tokens_used": 0,
       "current_checkpoint_estimated_tokens": 800,
@@ -85,8 +85,8 @@
   },
   "integrity": {
     "status": "verified",
-    "verified_at": "2026-08-24T13:49:10+00:00",
-    "source": "project-init:bootstrap",
-    "content_sha256": "2236718395ae6b26514c0cab0f476c2e326c34eb90eadc5d8b5eeb97dc286a8d"
+    "verified_at": "2026-08-24T21:50:23+00:00",
+    "source": "template-uninitialized",
+    "content_sha256": "4cf65a336078621b575eefe51666696bc1e2b4b9354f7617aed3cd2ac680074d"
   }
 }

@@ -29,7 +29,7 @@
 6. 运行真实客户端集成测试，记录镜像 ID、服务状态、健康、日志、控制台和网络。
    严格门只执行已纳入受测指纹的 `.agent/acceptance-client.json`；命令模板必须以 `node` 或 `python3` 启动 test_roots 内的固定入口，并包含 `{base_url}` 与 `{fresh_state_token}` 占位符。
 7. 修复后重建受影响镜像，不能复用不明缓存证明通过。
-8. 无论成功失败都运行 `docker compose down --remove-orphans`；数据卷只有在明确是测试数据且目标精确时才删除。
+8. 变更 Docker 前必须证明唯一 acceptance project 标签与精确候选镜像标签均为空；只有成功取得该干净命名空间后，才在成功/失败路径运行 `docker compose down --remove-orphans --volumes`，按精确 project label 清理残余容器、网络和命名卷，删除精确候选镜像标签，并复核四类残余均为零；未取得命名空间权威时不得清理，且绝不删除其他服务镜像或非本次 project 数据。
 
 运行时 helper 必须把所有声明服务 `health != healthy` 视为失败，并断言 health URL 精确命中 inspect 得到的回环发布端口。Live gate 每轮分配不同端口，外层设置总超时，在独立 `finally` 再次 down 并检查 project label 残留；不能只信 helper 自报清理。Helper 与 live runner 都把客户端放入独立进程组，并在正常、失败、超时后 TERM→有界等待→KILL，任何宿主机子进程残留都阻断。
 

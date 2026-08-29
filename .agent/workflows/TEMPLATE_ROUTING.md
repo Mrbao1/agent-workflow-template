@@ -25,7 +25,7 @@ Rendering rules:
 - Each `agent-template-route/v3` receipt binds task type, projection, mode, capabilities, requirement contract and manifest; project capabilities additionally bind the confirmed blueprint and verified Skill lock digests. Each render receipt additionally binds route, source and output hashes/bytes.
 - A changed contract, manifest, route, template source or output makes validation fail until an intentional re-route/re-render.
 - A transaction restores TASK, CONTEXT and output bytes if context synchronization fails.
-- Legacy task-local `ci-provider-github` remains digest-bound for compatible installations. New project-level GitHub/GitLab Issue and CI templates come only from providers explicitly confirmed in `.agent/project/BLUEPRINT.json` and are emitted by `providerctl.py`; no provider or stack command is inferred.
+- Legacy task-local `ci-provider-github` remains digest-bound for compatible installations. New project-level GitHub/GitLab Issue and CI templates come only from those providers explicitly confirmed in `.agent/project/BLUEPRINT.json` and are emitted by `providerctl.py`; generic provider records require a separately reviewed matching Skill/emitter, and no provider or stack command is inferred.
 - Legacy optional context transports are compatibility adapters, never universal defaults or project technology choices. They remain disabled until explicit opt-in and verified provenance; native context remains sufficient for the generic route.
 - Unselected templates are not loaded or validated. A template may add requirements but cannot remove clarification, cleanup, human solution/acceptance, production approval or root-cause rollback gates.
 

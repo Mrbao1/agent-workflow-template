@@ -5,9 +5,43 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from typing import Dict, List, Optional, Set, Tuple
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+from adaptive_common import AdaptiveError,canonical_sha256,validate_design
+from workflowlib import boundedio
+
+MAX_DOCUMENT_BYTES=16*1024*1024
+
+
+def confirmed_application_service_authority(root: Path,errors: List[str]) -> Tuple[List[str],str]:
+    try:
+        raw=json.loads(bounded_read_text(root/".agent/project/BLUEPRINT.json","confirmed Blueprint"))
+        if (not isinstance(raw,dict) or raw.get("schema")!="agent-project-blueprint/v1" or raw.get("status")!="confirmed"):
+            raise ValueError("Blueprint is not confirmed")
+        design=validate_design(raw.get("design"),require_material=True)
+        confirmation=raw.get("confirmation")
+        if (not isinstance(confirmation,dict) or set(confirmation)!={"source","design_sha256","confirmed_at","decision_receipt"}
+                or not isinstance(confirmation.get("source"),str) or not confirmation["source"].startswith("user:")
+                or not isinstance(confirmation.get("decision_receipt"),dict)
+                or confirmation.get("design_sha256")!=canonical_sha256(design)):
+            raise ValueError("Blueprint confirmation does not bind the exact normalized design")
+        services=design.get("application_services")
+        if not isinstance(services,list) or not services:
+            raise ValueError("Blueprint has no application_services authority")
+        return services,str(confirmation["design_sha256"])
+    except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError,AdaptiveError) as error:
+        errors.append(f"confirmed Blueprint application-service authority is invalid: {error}")
+        return [],""
+
+
+def bounded_read_text(path: Path,label: str) -> str:
+    try: return boundedio.read_text(path,maximum=MAX_DOCUMENT_BYTES,label=label)
+    except RuntimeError as error: raise ValueError(str(error)) from error
 
 
 FIELDS = (
@@ -82,7 +116,7 @@ def json_evidence(path: Optional[Path], errors: List[str]) -> Optional[Dict[str,
         errors.append(f"JSON evidence exceeds 64 KiB: {path}")
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(bounded_read_text(path,"acceptance JSON"))
     except (OSError, ValueError) as error:
         errors.append(f"evidence must be valid JSON: {path} ({error})")
         return None
@@ -102,7 +136,7 @@ def validate_fingerprint_manifest(path: Optional[Path], root: Path, errors: List
     if path is None:
         return
     entries = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in bounded_read_text(path,"acceptance JSON").splitlines():
         if not line.strip():
             continue
         match = re.fullmatch(r"([a-f0-9]{64})  (.+)", line)
@@ -119,7 +153,7 @@ def manifest_paths(path: Optional[Path]) -> Set[str]:
     if path is None:
         return set()
     paths = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in bounded_read_text(path,"acceptance JSON").splitlines():
         match = re.fullmatch(r"[a-f0-9]{64}  (.+)", line)
         if match:
             paths.add(match.group(1))
@@ -130,11 +164,63 @@ def manifest_entries(path: Optional[Path]) -> Dict[str, str]:
     if path is None:
         return {}
     result = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in bounded_read_text(path,"acceptance JSON").splitlines():
         match = re.fullmatch(r"([a-f0-9]{64})  (.+)", line)
         if match:
             result[match.group(2)] = match.group(1)
     return result
+
+
+MAX_SCOPE_ENTRIES=32768
+MAX_SCOPE_FILES=16384
+
+
+def safe_scope_path(root: Path,raw: str,*,directory: Optional[bool],errors: List[str],label: str) -> Optional[Path]:
+    relative=Path(raw)
+    if relative.is_absolute() or not relative.parts or any(part in {"",".",".."} for part in relative.parts):
+        errors.append(f"{label} is not one safe project-relative path: {raw}"); return None
+    current=root
+    try:
+        for part in relative.parts:
+            current=current/part; observed=os.lstat(current)
+            if stat.S_ISLNK(observed.st_mode):
+                errors.append(f"{label} traverses a symlink: {raw}"); return None
+        final=os.lstat(current)
+    except OSError:
+        errors.append(f"{label} is missing: {raw}"); return None
+    expected=(stat.S_ISDIR(final.st_mode) or stat.S_ISREG(final.st_mode)) if directory is None else (stat.S_ISDIR(final.st_mode) if directory else stat.S_ISREG(final.st_mode))
+    if not expected:
+        errors.append(f"{label} has the wrong file type: {raw}"); return None
+    return current
+
+
+def bounded_scope_files(path: Path,root: Path,errors: List[str],state: Dict[str,int]):
+    stack=[path]
+    while stack:
+        directory=stack.pop()
+        try:
+            with os.scandir(directory) as scanner:
+                entries=[]
+                for entry in scanner:
+                    state["entries"]+=1
+                    if state["entries"]>MAX_SCOPE_ENTRIES:
+                        raise RuntimeError("acceptance scope entry limit exceeded")
+                    entries.append(entry)
+        except (OSError,RuntimeError) as error:
+            errors.append(str(error)); return
+        for entry in sorted(entries,key=lambda item:os.fsencode(item.name),reverse=True):
+            try: observed=entry.stat(follow_symlinks=False)
+            except OSError:
+                errors.append(f"acceptance scope entry became unreadable: {entry.path}"); return
+            if stat.S_ISLNK(observed.st_mode):
+                errors.append(f"acceptance scope contains a symlink: {entry.path}"); return
+            if stat.S_ISDIR(observed.st_mode): stack.append(Path(entry.path)); continue
+            if not stat.S_ISREG(observed.st_mode):
+                errors.append(f"acceptance scope contains a special file: {entry.path}"); return
+            state["files"]+=1
+            if state["files"]>MAX_SCOPE_FILES:
+                errors.append("acceptance scope file limit exceeded"); return
+            yield Path(entry.path)
 
 
 def scoped_files(scope: Dict[str, object], root: Path, errors: List[str]) -> Set[str]:
@@ -151,65 +237,40 @@ def scoped_files(scope: Dict[str, object], root: Path, errors: List[str]) -> Set
     if not conventional_tests.issubset(declared_test_roots):
         errors.append("scope test_roots omit conventional project roots: " + ", ".join(sorted(conventional_tests - declared_test_roots)))
 
-    declared_root_paths = [(root / item).resolve() for item in declared_source_roots | declared_test_roots]
+    declared_root_paths=[]
+    for item in sorted(declared_source_roots|declared_test_roots):
+        declared=safe_scope_path(root,item,directory=True,errors=errors,label="scope root")
+        if declared is not None: declared_root_paths.append(declared)
     exclusions = scope.get("exclude_paths", [])
     excluded: Set[str] = set()
     if not isinstance(exclusions, list):
-        errors.append("scope exclude_paths must be a list")
-        exclusions = []
+        errors.append("scope exclude_paths must be a list"); exclusions = []
     for item in exclusions:
         if not isinstance(item, dict) or not item.get("path") or not item.get("reason") or not str(item.get("approver", "")).startswith("user:"):
-            errors.append("each scope exclusion needs path, reason, and user approver")
-            continue
-        exclusion_path = (root / str(item["path"])).resolve()
-        if not exclusion_path.exists():
-            errors.append(f"scope exclusion does not exist: {item['path']}")
-            continue
-        inside_declared = False
-        for declared in declared_root_paths:
-            try:
-                exclusion_path.relative_to(declared)
-                inside_declared = True
-                break
-            except ValueError:
-                continue
-        if not inside_declared:
-            errors.append(f"scope exclusion is outside declared source/test roots: {item['path']}")
-            continue
-        excluded.add(str(exclusion_path.relative_to(root)))
-    result: Set[str] = set()
+            errors.append("each scope exclusion needs path, reason, and user approver"); continue
+        exclusion_path=safe_scope_path(root,str(item["path"]),directory=None,errors=errors,label="scope exclusion")
+        if exclusion_path is None: continue
+        if not any(exclusion_path==declared or declared in exclusion_path.parents for declared in declared_root_paths):
+            errors.append(f"scope exclusion is outside declared source/test roots: {item['path']}"); continue
+        excluded.add(exclusion_path.relative_to(root).as_posix())
+    result: Set[str] = set(); traversal={"entries":0,"files":0}
     for category in ("source_roots", "test_roots"):
         for raw in scope.get(category, []):
-            path = (root / str(raw)).resolve()
-            try:
-                path.relative_to(root)
-            except ValueError:
-                errors.append(f"scope root escapes project: {raw}")
-                continue
-            if not path.is_dir():
-                errors.append(f"scope root is missing: {raw}")
-                continue
-            contribution = 0
-            for file_path in path.rglob("*"):
-                if file_path.is_file() and not file_path.is_symlink():
-                    relative = str(file_path.relative_to(root))
-                    if relative not in excluded:
-                        result.add(relative)
-                        contribution += 1
-            if contribution < 1:
-                errors.append(f"scope root contributes no tested files: {raw}")
+            path=safe_scope_path(root,str(raw),directory=True,errors=errors,label="scope root")
+            if path is None: continue
+            contribution=0
+            for file_path in bounded_scope_files(path,root,errors,traversal):
+                relative=file_path.relative_to(root).as_posix()
+                if relative not in excluded:
+                    result.add(relative); contribution+=1
+            if contribution<1: errors.append(f"scope root contributes no tested files: {raw}")
     for category in ("config_files", "container_files", "requirement_files"):
         for raw in scope.get(category, []):
-            path = (root / str(raw)).resolve()
-            try:
-                path.relative_to(root)
-            except ValueError:
-                errors.append(f"scope file escapes project: {raw}")
-                continue
-            if not path.is_file() or path.is_symlink():
-                errors.append(f"scope file is missing: {raw}")
-            else:
-                result.add(str(path.relative_to(root)))
+            path=safe_scope_path(root,str(raw),directory=False,errors=errors,label="scope file")
+            if path is not None:
+                traversal["files"]+=1
+                if traversal["files"]>MAX_SCOPE_FILES: errors.append("acceptance scope file limit exceeded")
+                else: result.add(path.relative_to(root).as_posix())
     return result
 
 
@@ -234,7 +295,7 @@ def valid_document_anchor(path: Path, raw_anchor: object) -> bool:
     anchor = str(raw_anchor).strip().lstrip("#").strip()
     if not anchor:
         return False
-    text = path.read_text(encoding="utf-8")
+    text = bounded_read_text(path,"acceptance JSON")
     line_match = re.fullmatch(r"L([1-9][0-9]*)", anchor)
     if line_match:
         return int(line_match.group(1)) <= len(text.splitlines())
@@ -263,12 +324,13 @@ def main() -> int:
 
     report = Path(args.report).resolve()
     root = Path.cwd().resolve()
-    text = report.read_text(encoding="utf-8")
+    text = bounded_read_text(report,"acceptance report")
     errors: List[str] = []
     values: Dict[str, str] = {}
+    blueprint_services,blueprint_sha256=confirmed_application_service_authority(root,errors)
     try:
         configured_clean_reruns = int(json.loads(
-            (root / ".agent/config.json").read_text(encoding="utf-8")
+            bounded_read_text(root/".agent/config.json","agent config")
         )["routing"]["modes"]["release"]["clean_reruns"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         configured_clean_reruns = -1
@@ -347,12 +409,10 @@ def main() -> int:
             missing_from_fingerprint = all_scoped - manifest_paths(manifest_path)
             if missing_from_fingerprint:
                 errors.append("fingerprint omits scoped files: " + ", ".join(sorted(missing_from_fingerprint)))
-            runtime_required_files = set()
-            for category in ("source_roots",):
-                for raw in scope.get(category, []):
-                    path = (root / str(raw)).resolve()
-                    if path.is_dir():
-                        runtime_required_files.update(str(item.relative_to(root)) for item in path.rglob("*") if item.is_file() and not item.is_symlink())
+            source_root_paths=[path for raw in scope.get("source_roots", [])
+                for path in [safe_scope_path(root,str(raw),directory=True,errors=errors,label="scope root")] if path is not None]
+            runtime_required_files={relative for relative in all_scoped
+                if any((root/relative)==source_root or source_root in (root/relative).parents for source_root in source_root_paths)}
             runtime_required_files.update(str(item) for category in ("config_files", "container_files") for item in scope.get(category, []))
             requirement_files = {str(item) for item in scope.get("requirement_files", [])}
             for requirement in plan_requirement_items:
@@ -680,10 +740,10 @@ def main() -> int:
                 runtime_path = checked_evidence_path(runtime_path_raw, runtime_hash, root, errors)
                 runtime = json_evidence(runtime_path, errors)
                 if runtime is not None:
-                    require_keys(runtime, ("schema", "tool", "tool_sha256", "candidate_sha256", "docker", "compose", "resolved_compose", "build", "up", "containers", "health", "client", "logs", "source", "source_after", "cleanup_command", "cleanup"), f"runtime {match.group('run')}", errors)
+                    require_keys(runtime, ("schema", "tool", "tool_sha256", "candidate_sha256", "blueprint_sha256", "docker", "compose", "resolved_compose", "build", "loaded_image_id", "application_services", "candidate_services", "up", "containers", "health", "client", "logs", "source", "source_after", "namespace_preflight", "cleanup_command", "cleanup"), f"runtime {match.group('run')}", errors)
                     helper_path = Path(__file__).with_name("run_acceptance_runtime.py").resolve()
                     helper_hash = sha256(helper_path) if helper_path.is_file() else ""
-                    if runtime.get("schema") != "run_acceptance_runtime/v1" or runtime.get("tool") != "run_acceptance_runtime" or runtime.get("tool_sha256") != helper_hash:
+                    if runtime.get("schema") != "run_acceptance_runtime/v2" or runtime.get("tool") != "run_acceptance_runtime" or runtime.get("tool_sha256") != helper_hash:
                         errors.append(f"runtime evidence schema/tool mismatch: {match.group('run')}")
                     if (
                         not isinstance(data.get("candidate_sha256"), str)
@@ -693,12 +753,35 @@ def main() -> int:
                         errors.append(f"runtime candidate fingerprint mismatch: {match.group('run')}")
                     if runtime.get("status") != "passed" or runtime.get("project") != runtime_id:
                         errors.append(f"runtime evidence status or id mismatch: {match.group('run')}")
-                    cleanup = runtime.get("cleanup")
-                    if not isinstance(cleanup, dict) or cleanup.get("containers") != 0 or cleanup.get("networks") != 0:
+                    namespace_preflight=runtime.get("namespace_preflight")
+                    if not isinstance(namespace_preflight,dict) or any(namespace_preflight.get(kind)!=0 for kind in ("containers","networks","volumes","images")):
+                        errors.append(f"runtime Docker namespace was not clean before mutation: {match.group('run')}")
+                    cleanup=runtime.get("cleanup")
+                    if (not isinstance(cleanup,dict) or any(cleanup.get(kind)!=0 for kind in ("containers","networks","volumes","images"))):
                         errors.append(f"runtime evidence cleanup failed: {match.group('run')}")
-                    containers = runtime.get("containers")
-                    if not isinstance(containers, list) or not containers or not all(isinstance(item, dict) for item in containers) or any(item.get("status") != "running" or item.get("health") != "healthy" or item.get("image") != image_digest for item in containers if isinstance(item, dict)):
+                    loaded_image_id=runtime.get("loaded_image_id")
+                    candidate_services=runtime.get("candidate_services")
+                    if (runtime.get("blueprint_sha256")!=blueprint_sha256
+                            or runtime.get("application_services")!=blueprint_services
+                            or candidate_services!=blueprint_services):
+                        errors.append(f"runtime candidate services differ from exact confirmed Blueprint authority: {match.group('run')}")
+                    containers=runtime.get("containers")
+                    if loaded_image_id!=image_digest or not isinstance(loaded_image_id,str) or re.fullmatch(r"sha256:[a-f0-9]{64}",loaded_image_id) is None:
+                        errors.append(f"runtime loaded candidate image mismatch: {match.group('run')}")
+                    if (not isinstance(candidate_services,list) or not candidate_services
+                            or candidate_services!=sorted(set(candidate_services))
+                            or not all(isinstance(item,str) and item for item in candidate_services)):
+                        errors.append(f"runtime candidate service authority is invalid: {match.group('run')}")
+                        candidate_services=[]
+                    if not isinstance(containers,list) or not containers or not all(isinstance(item,dict) for item in containers):
                         errors.append(f"runtime evidence container mismatch: {match.group('run')}")
+                    else:
+                        if any(item.get("status")!="running" or item.get("health")!="healthy" for item in containers):
+                            errors.append(f"runtime evidence container mismatch: {match.group('run')}")
+                        observed_candidate={item.get("service") for item in containers if item.get("image")==loaded_image_id}
+                        governed=[item for item in containers if item.get("service") in candidate_services]
+                        if observed_candidate!=set(candidate_services) or len(governed)!=len(candidate_services) or any(item.get("image")!=loaded_image_id for item in governed):
+                            errors.append(f"runtime did not exercise exact loaded candidate services: {match.group('run')}")
                     client = runtime.get("client")
                     client_command = client.get("command") if isinstance(client, dict) else None
                     client_output = client.get("output") if isinstance(client, dict) else None
@@ -715,6 +798,7 @@ def main() -> int:
                         or not all(isinstance(item, str) and item for item in client_command)
                         or not command_test_files
                         or client.get("exit_code") != 0
+                        or client.get("output_limit_exceeded") is not False
                         or client_process_cleanup != {"remaining": 0}
                         or not isinstance(client_output, dict)
                         or not re.fullmatch(r"[a-f0-9]{64}", str(client_output.get("sha256", "")))
@@ -790,4 +874,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"scripts"))
+    from workflowlib.publication import discover_project_root,run_cli
+    raise SystemExit(run_cli(discover_project_root(),main))

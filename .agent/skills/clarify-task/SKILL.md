@@ -10,14 +10,17 @@ description: Clarify a request and create an approved requirement contract befor
 3. `agentctl.py start` creates the single current `.agent/state/REQUIREMENT_CONTRACT.md`. While `requirements_clarified=false`, this file is an explicitly mutable, non-authoritative draft: revise it repeatedly without treating any intermediate SHA-256 as a decision. Replace every `PENDING` value with goal, users, success, scope, exclusions, constraints, data/permissions, target environment, acceptance and provenance.
 4. Ask only questions whose answers materially change product behavior, scope, risk, environment or acceptance. Batch related questions.
 5. Do not produce solution design, UI direction, task decomposition or code while a material question remains.
-6. After explicit user approval, run:
+6. After explicit user approval, first print the immutable prospective decision request without mutating state, have the provider-owned adapter sign exactly that request, then consume its receipt:
 
 ```bash
 python3 .agent/scripts/agentctl.py approve-requirements \
-  --source 'user:<decision>'
+  --source 'user:<provider-observed-decision>' --print-decision-request
+python3 .agent/scripts/agentctl.py approve-requirements \
+  --source 'user:<provider-observed-decision>' \
+  --human-decision-receipt /path/to/provider-receipt.json
 ```
 
-   This adapterless form is allowed only when TASK selected decision policy v2: local, non-deploy fast/standard work, or release-mode local implementation explicitly enabled by `human_decision_observer.allow_current_chat_local_release`. It stores an explicit lower-assurance current-chat record. Test, production, deploy, irreversible, external-impact and all policy-v1 tasks require `--human-decision-receipt /path/to/provider-receipt.json` plus a healthy provider-owned adapter.
-7. Approval succeeds only for the active waiting clarification, with no unresolved fields or material open questions. The command atomically writes the exact final bytes, flips `requirements_clarified=true`, and changes the context binding from `unapproved-draft` to that SHA-256. Local v2 records never claim provider verification. Policy-v1 receipts sign that exact SHA-256; old or tampered receipts fail without changing draft, TASK or CONTEXT. Route to `run-ai-coding-pipeline` only after the command succeeds.
+   The request binds the final contract bytes plus the prospective post-approval task-generation hash and ID, so the durable receipt remains valid after the atomic transition and cannot cross task generations. Every authoritative approval uses provider policy v1 and requires the exact receipt plus a healthy provider-owned adapter whose protected metadata sidecar binds `health` and `verify`. Adapterless/local/current-chat text is advisory only for every mode and environment; it may guide further clarification but cannot approve the contract.
+7. Approval succeeds only for the active waiting clarification, with no unresolved fields or material open questions. The command atomically writes the exact final bytes, flips `requirements_clarified=true`, and changes the context binding from `unapproved-draft` to that SHA-256. Historical local-policy records remain non-authoritative archive data. Provider-policy receipts sign that exact SHA-256; missing, old or tampered receipts fail without changing draft, TASK or CONTEXT. Route to `run-ai-coding-pipeline` only after the command succeeds.
 
 Read [clarification-gate.md](references/clarification-gate.md) only for complex or disputed requirements.

@@ -1,21 +1,82 @@
-name: selftest
+# Candidate-owned evidence only. A required check must be emitted by an immutable external or
+# protected-default-branch verifier that fetches candidate blobs as data and executes no candidate verifier.
+name: candidate-selftest-evidence
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selftest-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   selftest:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }} / ${{ matrix.context }} / ${{ matrix.shard }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      AGENT_GITHUB_AUTHORITY_MODE: ${{ vars.AGENT_GITHUB_AUTHORITY_MODE }}
+      AGENT_GITHUB_AUTHORITY_REPOSITORY_ID: ${{ vars.AGENT_GITHUB_AUTHORITY_REPOSITORY_ID }}
+      AGENT_GITHUB_AUTHORITY_WORKFLOW_REF: ${{ vars.AGENT_GITHUB_AUTHORITY_WORKFLOW_REF }}
+      AGENT_GITHUB_REQUIRED_CHECK_NAME: ${{ vars.AGENT_GITHUB_REQUIRED_CHECK_NAME }}
+      AGENT_GITHUB_RULESET_RECEIPT_SHA256: ${{ vars.AGENT_GITHUB_RULESET_RECEIPT_SHA256 }}
+      AGENT_GITHUB_VERIFIER_CONFIG_SHA256: ${{ vars.AGENT_GITHUB_VERIFIER_CONFIG_SHA256 }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-14]
+        toolchain: [minimum, modern-pinned]
+        context: [idle-source, polluted-source, installed-project]
         shard: ["1/2", "2/2"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Validate external required-verifier configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AGENT_GITHUB_AUTHORITY_MODE" == immutable-external-workflow || "$AGENT_GITHUB_AUTHORITY_MODE" == protected-default-branch-verifier ]] || exit 2
+          [[ "$AGENT_GITHUB_AUTHORITY_REPOSITORY_ID" =~ ^[1-9][0-9]{0,19}$ ]] || exit 2
+          [[ "$AGENT_GITHUB_AUTHORITY_WORKFLOW_REF" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}$ ]] || exit 2
+          [[ "$AGENT_GITHUB_REQUIRED_CHECK_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._:/+-]{0,127}$ ]] || exit 2
+          [[ "$AGENT_GITHUB_RULESET_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          [[ "$AGENT_GITHUB_VERIFIER_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          python-version: "3.x"
-      - name: Run self-test shard ${{ matrix.shard }}
-        run: python3 tests/run_all.py --shard ${{ matrix.shard }} --test-timeout 600
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.toolchain == 'minimum' && '3.9.21' || '3.13.5' }}
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.toolchain == 'minimum' && '20.19.4' || '22.18.0' }}
+      - name: Show pinned toolchain
+        run: |
+          python --version
+          node --version
+      - name: Run isolated self-test shard
+        run: >-
+          python tests/run_all.py
+          --context "${{ matrix.context }}"
+          --shard "${{ matrix.shard }}"
+          --test-timeout 600
+          --require-command python
+          --require-command node
+          --require-command git
+          --fail-on-skip
+          --allow-skip .agent/skills/manage-local-runtime/scripts/self_test_docker_http.py
+          --report "outputs/self-suite-${{ matrix.os }}-${{ matrix.toolchain }}-${{ matrix.context }}-${{ strategy.job-index }}.json"
+      - name: Upload self-test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: self-suite-${{ matrix.os }}-${{ matrix.toolchain }}-${{ matrix.context }}-${{ strategy.job-index }}
+          path: outputs/self-suite-*.json
+          if-no-files-found: warn
+          retention-days: 14
