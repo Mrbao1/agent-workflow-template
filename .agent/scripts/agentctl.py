@@ -1023,7 +1023,15 @@ def native_process_identity(pid: int) -> Tuple[str, Optional[Dict[str, object]]]
 
 def lsof_executable() -> Optional[str]:
     """Resolve lsof only through an OS-owned, Agent-nonwritable path chain."""
-    observed = [shutil.which("lsof"), "/usr/sbin/lsof", "/usr/bin/lsof"]
+    raw_path = os.environ.get("PATH", os.defpath)
+    try:
+        path_entries = raw_path.split(os.pathsep) if len(raw_path.encode("utf-8")) <= 4096 else []
+    except UnicodeError:
+        path_entries = []
+    if len(path_entries) > 64:
+        path_entries = []
+    observed = [str(Path(item) / "lsof") for item in path_entries if item and Path(item).is_absolute()]
+    observed.extend(["/usr/sbin/lsof", "/usr/bin/lsof"])
     seen = set()
     for raw in observed:
         if not raw:
