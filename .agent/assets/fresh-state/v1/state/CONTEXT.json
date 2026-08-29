@@ -1,7 +1,7 @@
 {
   "schema": "agent-context/v2",
   "policy_bundle_version": "policy-bundle/v2",
-  "policy_bundle_sha256": "e56ac8de16e620ca28c457754cd3e36f7d8379974817f3afa55e2cf45e2f56ae",
+  "policy_bundle_sha256": "85c2f930bf912c923fb5eabfcebcf00b7a0dfbdd5aca41a311efa324c8669ad2",
   "task_title": "No active task",
   "phase": "idle",
   "mode": "standard",
@@ -87,6 +87,6 @@
     "status": "verified",
     "verified_at": "2026-08-24T21:50:23+00:00",
     "source": "template-uninitialized",
-    "content_sha256": "f95b8a30e8767f0187ddb464d7156a1fef4647f3f106e1692f9d549de18fa8a2"
+    "content_sha256": "308362b0d4057855103ba8321243e19fabcac701901dae114ae71d6d903862af"
   }
 }

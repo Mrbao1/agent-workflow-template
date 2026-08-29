@@ -79,7 +79,7 @@ def assert_namespace_binding(target=None):
         if not stat.S_ISDIR(current.st_mode) or inode_identity(current)!=BOUND_TARGET_IDENTITY:
             raise RuntimeError("installer target root was replaced during the transaction")
 
-VERSION="4.0.1"
+VERSION="4.0.2"
 MIGRATION_VERSION=42
 CANONICAL_ACCEPTANCE_ADAPTERS={
     "acceptance-workflow":{"implemented":True,"runner":".agent/skills/run-full-chain-acceptance/scripts/run_workflow_release_gate.py","receipt_schema":"workflow-release-gate/v4"},
@@ -626,7 +626,7 @@ RELEASED_MANIFEST_METADATA={
     "agent-workflow-install/v1":{("3.1.40",32)},
     "agent-workflow-install/v3":{("3.1.41",34)},
     "agent-workflow-install/v4":{("3.1.42",35),("3.1.43",36),("3.1.46",38),("3.1.48",39),("3.2.0",40)},
-    "agent-workflow-install/v5":{("4.0.0",42),(VERSION,MIGRATION_VERSION)},
+    "agent-workflow-install/v5":{("4.0.0",42),("4.0.1",42),(VERSION,MIGRATION_VERSION)},
 }
 
 

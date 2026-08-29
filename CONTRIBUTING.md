@@ -6,7 +6,7 @@ The checked-in, candidate-owned GitHub evidence matrix exercises the Cartesian p
 
 - Ubuntu 24.04 with Python 3.9.21 and Node.js 20.19.4
 - Ubuntu 24.04 with Python 3.13.5 and Node.js 22.18.0
-- macOS 14 with Python 3.9.21 and Node.js 20.19.4
+- macOS 14 ARM64 with the latest published Python 3.9 ARM64 toolcache build, 3.9.13, and Node.js 20.19.4
 - macOS 14 with Python 3.13.5 and Node.js 22.18.0
 
 Every combination runs both shards across `idle-source`, `polluted-source`, and `installed-project`. Skips fail except the exact audited Docker-not-applicable self-test. This workflow is useful evidence only: a protected immutable external or protected-default-branch verifier must authenticate the candidate bytes and effective matrix before its independently named required check can authorize a release.

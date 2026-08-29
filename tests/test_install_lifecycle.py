@@ -194,6 +194,8 @@ def main() -> int:
         installer_spec = importlib.util.spec_from_file_location("workflow_installer", installer)
         installer_module = importlib.util.module_from_spec(installer_spec)
         installer_spec.loader.exec_module(installer_module)
+        if installer_module.RELEASED_MANIFEST_METADATA["agent-workflow-install/v5"]!={("4.0.0",42),("4.0.1",42),("4.0.2",42)}:
+            raise SystemExit("v4 patch release manifest compatibility window drifted")
         real_read_parent=workspace/"real-read-parent"; real_read_parent.mkdir(); (real_read_parent/"value").write_bytes(b"ok")
         linked_read_parent=workspace/"linked-read-parent"; linked_read_parent.symlink_to(real_read_parent,target_is_directory=True)
         try: installer_module.read_installer_bytes(linked_read_parent/"value")
@@ -625,7 +627,7 @@ def main() -> int:
         subprocess.run(["git","init","-q"],cwd=patch_upgrade,check=True)
         subprocess.run(["git","checkout","-q","-b","fix/active-patch-upgrade"],cwd=patch_upgrade,check=True)
         old_script=patch_upgrade/".agent/scripts/self_test_plugin_install_lifecycle.py"
-        old_bytes=old_script.read_bytes().replace(b'manifest.get("version")!="4.0.1"',b'manifest.get("version")!="4.0.0"')
+        old_bytes=old_script.read_bytes().replace(b'manifest.get("version")!="4.0.2"',b'manifest.get("version")!="4.0.0"')
         if old_bytes==old_script.read_bytes(): raise SystemExit("active patch fixture did not downgrade one managed policy file")
         old_script.write_bytes(old_bytes)
         old_manifest_path=patch_upgrade/".agent/.workflow-manifest.json"
@@ -1094,7 +1096,7 @@ raise SystemExit(contextctl.validate_context(quiet=True))
         bound_manifest_path = bound_metadata / ".agent/.workflow-manifest.json"
         baseline_manifest = bound_manifest_path.read_bytes()
         for field, bad_value, expected_text in (
-            ("version", "4.0.2", "schema/version/migration combination is not a supported release"),
+            ("version", "4.0.3", "schema/version/migration combination is not a supported release"),
             ("migration_version", 41, "schema/version/migration combination is not a supported release"),
             ("schema", "agent-workflow-install/v6", "invalid workflow install manifest"),
         ):
@@ -1108,7 +1110,7 @@ raise SystemExit(contextctl.validate_context(quiet=True))
                 if expected_text not in refused.stdout or tree(bound_metadata) != metadata_before:
                     raise SystemExit(f"v5 {field} tamper was not rejected byte-for-byte: {refused.stdout}")
             bound_manifest_path.write_bytes(baseline_manifest)
-        for field, bad_value in (("version", "4.0.2"), ("migration_version", 41)):
+        for field, bad_value in (("version", "4.0.3"), ("migration_version", 41)):
             candidate_manifest = json.loads(baseline_manifest)
             candidate_manifest[field] = bad_value
             bind_v5_manifest_metadata(candidate_manifest)

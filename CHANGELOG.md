@@ -5,6 +5,13 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 
 ## [Unreleased]
 
+## [4.0.2] - 2026-08-29
+
+### Fixed
+
+- Corrected failures observed in both live v4.0.1 forge pipelines. GitHub now copies the setup-selected Node executable into an owner-only path accepted by the self-suite's executable trust checks and uses the published Python 3.9.13 ARM64 build on the `macos-14` runner; the selected setup-python interpreter still launches every shard. GitLab now stages the verified Node executable under a root-owned, non-group-writable `/opt` path instead of the group-writable checkout hierarchy.
+- Preserved immutable v4.0.1 refs and added v4.0.1/42 to the installer's released-manifest compatibility window before publishing this follow-up patch.
+
 ## [4.0.1] - 2026-08-29
 
 ### Fixed
@@ -102,6 +109,7 @@ Changelog 1.1.0 and releases use Semantic Versioning 2.0.0.
 - Removed stale runtime evidence, generated reports, IDE metadata, and the obsolete
   remediation plan from the release tree.
 
-[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.1...HEAD
+[Unreleased]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.2...HEAD
+[4.0.2]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.1...v4.0.2
 [4.0.1]: https://github.com/Mrbao1/agent-workflow-template/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/Mrbao1/agent-workflow-template/releases/tag/v4.0.0

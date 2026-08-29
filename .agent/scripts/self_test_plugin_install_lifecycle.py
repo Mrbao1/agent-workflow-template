@@ -169,7 +169,7 @@ def main():
         manifest=json.loads((target/".agent/.workflow-manifest.json").read_text(encoding="utf-8"))
         if (
             manifest.get("schema")!="agent-workflow-install/v5"
-            or manifest.get("version")!="4.0.1"
+            or manifest.get("version")!="4.0.2"
             or manifest.get("migration_version")!=42
             or not isinstance(manifest.get("agent_files"),dict)
             or manifest.get("pxpipe")!={

@@ -135,7 +135,7 @@ def trusted_absolute_tool(requested):
 
 def trusted_tool_path(name):
     directories=[]
-    # The CI-selected PATH is the toolchain authority (setup-node/.ci-bin).
+    # The CI-selected PATH is the toolchain authority after verified tools are staged under an owner-chain-safe directory.
     # Each selected executable still must pass owner-chain checks and digest sealing.
     for value in (ORIGINAL_TOOL_PATH,os.defpath):
         for item in value.split(os.pathsep):
